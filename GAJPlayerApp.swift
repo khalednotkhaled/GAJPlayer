@@ -1044,8 +1044,8 @@ struct FullPlayerDeckView: View {
             ZStack {
                 LinearGradient(
                     colors: [Color(red: 0.12, green: 0.09, blue: 0.15), Color(red: 0.04, green: 0.04, blue: 0.06)],
-                    startAngle: .top,
-                    endAngle: .bottom
+                    startPoint: .top,
+                    endPoint: .bottom
                 )
                 .ignoresSafeArea()
 
