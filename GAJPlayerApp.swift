@@ -42,6 +42,7 @@ struct Playlist: Identifiable, Hashable, Codable {
 
 struct LyricLine: Identifiable, Equatable {
     let id = UUID()
+    let index: Int
     let time: TimeInterval?
     let text: String
 }
@@ -91,7 +92,6 @@ extension UIImage {
         return UIImage(cgImage: croppedCG, scale: self.scale, orientation: self.imageOrientation)
     }
 
-    /// Downscales the album cover and extracts two rich, vibrant colors for the full-screen player background
     func extractPlayerGradientColors() -> [Color] {
         guard let cgImage = self.cgImage else {
             return [Color(red: 0.16, green: 0.10, blue: 0.22), Color(red: 0.05, green: 0.05, blue: 0.08)]
@@ -131,7 +131,6 @@ extension UIImage {
                 let saturation = maxC > 0 ? (maxC - minC) / maxC : 0
                 let brightness = (r + g + b) / 3.0
 
-                // Favor vibrant mid-tone pixels over pure black or pure white
                 let weight: CGFloat = 0.2 + (saturation * 2.2) + (brightness > 0.1 && brightness < 0.9 ? 0.5 : 0.0)
 
                 if y < sampleSize / 2 {
@@ -283,7 +282,7 @@ final class LyricsManager {
         UserDefaults.standard.set(dict, forKey: storageKey)
     }
 
-    /// Parses [mm:ss.xx] LRC timestamps or plain lyrics into structured line-by-line items
+    /// Parses [mm:ss.xx] LRC timestamps and strips raw timestamp brackets so only clean lyrics show
     func parseLyrics(_ raw: String) -> [LyricLine] {
         let rawLines = raw.components(separatedBy: .newlines)
         var parsed: [LyricLine] = []
@@ -291,6 +290,7 @@ final class LyricsManager {
         let pattern = #"\[(\d{1,2}):(\d{2})(?:[\.:](\d{1,3}))?\](.*)"#
         let regex = try? NSRegularExpression(pattern: pattern)
 
+        var idx = 0
         for line in rawLines {
             let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { continue }
@@ -313,14 +313,33 @@ final class LyricsManager {
                 let timestamp = (mins * 60.0) + secs + frac
                 let lyricText = String(trimmed[textRange]).trimmingCharacters(in: .whitespacesAndNewlines)
                 if !lyricText.isEmpty {
-                    parsed.append(LyricLine(time: timestamp, text: lyricText))
+                    parsed.append(LyricLine(index: idx, time: timestamp, text: lyricText))
+                    idx += 1
                 }
-            } else if !trimmed.hasPrefix("[ti:") && !trimmed.hasPrefix("[ar:") && !trimmed.hasPrefix("[al:") && !trimmed.hasPrefix("[by:") {
-                parsed.append(LyricLine(time: nil, text: trimmed))
+            } else if !trimmed.hasPrefix("[ti:") && !trimmed.hasPrefix("[ar:") && !trimmed.hasPrefix("[al:") && !trimmed.hasPrefix("[by:") && !trimmed.hasPrefix("[length:") {
+                parsed.append(LyricLine(index: idx, time: nil, text: trimmed))
+                idx += 1
             }
         }
 
         return parsed
+    }
+
+    static func activeLineIndex(in lines: [LyricLine], currentTime: Double, duration: Double) -> Int? {
+        guard !lines.isEmpty else { return nil }
+        if lines.contains(where: { $0.time != nil }) {
+            var lastMatch: Int = 0
+            for (i, line) in lines.enumerated() {
+                if let t = line.time, t <= currentTime + 0.18 {
+                    lastMatch = i
+                }
+            }
+            return lastMatch
+        } else {
+            let dur = max(duration, 1)
+            let ratio = min(max(currentTime / dur, 0), 0.999)
+            return Int(ratio * Double(lines.count))
+        }
     }
 
     func fetchOnlineLyrics(title: String, artist: String) async -> String? {
@@ -333,7 +352,7 @@ final class LyricsManager {
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
         var query = cleanTitle
-        if artist != "Unknown Artist" && artist != "YouTube Import" && !artist.isEmpty {
+        if artist != "Unknown Artist" && artist != "Direct Audio Import" && !artist.isEmpty {
             query = "\(artist) \(cleanTitle)"
         }
 
@@ -344,11 +363,10 @@ final class LyricsManager {
 
         do {
             var req = URLRequest(url: url)
-            req.setValue("MusiQ iOS Player v2.0", forHTTPHeaderField: "User-Agent")
+            req.setValue("MusiQ iOS Player v2.1", forHTTPHeaderField: "User-Agent")
             let (data, _) = try await URLSession.shared.data(for: req)
             if let results = try JSONSerialization.jsonObject(with: data) as? [[String: Any]],
                !results.isEmpty {
-                // Prefer synced LRC lyrics first so line-by-line timing works out of the box!
                 if let syncedMatch = results.first(where: { ($0["syncedLyrics"] as? String)?.isEmpty == false }),
                    let synced = syncedMatch["syncedLyrics"] as? String {
                     return synced
@@ -388,14 +406,11 @@ final class MusiQEngine: ObservableObject {
     @Published var artworkRefreshID: UUID = UUID()
     @Published var playbackErrorMessage: String? = nil
 
-    // Active Track Parsed Lyrics for Live Line-by-Line Sync
     @Published var currentTrackLyrics: [LyricLine] = []
     @Published var isFetchingLyricsInBackground: Bool = false
 
-    // Listening Time Tracker (fileName -> total seconds listened)
     @Published var listenedSecondsByFile: [String: Double] = [:]
 
-    // A-B Loop state
     @Published var loopStart: Double? = nil
     @Published var loopEnd: Double? = nil
 
@@ -474,7 +489,6 @@ final class MusiQEngine: ObservableObject {
         }
     }
 
-    // MARK: - Live Synced Lyrics Loader
     func reloadLyricsForCurrentTrack() {
         guard let track = currentTrack else {
             currentTrackLyrics = []
@@ -506,7 +520,6 @@ final class MusiQEngine: ObservableObject {
         }
     }
 
-    // MARK: - Listening Time Tracker Persistence
     private func loadListeningStats() {
         if let dict = UserDefaults.standard.dictionary(forKey: listeningStatsKey) as? [String: Double] {
             listenedSecondsByFile = dict
@@ -530,7 +543,6 @@ final class MusiQEngine: ObservableObject {
         listenedSecondsByFile.values.reduce(0, +) / 60.0
     }
 
-    // MARK: - Background File Scanning
     func scanLocalLibrary() {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
@@ -628,7 +640,6 @@ final class MusiQEngine: ObservableObject {
         updateNowPlayingInfo()
     }
 
-    // MARK: - Manual Playlist Persistence
     func loadSavedPlaylists() {
         guard let data = UserDefaults.standard.data(forKey: playlistsStorageKey),
               let decoded = try? JSONDecoder().decode([Playlist].self, from: data) else {
@@ -676,7 +687,6 @@ final class MusiQEngine: ObservableObject {
         }
     }
 
-    // MARK: - Playback Controls
     func playTrack(_ track: Track, in queue: [Track]) {
         let validQueue = queue.isEmpty ? allTracks : queue
         currentQueue = validQueue
@@ -751,7 +761,7 @@ final class MusiQEngine: ObservableObject {
         } catch {
             isPlaying = false
             stopProgressTimer()
-            playbackErrorMessage = "Corrupted audio format. Delete & re-download this track."
+            playbackErrorMessage = "Corrupted audio format. Delete & re-import this track."
             print("Playback load error: \(error)")
         }
     }
@@ -840,7 +850,6 @@ final class MusiQEngine: ObservableObject {
         }
     }
 
-    // MARK: - DSP Controls
     func setPitch(_ cents: Float) {
         pitchCents = cents
         timePitchNode.pitch = cents
@@ -881,16 +890,15 @@ final class MusiQEngine: ObservableObject {
         }
     }
 
-    // MARK: - Progress & Listening Minutes Timer
     private func startProgressTimer() {
         stopProgressTimer()
-        progressTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
+        progressTimer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: true) { [weak self] _ in
             guard let self = self, self.isPlaying, self.activeAudioFile != nil else { return }
 
             if let activeFile = self.currentTrack?.fileName {
-                self.listenedSecondsByFile[activeFile, default: 0] += 0.2
+                self.listenedSecondsByFile[activeFile, default: 0] += 0.15
                 self.tickCounter += 1
-                if self.tickCounter % 20 == 0 {
+                if self.tickCounter % 25 == 0 {
                     self.saveListeningStats()
                 }
             }
@@ -915,7 +923,6 @@ final class MusiQEngine: ObservableObject {
         progressTimer = nil
     }
 
-    // MARK: - Lock Screen Controls
     private func setupRemoteTransportControls() {
         let commandCenter = MPRemoteCommandCenter.shared()
         commandCenter.playCommand.addTarget { [weak self] _ in
@@ -952,7 +959,7 @@ final class MusiQEngine: ObservableObject {
     }
 }
 
-// MARK: - Continuous 60fps Spinning Disc Modifier (Walkman CD & Side Vinyl)
+// MARK: - Continuous 60fps Spinning Disc Modifier
 struct ContinuousSpinView<Content: View>: View {
     let isSpinning: Bool
     let rpm: Double
@@ -985,7 +992,7 @@ struct ContinuousSpinView<Content: View>: View {
     }
 }
 
-// MARK: - Looping Marquee Text (iOS Phone Call Style)
+// MARK: - Looping Marquee Text
 struct LoopingMarqueeText: View {
     let text: String
     let font: Font
@@ -1063,97 +1070,358 @@ struct LoopingMarqueeText: View {
     }
 }
 
-// MARK: - Live Synced Line-by-Line Lyrics Display (Sits Between Artist & Scrubber)
-struct LiveSyncedLyricBanner: View {
+// MARK: - Spotify-Style Borderless In-Player Lyric Line (Image 4 Style)
+struct SpotifyInlineLyricView: View {
     @ObservedObject var progress: PlaybackProgressObserver
     let lines: [LyricLine]
     let isFetching: Bool
-    let onTapBanner: () -> Void
+    let onTap: () -> Void
 
     private var activeIndex: Int? {
-        guard !lines.isEmpty else { return nil }
-        let current = progress.currentTime
-
-        // 1. If lyrics have [mm:ss.xx] timestamps, pick the active line for the current second
-        if lines.contains(where: { $0.time != nil }) {
-            var lastMatch: Int = 0
-            for (idx, line) in lines.enumerated() {
-                if let t = line.time, t <= current + 0.15 {
-                    lastMatch = idx
-                }
-            }
-            return lastMatch
-        } else {
-            // 2. If plain unsynced lyrics, estimate active line smoothly by song progress
-            let dur = max(progress.duration, 1)
-            let ratio = min(max(current / dur, 0), 0.999)
-            return Int(ratio * Double(lines.count))
-        }
+        LyricsManager.activeLineIndex(
+            in: lines,
+            currentTime: progress.currentTime,
+            duration: progress.duration
+        )
     }
 
     var body: some View {
-        Button(action: onTapBanner) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 16)
-                    .fill(Color.black.opacity(0.28))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 16)
-                            .stroke(Color.white.opacity(0.14), lineWidth: 1)
-                    )
-
+        Button(action: onTap) {
+            ZStack(alignment: .leading) {
                 if let idx = activeIndex {
-                    let prevText = idx > 0 ? lines[idx - 1].text : " "
-                    let currText = lines[idx].text
-                    let nextText = (idx + 1 < lines.count) ? lines[idx + 1].text : " "
-
-                    VStack(spacing: 4) {
-                        Text(prevText)
-                            .font(.system(size: 11, weight: .medium, design: .rounded))
-                            .foregroundColor(.white.opacity(0.32))
-                            .lineLimit(1)
-
-                        Text(currText)
-                            .font(.system(size: 15, weight: .bold, design: .rounded))
-                            .foregroundColor(.white)
-                            .shadow(color: .white.opacity(0.35), radius: 6, x: 0, y: 0)
-                            .lineLimit(1)
-                            .minimumScaleFactor(0.8)
-                            .id("active_lyric_\(idx)")
-                            .transition(.asymmetric(
+                    let currentLine = lines[idx].text
+                    Text(currentLine)
+                        .font(.system(size: 19, weight: .bold, design: .rounded))
+                        .foregroundColor(.white)
+                        .lineLimit(2)
+                        .minimumScaleFactor(0.78)
+                        .multilineTextAlignment(.leading)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .id("spotify_inline_\(idx)")
+                        .transition(
+                            .asymmetric(
                                 insertion: .move(edge: .bottom).combined(with: .opacity),
                                 removal: .move(edge: .top).combined(with: .opacity)
-                            ))
-
-                        Text(nextText)
-                            .font(.system(size: 11, weight: .medium, design: .rounded))
-                            .foregroundColor(.white.opacity(0.38))
-                            .lineLimit(1)
-                    }
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 6)
-                    .animation(.spring(response: 0.32, dampingFraction: 0.82), value: idx)
+                            )
+                        )
+                        .animation(.spring(response: 0.34, dampingFraction: 0.84), value: idx)
                 } else if isFetching {
-                    HStack(spacing: 8) {
-                        ProgressView()
-                            .tint(.white.opacity(0.75))
-                            .scaleEffect(0.8)
-                        Text("Syncing live lyrics...")
-                            .font(.caption.weight(.medium))
-                            .foregroundColor(.white.opacity(0.65))
-                    }
+                    Text("Loading synced lyrics...")
+                        .font(.system(size: 15, weight: .semibold, design: .rounded))
+                        .foregroundColor(.white.opacity(0.45))
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 } else {
-                    HStack(spacing: 6) {
-                        Image(systemName: "quote.bubble")
-                            .font(.caption)
-                        Text("Tap to add or auto-fetch synced lyrics")
-                            .font(.caption.weight(.medium))
-                    }
-                    .foregroundColor(.white.opacity(0.5))
+                    Text(" ")
+                        .font(.system(size: 19, weight: .bold))
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
-            .frame(height: 66)
+            .frame(minHeight: 46)
         }
         .buttonStyle(.plain)
+    }
+}
+
+// MARK: - Apple Music-Style Blurred Scrolling Lyrics Sheet (Image 3 Style)
+struct AppleMusicLyricsSheetView: View {
+    @ObservedObject var engine: MusiQEngine
+    @ObservedObject var progress: PlaybackProgressObserver
+    let track: Track
+
+    @State private var showRawEditor: Bool = false
+    @State private var rawLyricsDraft: String = ""
+    @State private var isFetchingOnline: Bool = false
+    @Environment(\.dismiss) private var dismiss
+
+    private var activeIndex: Int? {
+        LyricsManager.activeLineIndex(
+            in: engine.currentTrackLyrics,
+            currentTime: progress.currentTime,
+            duration: progress.duration
+        )
+    }
+
+    private var albumGradient: [Color] {
+        ArtworkCache.shared.playerGradient(for: track.fileName)
+    }
+
+    var body: some View {
+        ZStack {
+            // Blurred Album Color Gradient Backdrop
+            LinearGradient(
+                colors: albumGradient,
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+            .ignoresSafeArea()
+
+            Color.black.opacity(0.28)
+                .ignoresSafeArea()
+
+            VStack(spacing: 0) {
+                // Grab Handle
+                Capsule()
+                    .fill(Color.white.opacity(0.32))
+                    .frame(width: 40, height: 5)
+                    .padding(.top, 10)
+                    .padding(.bottom, 12)
+
+                // Apple Music Compact Top Header (Cover Art + Title/Artist + '...' Menu Button)
+                HStack(spacing: 14) {
+                    if let art = ArtworkCache.shared.artwork(for: track.fileName) {
+                        Image(uiImage: art)
+                            .resizable()
+                            .scaledToFill()
+                            .frame(width: 52, height: 52)
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                            .shadow(color: .black.opacity(0.4), radius: 6, x: 0, y: 3)
+                    } else {
+                        RoundedRectangle(cornerRadius: 10)
+                            .fill(Color.white.opacity(0.15))
+                            .frame(width: 52, height: 52)
+                            .overlay(Image(systemName: "music.note").foregroundColor(.white))
+                    }
+
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(track.title)
+                            .font(.system(size: 17, weight: .bold))
+                            .foregroundColor(.white)
+                            .lineLimit(1)
+                        Text(track.artist)
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundColor(.white.opacity(0.65))
+                            .lineLimit(1)
+                    }
+
+                    Spacer()
+
+                    // '...' Circular Button (Auto-Fetch or Edit Raw LRC)
+                    Menu {
+                        Button {
+                            autoFetchSynced()
+                        } label: {
+                            Label("Auto-Fetch Synced Lyrics", systemImage: "sparkles")
+                        }
+
+                        Button {
+                            rawLyricsDraft = LyricsManager.shared.getLyrics(for: track)
+                            showRawEditor.toggle()
+                        } label: {
+                            Label(showRawEditor ? "View Apple Music Lyrics" : "Edit Raw Lyrics / LRC", systemImage: "pencil")
+                        }
+
+                        Button(role: .destructive) {
+                            dismiss()
+                        } label: {
+                            Label("Close Lyrics", systemImage: "xmark")
+                        }
+                    } label: {
+                        ZStack {
+                            Circle()
+                                .fill(Color.white.opacity(0.16))
+                                .frame(width: 38, height: 38)
+                            Image(systemName: "ellipsis")
+                                .font(.system(size: 16, weight: .bold))
+                                .foregroundColor(.white)
+                        }
+                    }
+                }
+                .padding(.horizontal, 24)
+                .padding(.bottom, 16)
+
+                if showRawEditor {
+                    // Optional Raw LRC Editor (Only shown when toggled via '...' menu)
+                    VStack(spacing: 12) {
+                        TextEditor(text: $rawLyricsDraft)
+                            .font(.system(size: 15, weight: .medium, design: .rounded))
+                            .padding(10)
+                            .background(Color.black.opacity(0.35))
+                            .clipShape(RoundedRectangle(cornerRadius: 14))
+                            .padding(.horizontal, 20)
+
+                        HStack(spacing: 16) {
+                            Button("Cancel") {
+                                showRawEditor = false
+                            }
+                            .foregroundColor(.white.opacity(0.75))
+
+                            Button {
+                                LyricsManager.shared.saveLyrics(rawLyricsDraft, for: track)
+                                engine.reloadLyricsForCurrentTrack()
+                                showRawEditor = false
+                            } label: {
+                                Text("Save Lyrics")
+                                    .font(.headline)
+                                    .padding(.horizontal, 22)
+                                    .padding(.vertical, 10)
+                                    .background(Color.white)
+                                    .foregroundColor(.black)
+                                    .clipShape(Capsule())
+                            }
+                        }
+                        .padding(.bottom, 16)
+                    }
+                } else {
+                    // Apple Music Scrolling & Blurred Lyrics Stage
+                    if engine.currentTrackLyrics.isEmpty {
+                        Spacer()
+                        VStack(spacing: 14) {
+                            if isFetchingOnline || engine.isFetchingLyricsInBackground {
+                                ProgressView()
+                                    .tint(.white)
+                                Text("Searching synced lyrics...")
+                                    .font(.subheadline)
+                                    .foregroundColor(.white.opacity(0.7))
+                            } else {
+                                Image(systemName: "quote.bubble")
+                                    .font(.system(size: 42))
+                                    .foregroundColor(.white.opacity(0.45))
+                                Text("No Synced Lyrics Found")
+                                    .font(.title3.bold())
+                                    .foregroundColor(.white)
+                                HStack(spacing: 12) {
+                                    Button {
+                                        autoFetchSynced()
+                                    } label: {
+                                        Label("Retry Auto-Fetch", systemImage: "sparkles")
+                                            .font(.subheadline.weight(.semibold))
+                                            .padding(.horizontal, 16)
+                                            .padding(.vertical, 10)
+                                            .background(Color.white.opacity(0.2))
+                                            .foregroundColor(.white)
+                                            .clipShape(Capsule())
+                                    }
+
+                                    Button {
+                                        rawLyricsDraft = ""
+                                        showRawEditor = true
+                                    } label: {
+                                        Label("Paste Lyrics", systemImage: "doc.on.clipboard")
+                                            .font(.subheadline.weight(.semibold))
+                                            .padding(.horizontal, 16)
+                                            .padding(.vertical, 10)
+                                            .background(Color.white.opacity(0.14))
+                                            .foregroundColor(.white)
+                                            .clipShape(Capsule())
+                                    }
+                                }
+                            }
+                        }
+                        Spacer()
+                    } else {
+                        ScrollViewReader { proxy in
+                            ScrollView(showsIndicators: false) {
+                                VStack(alignment: .leading, spacing: 26) {
+                                    Spacer().frame(height: 24)
+
+                                    ForEach(engine.currentTrackLyrics) { line in
+                                        let currentIdx = activeIndex ?? 0
+                                        let isCurrent = (line.index == currentIdx)
+                                        let distance = abs(line.index - currentIdx)
+
+                                        Button {
+                                            if let t = line.time {
+                                                engine.seek(to: t)
+                                            }
+                                        } label: {
+                                            Text(line.text)
+                                                .font(.system(size: isCurrent ? 31 : 27, weight: .bold, design: .rounded))
+                                                .foregroundColor(.white.opacity(isCurrent ? 1.0 : max(0.22, 0.50 - Double(distance) * 0.08)))
+                                                .blur(radius: isCurrent ? 0 : min(CGFloat(distance) * 1.45, 5.2))
+                                                .scaleEffect(isCurrent ? 1.0 : 0.96, anchor: .leading)
+                                                .multilineTextAlignment(.leading)
+                                                .frame(maxWidth: .infinity, alignment: .leading)
+                                                .animation(.spring(response: 0.38, dampingFraction: 0.82), value: currentIdx)
+                                        }
+                                        .buttonStyle(.plain)
+                                        .id(line.index)
+                                    }
+
+                                    Spacer().frame(height: 160)
+                                }
+                                .padding(.horizontal, 26)
+                            }
+                            .mask(
+                                LinearGradient(
+                                    stops: [
+                                        .init(color: .clear, location: 0.0),
+                                        .init(color: .black, location: 0.08),
+                                        .init(color: .black, location: 0.88),
+                                        .init(color: .clear, location: 1.0)
+                                    ],
+                                    startPoint: .top,
+                                    endPoint: .bottom
+                                )
+                            )
+                            .onAppear {
+                                if let idx = activeIndex {
+                                    proxy.scrollTo(idx, anchor: UnitPoint(x: 0.5, y: 0.28))
+                                }
+                            }
+                            .onChange(of: activeIndex) { newIdx in
+                                guard let idx = newIdx else { return }
+                                withAnimation(.spring(response: 0.45, dampingFraction: 0.85)) {
+                                    proxy.scrollTo(idx, anchor: UnitPoint(x: 0.5, y: 0.28))
+                                }
+                            }
+                        }
+                    }
+
+                    // Apple Music Bottom Playback Controls Bar Inside Lyrics View
+                    VStack(spacing: 14) {
+                        IsolatedScrubberView(progress: engine.progress) { newSeconds in
+                            engine.seek(to: newSeconds)
+                        }
+                        .padding(.horizontal, 26)
+
+                        HStack(spacing: 48) {
+                            Button {
+                                engine.previousTrack()
+                            } label: {
+                                Image(systemName: "backward.fill")
+                                    .font(.system(size: 28, weight: .bold))
+                                    .foregroundColor(.white)
+                            }
+
+                            Button {
+                                engine.togglePlayPause()
+                            } label: {
+                                Image(systemName: engine.isPlaying ? "pause.fill" : "play.fill")
+                                    .font(.system(size: 36, weight: .bold))
+                                    .foregroundColor(.white)
+                            }
+
+                            Button {
+                                engine.nextTrack()
+                            } label: {
+                                Image(systemName: "forward.fill")
+                                    .font(.system(size: 28, weight: .bold))
+                                    .foregroundColor(.white)
+                            }
+                        }
+                        .padding(.bottom, 18)
+                    }
+                    .padding(.top, 8)
+                }
+            }
+        }
+    }
+
+    private func autoFetchSynced() {
+        isFetchingOnline = true
+        Task {
+            if let found = await LyricsManager.shared.fetchOnlineLyrics(title: track.title, artist: track.artist) {
+                await MainActor.run {
+                    LyricsManager.shared.saveLyrics(found, for: track)
+                    engine.reloadLyricsForCurrentTrack()
+                    isFetchingOnline = false
+                }
+            } else {
+                await MainActor.run {
+                    isFetchingOnline = false
+                }
+            }
+        }
     }
 }
 
@@ -1178,9 +1446,9 @@ struct MusiQRootView: View {
                     }
                     .tag(1)
 
-                YouTubeDownloaderView(engine: engine)
+                DirectAudioImporterView(engine: engine)
                     .tabItem {
-                        Label("YouTube DL", systemImage: "arrow.down.circle.fill")
+                        Label("Audio URL", systemImage: "arrow.down.circle.fill")
                     }
                     .tag(2)
 
@@ -1437,7 +1705,7 @@ struct AllSongsSearchView: View {
                             .foregroundColor(.purple)
                         Text("No Songs Found")
                             .font(.headline)
-                        Text("Import audio files directly from your iPhone Files app, or download tracks from the YouTube DL tab.")
+                        Text("Import audio files directly from your iPhone Files app.")
                             .font(.caption)
                             .foregroundColor(.secondary)
                             .multilineTextAlignment(.center)
@@ -1657,7 +1925,7 @@ struct MiniPlayerBar: View {
     }
 }
 
-// MARK: - Full-Screen Player with Dynamic Album Cover Gradient & Live Line-by-Line Synced Lyrics
+// MARK: - Full-Screen Player (Spotify Inline Lyrics + Apple Music Full Lyrics Sheet)
 struct FullPlayerDeckView: View {
     @ObservedObject var engine: MusiQEngine
     @Binding var isPresented: Bool
@@ -1678,10 +1946,9 @@ struct FullPlayerDeckView: View {
     var body: some View {
         GeometryReader { geo in
             let safeWidth = geo.size.width
-            let artBoxSize = min(safeWidth - 104, 232)
+            let artBoxSize = min(safeWidth - 100, 236)
 
             ZStack {
-                // Dynamic Album Cover Gradient Background (Only inside Full Player)
                 LinearGradient(
                     colors: dynamicAlbumGradient,
                     startPoint: .topLeading,
@@ -1743,7 +2010,7 @@ struct FullPlayerDeckView: View {
 
                     Spacer(minLength: 2)
 
-                    // Fixed-Bounds Visualizer Stage (Sleeve, Walkman CD, Side Vinyl)
+                    // Visualizer Stage
                     PlayerVisualizerStage(
                         mode: engine.visualMode,
                         track: engine.currentTrack,
@@ -1751,8 +2018,18 @@ struct FullPlayerDeckView: View {
                         boxSize: artBoxSize,
                         refreshID: engine.artworkRefreshID
                     )
-                    .frame(width: safeWidth - 24, height: artBoxSize + 20)
+                    .frame(width: safeWidth - 24, height: artBoxSize + 18)
                     .clipped()
+
+                    // Spotify-Style Borderless Live Lyric Line (Right below Album Art, above Song Title, matching Image 4)
+                    SpotifyInlineLyricView(
+                        progress: engine.progress,
+                        lines: engine.currentTrackLyrics,
+                        isFetching: engine.isFetchingLyricsInBackground
+                    ) {
+                        activeBottomSheet = .lyrics
+                    }
+                    .padding(.horizontal, 26)
 
                     if let err = engine.playbackErrorMessage {
                         Text(err)
@@ -1762,7 +2039,7 @@ struct FullPlayerDeckView: View {
                             .padding(.horizontal, 20)
                     }
 
-                    // Looping Marquee Title + Artist
+                    // Song Title + Artist
                     VStack(spacing: 3) {
                         LoopingMarqueeText(
                             text: engine.currentTrack?.title ?? "No Track Selected",
@@ -1778,17 +2055,7 @@ struct FullPlayerDeckView: View {
                     }
                     .padding(.horizontal, 24)
 
-                    // Live Line-by-Line Synced Lyrics Banner (Positioned right between Artist & Scrubber!)
-                    LiveSyncedLyricBanner(
-                        progress: engine.progress,
-                        lines: engine.currentTrackLyrics,
-                        isFetching: engine.isFetchingLyricsInBackground
-                    ) {
-                        activeBottomSheet = .lyrics
-                    }
-                    .padding(.horizontal, 24)
-
-                    // Isolated Scrubber + Always-Visible Timers
+                    // Isolated Scrubber + Timers
                     IsolatedScrubberView(progress: engine.progress) { newSeconds in
                         engine.seek(to: newSeconds)
                     }
@@ -1855,7 +2122,7 @@ struct FullPlayerDeckView: View {
                         }
                     }
 
-                    // Bottom Action Bar (DSP, Edit Lyrics, Tag Editor, Queue)
+                    // Bottom Action Bar
                     HStack(spacing: 28) {
                         Button {
                             activeBottomSheet = .dsp
@@ -1929,8 +2196,9 @@ struct FullPlayerDeckView: View {
                         .presentationDetents([.medium])
                 case .lyrics:
                     if let current = engine.currentTrack {
-                        LyricsSheetView(engine: engine, track: current)
-                            .presentationDetents([.medium, .large])
+                        AppleMusicLyricsSheetView(engine: engine, progress: engine.progress, track: current)
+                            .presentationDetents([.large])
+                            .presentationDragIndicator(.hidden)
                     }
                 case .tagEditor:
                     if let current = engine.currentTrack {
@@ -2000,7 +2268,7 @@ struct IsolatedScrubberView: View {
     }
 }
 
-// MARK: - 3-Way Visualizer Stage (Square Sleeve, Metallic Walkman CD Player, Spinning Side Vinyl)
+// MARK: - 3-Way Visualizer Stage
 struct PlayerVisualizerStage: View {
     let mode: VisualMode
     let track: Track?
@@ -2226,103 +2494,6 @@ struct PlayerVisualizerStage: View {
     }
 }
 
-// MARK: - Synced Lyrics Editor & Auto-Fetcher Sheet
-struct LyricsSheetView: View {
-    @ObservedObject var engine: MusiQEngine
-    let track: Track
-    @State private var lyricsText: String = ""
-    @State private var isFetching: Bool = false
-    @State private var statusNote: String = ""
-    @Environment(\.dismiss) private var dismiss
-
-    var body: some View {
-        NavigationStack {
-            VStack(spacing: 12) {
-                HStack {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(track.title)
-                            .font(.headline)
-                            .lineLimit(1)
-                        Text(track.artist)
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
-                    Spacer()
-                    Button {
-                        fetchOnline()
-                    } label: {
-                        if isFetching {
-                            ProgressView()
-                        } else {
-                            Label("Auto-Fetch Synced", systemImage: "sparkles")
-                                .font(.caption.bold())
-                        }
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(.purple)
-                    .disabled(isFetching)
-                }
-                .padding(.horizontal)
-                .padding(.top, 8)
-
-                if !statusNote.isEmpty {
-                    Text(statusNote)
-                        .font(.caption2)
-                        .foregroundColor(.secondary)
-                }
-
-                TextEditor(text: $lyricsText)
-                    .font(.system(size: 15, weight: .medium, design: .rounded))
-                    .padding(10)
-                    .background(Color.white.opacity(0.05))
-                    .clipShape(RoundedRectangle(cornerRadius: 12))
-                    .padding(.horizontal)
-
-                Spacer()
-            }
-            .navigationTitle("Synced Lyrics & Notes")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button("Close") { dismiss() }
-                }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button("Save") {
-                        LyricsManager.shared.saveLyrics(lyricsText, for: track)
-                        engine.reloadLyricsForCurrentTrack()
-                        dismiss()
-                    }
-                    .fontWeight(.bold)
-                }
-            }
-            .onAppear {
-                lyricsText = LyricsManager.shared.getLyrics(for: track)
-            }
-        }
-    }
-
-    private func fetchOnline() {
-        isFetching = true
-        statusNote = "Searching LRCLIB for time-synced lyrics..."
-        Task {
-            if let found = await LyricsManager.shared.fetchOnlineLyrics(title: track.title, artist: track.artist) {
-                await MainActor.run {
-                    lyricsText = found
-                    LyricsManager.shared.saveLyrics(found, for: track)
-                    engine.reloadLyricsForCurrentTrack()
-                    isFetching = false
-                    statusNote = "Fetched & synced lyrics!"
-                }
-            } else {
-                await MainActor.run {
-                    isFetching = false
-                    statusNote = "No online match found. Paste lyrics or [mm:ss.xx] lines below."
-                }
-            }
-        }
-    }
-}
-
 // MARK: - Built-In Tag & Cover Art Editor
 struct BuiltInTagEditorSheet: View {
     @ObservedObject var engine: MusiQEngine
@@ -2492,34 +2663,20 @@ struct QueueSheetView: View {
     }
 }
 
-// MARK: - Tab 3: Multi-Engine YouTube Downloader (VisitorData InnerTube + Chunked Range + Loader/Invidious Proxy)
-struct YouTubeDownloaderView: View {
+// MARK: - Tab 3: Direct Audio URL Importer (.mp3, .m4a, .wav, .flac)
+struct DirectAudioImporterView: View {
     @ObservedObject var engine: MusiQEngine
     @State private var urlInput: String = ""
     @State private var customTitle: String = ""
     @State private var customArtist: String = ""
-    @State private var statusMessage: String = "Paste a YouTube link or direct audio URL."
+    @State private var statusMessage: String = "Paste a direct audio file link (.mp3, .m4a, .wav, .flac)."
     @State private var isDownloading: Bool = false
-
-    private let invidiousEndpoints = [
-        "https://inv.nadeko.net",
-        "https://invidious.nerdvpn.de",
-        "https://inv.tux.pizza",
-        "https://yewtu.be"
-    ]
-
-    private let cobaltEndpoints = [
-        "https://rue-cobalt.xenon.zone/",
-        "https://cobaltapi.cjs.nz/",
-        "https://nuko-c.meowing.de/",
-        "https://cobalt-api.lamps-dev.dev/"
-    ]
 
     var body: some View {
         NavigationStack {
             Form {
-                Section("YouTube / Audio Link") {
-                    TextField("https://youtu.be/... or direct audio link", text: $urlInput)
+                Section("Direct Audio File Link") {
+                    TextField("https://example.com/audio.mp3", text: $urlInput)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                 }
@@ -2531,14 +2688,14 @@ struct YouTubeDownloaderView: View {
 
                 Section {
                     Button {
-                        startDownload()
+                        startDirectDownload()
                     } label: {
                         HStack {
                             Spacer()
                             if isDownloading {
                                 ProgressView()
                                     .padding(.trailing, 8)
-                                Text("Extracting & Converting Audio...")
+                                Text("Downloading Audio...")
                             } else {
                                 Label("Download to MusiQ Library", systemImage: "arrow.down.circle.fill")
                                     .font(.headline)
@@ -2555,11 +2712,11 @@ struct YouTubeDownloaderView: View {
                         .foregroundColor(.secondary)
                 }
             }
-            .navigationTitle("YouTube Downloader")
+            .navigationTitle("Direct Audio URL")
         }
     }
 
-    private func startDownload() {
+    private func startDirectDownload() {
         let trimmedURL = urlInput.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let targetURL = URL(string: trimmedURL) else {
             statusMessage = "Invalid URL format."
@@ -2567,66 +2724,54 @@ struct YouTubeDownloaderView: View {
         }
 
         isDownloading = true
-        statusMessage = "Authenticating session & resolving audio stream..."
+        statusMessage = "Downloading direct audio file..."
 
         Task {
             do {
-                var resolvedTitle = customTitle.trimmingCharacters(in: .whitespacesAndNewlines)
-                var resolvedArtist = customArtist.trimmingCharacters(in: .whitespacesAndNewlines)
-                var thumbnailData: Data? = nil
+                let (tempURL, response) = try await URLSession.shared.download(from: targetURL)
+                let mime = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Type")?.lowercased() ?? ""
 
-                if trimmedURL.contains("youtube.com") || trimmedURL.contains("youtu.be") {
-                    if let encoded = trimmedURL.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
-                       let oembedURL = URL(string: "https://www.youtube.com/oembed?url=\(encoded)&format=json"),
-                       let (data, _) = try? await URLSession.shared.data(from: oembedURL),
-                       let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                        if resolvedTitle.isEmpty, let ytTitle = json["title"] as? String {
-                            resolvedTitle = ytTitle
-                        }
-                        if resolvedArtist.isEmpty, let ytAuthor = json["author_name"] as? String {
-                            resolvedArtist = ytAuthor
-                        }
-                        if let thumbStr = json["thumbnail_url"] as? String,
-                           let thumbURL = URL(string: thumbStr),
-                           let (imgData, _) = try? await URLSession.shared.data(from: thumbURL) {
-                            thumbnailData = imgData
-                        }
-                    }
+                var ext = targetURL.pathExtension.lowercased()
+                if !["mp3", "m4a", "wav", "flac", "aac"].contains(ext) {
+                    ext = mime.contains("mp4") || mime.contains("m4a") ? "m4a" : "mp3"
                 }
 
+                var resolvedTitle = customTitle.trimmingCharacters(in: .whitespacesAndNewlines)
                 if resolvedTitle.isEmpty {
                     resolvedTitle = targetURL.deletingPathExtension().lastPathComponent
                 }
-                if resolvedTitle.isEmpty || resolvedTitle == "watch" {
+                if resolvedTitle.isEmpty {
                     resolvedTitle = "Track_\(Int(Date().timeIntervalSince1970))"
                 }
-                if resolvedArtist.isEmpty {
-                    resolvedArtist = "YouTube Import"
-                }
 
-                let (readyFileURL, fileExt) = try await downloadAndPreparePlayableAudio(from: targetURL)
+                var resolvedArtist = customArtist.trimmingCharacters(in: .whitespacesAndNewlines)
+                if resolvedArtist.isEmpty {
+                    resolvedArtist = "Direct Audio Import"
+                }
 
                 let safeBaseName = resolvedTitle
                     .replacingOccurrences(of: "/", with: "-")
                     .replacingOccurrences(of: ":", with: "-")
                     .replacingOccurrences(of: "?", with: "")
-                    .replacingOccurrences(of: "\"", with: "")
 
-                let safeFileName = "\(safeBaseName).\(fileExt)"
+                let safeFileName = "\(safeBaseName).\(ext)"
                 let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
                 let destinationURL = docs.appendingPathComponent(safeFileName)
 
                 if FileManager.default.fileExists(atPath: destinationURL.path) {
                     try FileManager.default.removeItem(at: destinationURL)
                 }
-                try FileManager.default.moveItem(at: readyFileURL, to: destinationURL)
+                try FileManager.default.moveItem(at: tempURL, to: destinationURL)
 
-                ArtworkCache.shared.saveCustomMetadata(title: resolvedTitle, artist: resolvedArtist, for: safeFileName)
-                if let thumbData = thumbnailData, let image = UIImage(data: thumbData) {
-                    ArtworkCache.shared.setCustomArtwork(image.autoCroppedToSquare(), for: safeFileName)
+                guard (try? AVAudioFile(forReading: destinationURL)) != nil else {
+                    try? FileManager.default.removeItem(at: destinationURL)
+                    throw NSError(domain: "MusiQ", code: -1, userInfo: [
+                        NSLocalizedDescriptionKey: "URL did not point to a valid direct audio file."
+                    ])
                 }
 
-                // Pre-fetch synced lyrics right when downloaded
+                ArtworkCache.shared.saveCustomMetadata(title: resolvedTitle, artist: resolvedArtist, for: safeFileName)
+
                 if let lyrics = await LyricsManager.shared.fetchOnlineLyrics(title: resolvedTitle, artist: resolvedArtist) {
                     let tempTrack = Track(id: UUID(), title: resolvedTitle, artist: resolvedArtist, fileName: safeFileName, duration: 0)
                     LyricsManager.shared.saveLyrics(lyrics, for: tempTrack)
@@ -2634,7 +2779,7 @@ struct YouTubeDownloaderView: View {
 
                 await MainActor.run {
                     isDownloading = false
-                    statusMessage = "✅ Saved '\(resolvedTitle)' with synced lyrics & cover!"
+                    statusMessage = "✅ Saved '\(resolvedTitle)' to your Songs library!"
                     urlInput = ""
                     customTitle = ""
                     customArtist = ""
@@ -2643,366 +2788,10 @@ struct YouTubeDownloaderView: View {
             } catch {
                 await MainActor.run {
                     isDownloading = false
-                    statusMessage = "Download error: \(error.localizedDescription)"
+                    statusMessage = "Import error: \(error.localizedDescription)"
                 }
             }
         }
-    }
-
-    private func extractYouTubeID(from urlString: String) -> String? {
-        if let url = URL(string: urlString) {
-            if url.host?.contains("youtu.be") == true {
-                return url.pathComponents.dropFirst().first
-            }
-            if url.pathComponents.contains("shorts"), let last = url.pathComponents.last {
-                return last
-            }
-            if let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
-               let v = comps.queryItems?.first(where: { $0.name == "v" })?.value {
-                return v
-            }
-        }
-        return nil
-    }
-
-    private func downloadAndPreparePlayableAudio(from inputURL: URL) async throws -> (URL, String) {
-        let candidateURLs = try await resolveCandidateStreamURLs(from: inputURL)
-
-        for streamURL in candidateURLs {
-            await MainActor.run {
-                statusMessage = "Downloading audio stream..."
-            }
-
-            guard let tempURL = await downloadStreamWithRangeSupport(url: streamURL) else {
-                continue
-            }
-
-            guard let attrs = try? FileManager.default.attributesOfItem(atPath: tempURL.path),
-                  let fileSize = attrs[.size] as? UInt64, fileSize > 24576 else {
-                try? FileManager.default.removeItem(at: tempURL)
-                continue
-            }
-
-            // 1. Try direct AVAudioFile verification (.m4a or .mp3)
-            for ext in ["m4a", "mp3", "mp4"] {
-                let testURL = FileManager.default.temporaryDirectory.appendingPathComponent("test_\(UUID().uuidString).\(ext)")
-                try? FileManager.default.copyItem(at: tempURL, to: testURL)
-                if let audioFile = try? AVAudioFile(forReading: testURL), audioFile.length > 0 {
-                    try? FileManager.default.removeItem(at: tempURL)
-                    let finalExt = (ext == "mp4") ? "m4a" : ext
-                    let finalURL = FileManager.default.temporaryDirectory.appendingPathComponent("ready_\(UUID().uuidString).\(finalExt)")
-                    try? FileManager.default.moveItem(at: testURL, to: finalURL)
-                    return (finalURL, finalExt)
-                }
-                try? FileManager.default.removeItem(at: testURL)
-            }
-
-            // 2. Hardware remux fragmented MP4 or video+audio stream into pure Apple M4A
-            let rawMP4URL = FileManager.default.temporaryDirectory.appendingPathComponent("raw_\(UUID().uuidString).mp4")
-            try? FileManager.default.moveItem(at: tempURL, to: rawMP4URL)
-
-            if let convertedM4A = await remuxToNativeM4A(sourceURL: rawMP4URL),
-               let verified = try? AVAudioFile(forReading: convertedM4A), verified.length > 0 {
-                try? FileManager.default.removeItem(at: rawMP4URL)
-                return (convertedM4A, "m4a")
-            }
-            try? FileManager.default.removeItem(at: rawMP4URL)
-        }
-
-        throw NSError(domain: "MusiQDownloader", code: -1, userInfo: [
-            NSLocalizedDescriptionKey: "All stream extractors timed out on this track. Try pasting the link again or use the Files importer."
-        ])
-    }
-
-    /// Downloads googlevideo & proxy streams using Range headers so YouTube never throttles or 403-blocks mid-download
-    private func downloadStreamWithRangeSupport(url: URL) async -> URL? {
-        let outURL = FileManager.default.temporaryDirectory.appendingPathComponent("dl_\(UUID().uuidString).bin")
-        try? FileManager.default.removeItem(at: outURL)
-
-        // If it's a googlevideo stream, append range query or fetch in 4MB chunks
-        if url.host?.contains("googlevideo.com") == true {
-            FileManager.default.createFile(atPath: outURL.path, contents: nil)
-            guard let handle = try? FileHandle(forWritingTo: outURL) else { return nil }
-            defer { try? handle.close() }
-
-            var offset: Int64 = 0
-            let chunkSize: Int64 = 4_194_304 // 4 MB chunks bypass throttling
-            var totalReceived: Int64 = 0
-
-            while true {
-                let endByte = offset + chunkSize - 1
-                var req = URLRequest(url: url)
-                req.timeoutInterval = 18
-                req.setValue("bytes=\(offset)-\(endByte)", forHTTPHeaderField: "Range")
-                req.setValue("com.google.android.youtube/19.45.4 (Linux; U; Android 14) gzip", forHTTPHeaderField: "User-Agent")
-
-                guard let (data, resp) = try? await URLSession.shared.data(for: req),
-                      let http = resp as? HTTPURLResponse,
-                      (200...206).contains(http.statusCode),
-                      !data.isEmpty else {
-                    break
-                }
-
-                handle.write(data)
-                totalReceived += Int64(data.count)
-                if Int64(data.count) < chunkSize || http.statusCode == 200 {
-                    break
-                }
-                offset += Int64(data.count)
-            }
-
-            return totalReceived > 24576 ? outURL : nil
-        } else {
-            var req = URLRequest(url: url)
-            req.timeoutInterval = 25
-            req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)", forHTTPHeaderField: "User-Agent")
-            guard let (tempURL, resp) = try? await URLSession.shared.download(for: req),
-                  let http = resp as? HTTPURLResponse,
-                  (200...299).contains(http.statusCode) else {
-                return nil
-            }
-            let mime = http.value(forHTTPHeaderField: "Content-Type")?.lowercased() ?? ""
-            if mime.contains("text/html") || mime.contains("application/json") {
-                try? FileManager.default.removeItem(at: tempURL)
-                return nil
-            }
-            try? FileManager.default.moveItem(at: tempURL, to: outURL)
-            return outURL
-        }
-    }
-
-    private func remuxToNativeM4A(sourceURL: URL) async -> URL? {
-        let asset = AVURLAsset(url: sourceURL)
-        guard let exporter = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetAppleM4A) else {
-            return nil
-        }
-        let outURL = FileManager.default.temporaryDirectory.appendingPathComponent("remux_\(UUID().uuidString).m4a")
-        try? FileManager.default.removeItem(at: outURL)
-        exporter.outputURL = outURL
-        exporter.outputFileType = .m4a
-
-        await exporter.export()
-        if exporter.status == .completed {
-            return outURL
-        }
-        return nil
-    }
-
-    private func resolveCandidateStreamURLs(from inputURL: URL) async throws -> [URL] {
-        let ext = inputURL.pathExtension.lowercased()
-        if ["mp3", "m4a", "wav", "flac", "aac"].contains(ext) {
-            return [inputURL]
-        }
-
-        var results: [URL] = []
-
-        if let videoID = extractYouTubeID(from: inputURL.absoluteString) {
-            // 1. Direct InnerTube Extraction with live VisitorData session token
-            let directStreams = await fetchDirectInnerTubeStreams(videoID: videoID)
-            results.append(contentsOf: directStreams)
-
-            // 2. Loader.to / OceanSaver Cloud M4A Transcoder Fallback (works on VEVO/ciphered music videos)
-            if let cloudURL = await fetchOceanSaverTranscodedStream(videoURL: "https://www.youtube.com/watch?v=\(videoID)") {
-                results.append(cloudURL)
-            }
-
-            // 3. Invidious Local-Proxied Streams (?local=true bypasses IP locks!)
-            for invBase in invidiousEndpoints {
-                // Direct local-proxied itag 140 (M4A) & itag 18 (MP4) endpoints
-                if let directProxy140 = URL(string: "\(invBase)/latest_version?id=\(videoID)&itag=140&local=true") {
-                    results.append(directProxy140)
-                }
-                if let directProxy18 = URL(string: "\(invBase)/latest_version?id=\(videoID)&itag=18&local=true") {
-                    results.append(directProxy18)
-                }
-            }
-        }
-
-        // 4. Cobalt API Fallback
-        for endpoint in cobaltEndpoints {
-            guard let apiEndpoint = URL(string: endpoint) else { continue }
-            var request = URLRequest(url: apiEndpoint)
-            request.httpMethod = "POST"
-            request.timeoutInterval = 8
-            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            request.setValue("application/json", forHTTPHeaderField: "Accept")
-
-            let payload: [String: Any] = [
-                "url": inputURL.absoluteString,
-                "downloadMode": "audio",
-                "audioFormat": "mp3"
-            ]
-            request.httpBody = try? JSONSerialization.data(withJSONObject: payload)
-
-            if let (data, _) = try? await URLSession.shared.data(for: request),
-               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let streamURLStr = json["url"] as? String,
-               let streamURL = URL(string: streamURLStr) {
-                results.append(streamURL)
-            }
-        }
-
-        if results.isEmpty {
-            throw URLError(.cannotFindHost)
-        }
-        return results
-    }
-
-    /// Fetches a fresh visitorData token from YouTube so InnerTube never returns LOGIN_REQUIRED
-    private func fetchYouTubeVisitorData() async -> String? {
-        guard let url = URL(string: "https://www.youtube.com/sw.js_data") else { return nil }
-        var req = URLRequest(url: url)
-        req.timeoutInterval = 6
-        req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)", forHTTPHeaderField: "User-Agent")
-        guard let (data, _) = try? await URLSession.shared.data(for: req),
-              let text = String(data: data, encoding: .utf8) else { return nil }
-
-        let pattern = #""Cgt[A-Za-z0-9_\-]+""#
-        if let range = text.range(of: pattern, options: .regularExpression) {
-            return String(text[range]).replacingOccurrences(of: "\"", with: "")
-        }
-        return nil
-    }
-
-    private func fetchDirectInnerTubeStreams(videoID: String) async -> [URL] {
-        var found: [URL] = []
-        let visitorData = await fetchYouTubeVisitorData()
-
-        let clients: [([String: Any], String)] = [
-            (
-                [
-                    "clientName": "ANDROID_TESTSUITE",
-                    "clientVersion": "1.9",
-                    "androidSdkVersion": 34,
-                    "osName": "Android",
-                    "osVersion": "14",
-                    "hl": "en",
-                    "gl": "US"
-                ],
-                "com.google.android.youtube/1.9 (Linux; U; Android 14; en_US) gzip"
-            ),
-            (
-                [
-                    "clientName": "ANDROID_VR",
-                    "clientVersion": "1.60.19",
-                    "deviceMake": "Oculus",
-                    "deviceModel": "Quest 3",
-                    "androidSdkVersion": 32,
-                    "osName": "Android",
-                    "osVersion": "12L",
-                    "hl": "en",
-                    "gl": "US"
-                ],
-                "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"
-            ),
-            (
-                [
-                    "clientName": "IOS",
-                    "clientVersion": "19.45.4",
-                    "deviceMake": "Apple",
-                    "deviceModel": "iPhone16,2",
-                    "osName": "iPhone",
-                    "osVersion": "18.1.0.22B83",
-                    "hl": "en",
-                    "gl": "US"
-                ],
-                "com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1 like Mac OS X)"
-            )
-        ]
-
-        guard let endpoint = URL(string: "https://www.youtube.com/youtubei/v1/player?prettyPrint=false") else {
-            return []
-        }
-
-        for (baseClientDict, userAgent) in clients {
-            var clientDict = baseClientDict
-            if let vd = visitorData {
-                clientDict["visitorData"] = vd
-            }
-
-            var req = URLRequest(url: endpoint)
-            req.httpMethod = "POST"
-            req.timeoutInterval = 10
-            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            req.setValue(userAgent, forHTTPHeaderField: "User-Agent")
-            if let vd = visitorData {
-                req.setValue(vd, forHTTPHeaderField: "X-Goog-Visitor-Id")
-            }
-
-            let body: [String: Any] = [
-                "videoId": videoID,
-                "context": ["client": clientDict],
-                "contentCheckOk": true,
-                "racyCheckOk": true
-            ]
-            req.httpBody = try? JSONSerialization.data(withJSONObject: body)
-
-            guard let (data, _) = try? await URLSession.shared.data(for: req),
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let streamingData = json["streamingData"] as? [String: Any] else {
-                continue
-            }
-
-            if let adaptive = streamingData["adaptiveFormats"] as? [[String: Any]] {
-                for fmt in adaptive {
-                    let mime = (fmt["mimeType"] as? String)?.lowercased() ?? ""
-                    if mime.contains("audio/mp4") || (fmt["itag"] as? Int) == 140 {
-                        if let urlStr = fmt["url"] as? String, let u = URL(string: urlStr) {
-                            found.append(u)
-                        }
-                    }
-                }
-            }
-
-            if let formats = streamingData["formats"] as? [[String: Any]] {
-                for fmt in formats {
-                    let mime = (fmt["mimeType"] as? String)?.lowercased() ?? ""
-                    if mime.contains("mp4") {
-                        if let urlStr = fmt["url"] as? String, let u = URL(string: urlStr) {
-                            found.append(u)
-                        }
-                    }
-                }
-            }
-
-            if !found.isEmpty { break }
-        }
-
-        return found
-    }
-
-    /// Cloud M4A transcoder fallback for VEVO / signature-ciphered music videos
-    private func fetchOceanSaverTranscodedStream(videoURL: String) async -> URL? {
-        guard let encoded = videoURL.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
-              let initURL = URL(string: "https://p.oceansaver.in/ajax/download.php?format=m4a&url=\(encoded)") else {
-            return nil
-        }
-
-        var req = URLRequest(url: initURL)
-        req.timeoutInterval = 10
-        req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)", forHTTPHeaderField: "User-Agent")
-
-        guard let (data, _) = try? await URLSession.shared.data(for: req),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let jobID = json["id"] as? String else {
-            return nil
-        }
-
-        guard let progressURL = URL(string: "https://p.oceansaver.in/ajax/progress.php?id=\(jobID)") else {
-            return nil
-        }
-
-        for _ in 0..<8 {
-            try? await Task.sleep(nanoseconds: 1_200_000_000)
-            if let (pData, _) = try? await URLSession.shared.data(from: progressURL),
-               let pJson = try? JSONSerialization.jsonObject(with: pData) as? [String: Any],
-               let dlStr = pJson["download_url"] as? String,
-               !dlStr.isEmpty,
-               let dlURL = URL(string: dlStr) {
-                return dlURL
-            }
-        }
-        return nil
     }
 }
 
