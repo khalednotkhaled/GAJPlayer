@@ -40,6 +40,12 @@ struct Playlist: Identifiable, Hashable, Codable {
     var trackFileNames: [String] = []
 }
 
+struct LyricLine: Identifiable, Equatable {
+    let id = UUID()
+    let time: TimeInterval?
+    let text: String
+}
+
 enum VisualMode: String, CaseIterable {
     case sleeve = "Sleeve"
     case cdPlayer = "Walkman CD"
@@ -61,17 +67,15 @@ enum EQPreset: String, CaseIterable {
     case lateNight = "Warm / Lo-Fi"
 }
 
-// MARK: - Image Auto-Cropper (1:1 Center Square & YouTube Letterbox Remover)
+// MARK: - Image Auto-Cropper & Dominant Album Color Palette Extractor
 extension UIImage {
     func autoCroppedToSquare() -> UIImage {
         guard let cgImage = self.cgImage else { return self }
         let width = CGFloat(cgImage.width)
         let height = CGFloat(cgImage.height)
 
-        // If 16:9 or 4:3 YouTube thumbnail (wider than tall), strip top/bottom black bars first
         var effectiveHeight = height
         if width > height * 1.25 {
-            // Standard YouTube 4:3 oEmbed thumbnails (480x360) have 45px black bars top & bottom
             let aspect = width / height
             if abs(aspect - (4.0 / 3.0)) < 0.08 {
                 effectiveHeight = height * 0.75
@@ -86,12 +90,97 @@ extension UIImage {
         guard let croppedCG = cgImage.cropping(to: cropRect) else { return self }
         return UIImage(cgImage: croppedCG, scale: self.scale, orientation: self.imageOrientation)
     }
+
+    /// Downscales the album cover and extracts two rich, vibrant colors for the full-screen player background
+    func extractPlayerGradientColors() -> [Color] {
+        guard let cgImage = self.cgImage else {
+            return [Color(red: 0.16, green: 0.10, blue: 0.22), Color(red: 0.05, green: 0.05, blue: 0.08)]
+        }
+
+        let sampleSize = 16
+        let bytesPerPixel = 4
+        let bytesPerRow = sampleSize * bytesPerPixel
+        var rawData = [UInt8](repeating: 0, count: sampleSize * sampleSize * bytesPerPixel)
+
+        guard let context = CGContext(
+            data: &rawData,
+            width: sampleSize,
+            height: sampleSize,
+            bitsPerComponent: 8,
+            bytesPerRow: bytesPerRow,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            return [Color(red: 0.16, green: 0.10, blue: 0.22), Color(red: 0.05, green: 0.05, blue: 0.08)]
+        }
+
+        context.draw(cgImage, in: CGRect(x: 0, y: 0, width: sampleSize, height: sampleSize))
+
+        var topR: CGFloat = 0, topG: CGFloat = 0, topB: CGFloat = 0, topWeight: CGFloat = 0
+        var botR: CGFloat = 0, botG: CGFloat = 0, botB: CGFloat = 0, botWeight: CGFloat = 0
+
+        for y in 0..<sampleSize {
+            for x in 0..<sampleSize {
+                let offset = (y * sampleSize + x) * bytesPerPixel
+                let r = CGFloat(rawData[offset]) / 255.0
+                let g = CGFloat(rawData[offset + 1]) / 255.0
+                let b = CGFloat(rawData[offset + 2]) / 255.0
+
+                let maxC = max(r, max(g, b))
+                let minC = min(r, min(g, b))
+                let saturation = maxC > 0 ? (maxC - minC) / maxC : 0
+                let brightness = (r + g + b) / 3.0
+
+                // Favor vibrant mid-tone pixels over pure black or pure white
+                let weight: CGFloat = 0.2 + (saturation * 2.2) + (brightness > 0.1 && brightness < 0.9 ? 0.5 : 0.0)
+
+                if y < sampleSize / 2 {
+                    topR += r * weight
+                    topG += g * weight
+                    topB += b * weight
+                    topWeight += weight
+                } else {
+                    botR += r * weight
+                    botG += g * weight
+                    botB += b * weight
+                    botWeight += weight
+                }
+            }
+        }
+
+        let c1 = Self.tunedBackgroundUIColor(
+            r: topWeight > 0 ? topR / topWeight : 0.2,
+            g: topWeight > 0 ? topG / topWeight : 0.1,
+            b: topWeight > 0 ? topB / topWeight : 0.3,
+            targetBrightness: 0.52
+        )
+        let c2 = Self.tunedBackgroundUIColor(
+            r: botWeight > 0 ? botR / botWeight : 0.1,
+            g: botWeight > 0 ? botG / botWeight : 0.08,
+            b: botWeight > 0 ? botB / botWeight : 0.18,
+            targetBrightness: 0.28
+        )
+
+        return [Color(c1), Color(c2), Color(red: 0.04, green: 0.04, blue: 0.06)]
+    }
+
+    private static func tunedBackgroundUIColor(r: CGFloat, g: CGFloat, b: CGFloat, targetBrightness: CGFloat) -> UIColor {
+        let raw = UIColor(red: r, green: g, blue: b, alpha: 1.0)
+        var h: CGFloat = 0, s: CGFloat = 0, br: CGFloat = 0, a: CGFloat = 0
+        if raw.getHue(&h, saturation: &s, brightness: &br, alpha: &a) {
+            let boostedSat = min(max(s * 1.35, 0.28), 0.92)
+            let clampedBr = min(max(br * 0.75, 0.18), targetBrightness)
+            return UIColor(hue: h, saturation: boostedSat, brightness: clampedBr, alpha: 1.0)
+        }
+        return raw
+    }
 }
 
-// MARK: - Fast Artwork & Custom Tag Cache
+// MARK: - Fast Artwork, Gradient & Custom Tag Cache
 final class ArtworkCache {
     static let shared = ArtworkCache()
     private let cache = NSCache<NSString, UIImage>()
+    private var gradientCache: [String: [Color]] = [:]
     private let customMetaKey = "MusiQ_Custom_Metadata_v2"
 
     func artwork(for fileName: String) -> UIImage? {
@@ -103,6 +192,7 @@ final class ArtworkCache {
         if let data = try? Data(contentsOf: customCoverURL), let img = UIImage(data: data) {
             let squared = img.autoCroppedToSquare()
             cache.setObject(squared, forKey: fileName as NSString)
+            gradientCache[fileName] = squared.extractPlayerGradientColors()
             return squared
         }
 
@@ -115,6 +205,7 @@ final class ArtworkCache {
                    let img = UIImage(data: data) {
                     let squared = img.autoCroppedToSquare()
                     cache.setObject(squared, forKey: fileName as NSString)
+                    gradientCache[fileName] = squared.extractPlayerGradientColors()
                     return squared
                 }
             }
@@ -122,9 +213,25 @@ final class ArtworkCache {
         return nil
     }
 
+    func playerGradient(for fileName: String?) -> [Color] {
+        guard let fileName = fileName else {
+            return [Color(red: 0.16, green: 0.10, blue: 0.24), Color(red: 0.08, green: 0.06, blue: 0.14), Color(red: 0.04, green: 0.04, blue: 0.06)]
+        }
+        if let cached = gradientCache[fileName] {
+            return cached
+        }
+        if let img = artwork(for: fileName) {
+            let cols = img.extractPlayerGradientColors()
+            gradientCache[fileName] = cols
+            return cols
+        }
+        return [Color(red: 0.18, green: 0.10, blue: 0.26), Color(red: 0.09, green: 0.06, blue: 0.15), Color(red: 0.04, green: 0.04, blue: 0.06)]
+    }
+
     func setCustomArtwork(_ image: UIImage, for fileName: String) {
         let squared = image.autoCroppedToSquare()
         cache.setObject(squared, forKey: fileName as NSString)
+        gradientCache[fileName] = squared.extractPlayerGradientColors()
         if let data = squared.jpegData(compressionQuality: 0.9) {
             let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
             let customCoverURL = docs.appendingPathComponent(fileName + ".cover.jpg")
@@ -153,10 +260,10 @@ final class ArtworkCache {
     }
 }
 
-// MARK: - Lyrics Storage & Auto-Fetcher
+// MARK: - Synced Lyrics Storage, LRC Parser & Auto-Fetcher
 final class LyricsManager {
     static let shared = LyricsManager()
-    private let storageKey = "MusiQ_Saved_Lyrics_v2"
+    private let storageKey = "MusiQ_Saved_Lyrics_v3"
 
     func getLyrics(for track: Track) -> String {
         if let dict = UserDefaults.standard.dictionary(forKey: storageKey) as? [String: String],
@@ -176,15 +283,57 @@ final class LyricsManager {
         UserDefaults.standard.set(dict, forKey: storageKey)
     }
 
+    /// Parses [mm:ss.xx] LRC timestamps or plain lyrics into structured line-by-line items
+    func parseLyrics(_ raw: String) -> [LyricLine] {
+        let rawLines = raw.components(separatedBy: .newlines)
+        var parsed: [LyricLine] = []
+
+        let pattern = #"\[(\d{1,2}):(\d{2})(?:[\.:](\d{1,3}))?\](.*)"#
+        let regex = try? NSRegularExpression(pattern: pattern)
+
+        for line in rawLines {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+
+            let nsRange = NSRange(trimmed.startIndex..<trimmed.endIndex, in: trimmed)
+            if let match = regex?.firstMatch(in: trimmed, options: [], range: nsRange),
+               let minRange = Range(match.range(at: 1), in: trimmed),
+               let secRange = Range(match.range(at: 2), in: trimmed),
+               let textRange = Range(match.range(at: 4), in: trimmed) {
+
+                let mins = Double(trimmed[minRange]) ?? 0
+                let secs = Double(trimmed[secRange]) ?? 0
+                var frac: Double = 0
+                if match.range(at: 3).location != NSNotFound,
+                   let fracRange = Range(match.range(at: 3), in: trimmed) {
+                    let fracStr = String(trimmed[fracRange])
+                    let divisor = pow(10.0, Double(fracStr.count))
+                    frac = (Double(fracStr) ?? 0) / divisor
+                }
+                let timestamp = (mins * 60.0) + secs + frac
+                let lyricText = String(trimmed[textRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !lyricText.isEmpty {
+                    parsed.append(LyricLine(time: timestamp, text: lyricText))
+                }
+            } else if !trimmed.hasPrefix("[ti:") && !trimmed.hasPrefix("[ar:") && !trimmed.hasPrefix("[al:") && !trimmed.hasPrefix("[by:") {
+                parsed.append(LyricLine(time: nil, text: trimmed))
+            }
+        }
+
+        return parsed
+    }
+
     func fetchOnlineLyrics(title: String, artist: String) async -> String? {
         let cleanTitle = title
             .replacingOccurrences(of: "(highest quality)", with: "", options: .caseInsensitive)
             .replacingOccurrences(of: "(Official Audio)", with: "", options: .caseInsensitive)
             .replacingOccurrences(of: "(Official Video)", with: "", options: .caseInsensitive)
+            .replacingOccurrences(of: "(Official Music Video)", with: "", options: .caseInsensitive)
+            .replacingOccurrences(of: "(Lyrics)", with: "", options: .caseInsensitive)
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
         var query = cleanTitle
-        if artist != "Unknown Artist" && !artist.isEmpty {
+        if artist != "Unknown Artist" && artist != "YouTube Import" && !artist.isEmpty {
             query = "\(artist) \(cleanTitle)"
         }
 
@@ -194,14 +343,18 @@ final class LyricsManager {
         }
 
         do {
-            let (data, _) = try await URLSession.shared.data(from: url)
+            var req = URLRequest(url: url)
+            req.setValue("MusiQ iOS Player v2.0", forHTTPHeaderField: "User-Agent")
+            let (data, _) = try await URLSession.shared.data(for: req)
             if let results = try JSONSerialization.jsonObject(with: data) as? [[String: Any]],
-               let first = results.first {
-                if let plain = first["plainLyrics"] as? String, !plain.isEmpty {
-                    return plain
-                }
-                if let synced = first["syncedLyrics"] as? String, !synced.isEmpty {
+               !results.isEmpty {
+                // Prefer synced LRC lyrics first so line-by-line timing works out of the box!
+                if let syncedMatch = results.first(where: { ($0["syncedLyrics"] as? String)?.isEmpty == false }),
+                   let synced = syncedMatch["syncedLyrics"] as? String {
                     return synced
+                }
+                if let plain = results.first?["plainLyrics"] as? String, !plain.isEmpty {
+                    return plain
                 }
             }
         } catch {
@@ -234,6 +387,10 @@ final class MusiQEngine: ObservableObject {
     @Published var eqPreset: EQPreset = .flat
     @Published var artworkRefreshID: UUID = UUID()
     @Published var playbackErrorMessage: String? = nil
+
+    // Active Track Parsed Lyrics for Live Line-by-Line Sync
+    @Published var currentTrackLyrics: [LyricLine] = []
+    @Published var isFetchingLyricsInBackground: Bool = false
 
     // Listening Time Tracker (fileName -> total seconds listened)
     @Published var listenedSecondsByFile: [String: Double] = [:]
@@ -317,6 +474,38 @@ final class MusiQEngine: ObservableObject {
         }
     }
 
+    // MARK: - Live Synced Lyrics Loader
+    func reloadLyricsForCurrentTrack() {
+        guard let track = currentTrack else {
+            currentTrackLyrics = []
+            return
+        }
+        let saved = LyricsManager.shared.getLyrics(for: track)
+        if !saved.isEmpty {
+            currentTrackLyrics = LyricsManager.shared.parseLyrics(saved)
+        } else {
+            currentTrackLyrics = []
+            isFetchingLyricsInBackground = true
+            let requestedFile = track.fileName
+            Task {
+                if let fetched = await LyricsManager.shared.fetchOnlineLyrics(title: track.title, artist: track.artist) {
+                    LyricsManager.shared.saveLyrics(fetched, for: track)
+                    let parsed = LyricsManager.shared.parseLyrics(fetched)
+                    await MainActor.run {
+                        if self.currentTrack?.fileName == requestedFile {
+                            self.currentTrackLyrics = parsed
+                        }
+                        self.isFetchingLyricsInBackground = false
+                    }
+                } else {
+                    await MainActor.run {
+                        self.isFetchingLyricsInBackground = false
+                    }
+                }
+            }
+        }
+    }
+
     // MARK: - Listening Time Tracker Persistence
     private func loadListeningStats() {
         if let dict = UserDefaults.standard.dictionary(forKey: listeningStatsKey) as? [String: Double] {
@@ -358,7 +547,6 @@ final class MusiQEngine: ObservableObject {
 
             for url in urls where validExts.contains(url.pathExtension.lowercased()) {
                 let fileName = url.lastPathComponent
-                // Verify file is actually readable audio and not a corrupted 0-byte or HTML stub
                 guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
                       let fileSize = attrs[.size] as? UInt64, fileSize > 4096 else {
                     continue
@@ -488,7 +676,7 @@ final class MusiQEngine: ObservableObject {
         }
     }
 
-    // MARK: - Playback Controls (Strict Buffer Reset so Previous Track Never Bleeds Over)
+    // MARK: - Playback Controls
     func playTrack(_ track: Track, in queue: [Track]) {
         let validQueue = queue.isEmpty ? allTracks : queue
         currentQueue = validQueue
@@ -506,7 +694,6 @@ final class MusiQEngine: ObservableObject {
         scheduleGeneration += 1
         let currentGen = scheduleGeneration
 
-        // Strictly clear previous audio buffer so old song can NEVER play under new title
         playerNode.stop()
         playerNode.reset()
         activeAudioFile = nil
@@ -515,6 +702,8 @@ final class MusiQEngine: ObservableObject {
         loopStart = nil
         loopEnd = nil
         progress.currentTime = 0
+
+        reloadLyricsForCurrentTrack()
 
         do {
             let file = try AVAudioFile(forReading: track.fileURL)
@@ -532,7 +721,6 @@ final class MusiQEngine: ObservableObject {
             progress.duration = max(1, Double(totalFrames) / sampleRate)
             progress.currentTime = Double(seekFrameOffset) / sampleRate
 
-            // Reconnect graph to match current file channel count cleanly
             engine.disconnectNodeOutput(playerNode)
             engine.connect(playerNode, to: timePitchNode, format: file.processingFormat)
 
@@ -696,13 +884,13 @@ final class MusiQEngine: ObservableObject {
     // MARK: - Progress & Listening Minutes Timer
     private func startProgressTimer() {
         stopProgressTimer()
-        progressTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+        progressTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
             guard let self = self, self.isPlaying, self.activeAudioFile != nil else { return }
 
             if let activeFile = self.currentTrack?.fileName {
-                self.listenedSecondsByFile[activeFile, default: 0] += 0.25
+                self.listenedSecondsByFile[activeFile, default: 0] += 0.2
                 self.tickCounter += 1
-                if self.tickCounter % 16 == 0 {
+                if self.tickCounter % 20 == 0 {
                     self.saveListeningStats()
                 }
             }
@@ -872,6 +1060,100 @@ struct LoopingMarqueeText: View {
         withAnimation(.linear(duration: duration).delay(1.0).repeatForever(autoreverses: false)) {
             offset = -totalShift
         }
+    }
+}
+
+// MARK: - Live Synced Line-by-Line Lyrics Display (Sits Between Artist & Scrubber)
+struct LiveSyncedLyricBanner: View {
+    @ObservedObject var progress: PlaybackProgressObserver
+    let lines: [LyricLine]
+    let isFetching: Bool
+    let onTapBanner: () -> Void
+
+    private var activeIndex: Int? {
+        guard !lines.isEmpty else { return nil }
+        let current = progress.currentTime
+
+        // 1. If lyrics have [mm:ss.xx] timestamps, pick the active line for the current second
+        if lines.contains(where: { $0.time != nil }) {
+            var lastMatch: Int = 0
+            for (idx, line) in lines.enumerated() {
+                if let t = line.time, t <= current + 0.15 {
+                    lastMatch = idx
+                }
+            }
+            return lastMatch
+        } else {
+            // 2. If plain unsynced lyrics, estimate active line smoothly by song progress
+            let dur = max(progress.duration, 1)
+            let ratio = min(max(current / dur, 0), 0.999)
+            return Int(ratio * Double(lines.count))
+        }
+    }
+
+    var body: some View {
+        Button(action: onTapBanner) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 16)
+                    .fill(Color.black.opacity(0.28))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 16)
+                            .stroke(Color.white.opacity(0.14), lineWidth: 1)
+                    )
+
+                if let idx = activeIndex {
+                    let prevText = idx > 0 ? lines[idx - 1].text : " "
+                    let currText = lines[idx].text
+                    let nextText = (idx + 1 < lines.count) ? lines[idx + 1].text : " "
+
+                    VStack(spacing: 4) {
+                        Text(prevText)
+                            .font(.system(size: 11, weight: .medium, design: .rounded))
+                            .foregroundColor(.white.opacity(0.32))
+                            .lineLimit(1)
+
+                        Text(currText)
+                            .font(.system(size: 15, weight: .bold, design: .rounded))
+                            .foregroundColor(.white)
+                            .shadow(color: .white.opacity(0.35), radius: 6, x: 0, y: 0)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.8)
+                            .id("active_lyric_\(idx)")
+                            .transition(.asymmetric(
+                                insertion: .move(edge: .bottom).combined(with: .opacity),
+                                removal: .move(edge: .top).combined(with: .opacity)
+                            ))
+
+                        Text(nextText)
+                            .font(.system(size: 11, weight: .medium, design: .rounded))
+                            .foregroundColor(.white.opacity(0.38))
+                            .lineLimit(1)
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 6)
+                    .animation(.spring(response: 0.32, dampingFraction: 0.82), value: idx)
+                } else if isFetching {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                            .tint(.white.opacity(0.75))
+                            .scaleEffect(0.8)
+                        Text("Syncing live lyrics...")
+                            .font(.caption.weight(.medium))
+                            .foregroundColor(.white.opacity(0.65))
+                    }
+                } else {
+                    HStack(spacing: 6) {
+                        Image(systemName: "quote.bubble")
+                            .font(.caption)
+                        Text("Tap to add or auto-fetch synced lyrics")
+                            .font(.caption.weight(.medium))
+                    }
+                    .foregroundColor(.white.opacity(0.5))
+                }
+            }
+            .frame(height: 66)
+        }
+        .buttonStyle(.plain)
     }
 }
 
@@ -1375,7 +1657,7 @@ struct MiniPlayerBar: View {
     }
 }
 
-// MARK: - Full-Screen Player with Walkman CD, Spinning Vinyl, Lyrics, Tag Editor & Swipe Dismissal
+// MARK: - Full-Screen Player with Dynamic Album Cover Gradient & Live Line-by-Line Synced Lyrics
 struct FullPlayerDeckView: View {
     @ObservedObject var engine: MusiQEngine
     @Binding var isPresented: Bool
@@ -1388,20 +1670,27 @@ struct FullPlayerDeckView: View {
         var id: Int { hashValue }
     }
 
+    private var dynamicAlbumGradient: [Color] {
+        let _ = engine.artworkRefreshID
+        return ArtworkCache.shared.playerGradient(for: engine.currentTrack?.fileName)
+    }
+
     var body: some View {
         GeometryReader { geo in
             let safeWidth = geo.size.width
-            let artBoxSize = min(safeWidth - 88, 255)
+            let artBoxSize = min(safeWidth - 104, 232)
 
             ZStack {
+                // Dynamic Album Cover Gradient Background (Only inside Full Player)
                 LinearGradient(
-                    colors: [Color(red: 0.12, green: 0.09, blue: 0.15), Color(red: 0.04, green: 0.04, blue: 0.06)],
-                    startPoint: .top,
-                    endPoint: .bottom
+                    colors: dynamicAlbumGradient,
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
                 )
                 .ignoresSafeArea()
+                .animation(.easeInOut(duration: 0.65), value: engine.currentTrack?.fileName)
 
-                VStack(spacing: 12) {
+                VStack(spacing: 10) {
                     // Top Bar
                     HStack {
                         Button {
@@ -1409,22 +1698,22 @@ struct FullPlayerDeckView: View {
                         } label: {
                             Image(systemName: "chevron.left")
                                 .font(.title3.weight(.semibold))
-                                .foregroundColor(.white.opacity(0.8))
+                                .foregroundColor(.white.opacity(0.85))
                                 .padding(8)
                         }
                         Spacer()
                         Capsule()
-                            .fill(Color.white.opacity(0.25))
+                            .fill(Color.white.opacity(0.3))
                             .frame(width: 42, height: 5)
                         Spacer()
                         if let track = engine.currentTrack {
                             Text(engine.formattedListenTime(for: track.fileName))
-                                .font(.caption2.monospacedDigit())
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 4)
-                                .background(Color.white.opacity(0.1))
+                                .font(.caption2.monospacedDigit().weight(.semibold))
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 5)
+                                .background(Color.black.opacity(0.28))
                                 .clipShape(Capsule())
-                                .foregroundColor(.purple)
+                                .foregroundColor(.white.opacity(0.9))
                         }
                     }
                     .padding(.horizontal, 16)
@@ -1444,8 +1733,8 @@ struct FullPlayerDeckView: View {
                                         .font(.caption.weight(.semibold))
                                 }
                                 .padding(.horizontal, 12)
-                                .padding(.vertical, 8)
-                                .background(engine.visualMode == mode ? Color.white.opacity(0.22) : Color.white.opacity(0.07))
+                                .padding(.vertical, 7)
+                                .background(engine.visualMode == mode ? Color.white.opacity(0.24) : Color.black.opacity(0.22))
                                 .foregroundColor(.white)
                                 .clipShape(Capsule())
                             }
@@ -1462,7 +1751,7 @@ struct FullPlayerDeckView: View {
                         boxSize: artBoxSize,
                         refreshID: engine.artworkRefreshID
                     )
-                    .frame(width: safeWidth - 24, height: artBoxSize + 28)
+                    .frame(width: safeWidth - 24, height: artBoxSize + 20)
                     .clipped()
 
                     if let err = engine.playbackErrorMessage {
@@ -1473,10 +1762,8 @@ struct FullPlayerDeckView: View {
                             .padding(.horizontal, 20)
                     }
 
-                    Spacer(minLength: 2)
-
                     // Looping Marquee Title + Artist
-                    VStack(spacing: 5) {
+                    VStack(spacing: 3) {
                         LoopingMarqueeText(
                             text: engine.currentTrack?.title ?? "No Track Selected",
                             font: .system(size: 22, weight: .bold),
@@ -1485,9 +1772,19 @@ struct FullPlayerDeckView: View {
                         .frame(width: safeWidth - 48)
 
                         Text(engine.currentTrack?.artist ?? "MusiQ Local Library")
-                            .font(.subheadline)
-                            .foregroundColor(.white.opacity(0.65))
+                            .font(.subheadline.weight(.medium))
+                            .foregroundColor(.white.opacity(0.72))
                             .lineLimit(1)
+                    }
+                    .padding(.horizontal, 24)
+
+                    // Live Line-by-Line Synced Lyrics Banner (Positioned right between Artist & Scrubber!)
+                    LiveSyncedLyricBanner(
+                        progress: engine.progress,
+                        lines: engine.currentTrackLyrics,
+                        isFetching: engine.isFetchingLyricsInBackground
+                    ) {
+                        activeBottomSheet = .lyrics
                     }
                     .padding(.horizontal, 24)
 
@@ -1505,7 +1802,7 @@ struct FullPlayerDeckView: View {
                             .font(.caption2.weight(.semibold))
                             .padding(.horizontal, 14)
                             .padding(.vertical, 5)
-                            .background(engine.loopStart != nil ? Color.purple : Color.white.opacity(0.12))
+                            .background(engine.loopStart != nil ? Color.purple : Color.black.opacity(0.26))
                             .foregroundColor(.white)
                             .clipShape(Capsule())
                     }
@@ -1517,7 +1814,7 @@ struct FullPlayerDeckView: View {
                         } label: {
                             Image(systemName: "shuffle")
                                 .font(.title3)
-                                .foregroundColor(engine.isShuffle ? .purple : .white.opacity(0.5))
+                                .foregroundColor(engine.isShuffle ? .white : .white.opacity(0.45))
                         }
 
                         Button {
@@ -1533,10 +1830,10 @@ struct FullPlayerDeckView: View {
                         } label: {
                             ZStack {
                                 Circle()
-                                    .fill(Color.white.opacity(0.18))
-                                    .frame(width: 70, height: 70)
+                                    .fill(Color.white.opacity(0.22))
+                                    .frame(width: 68, height: 68)
                                 Image(systemName: engine.isPlaying ? "pause.fill" : "play.fill")
-                                    .font(.system(size: 28, weight: .bold))
+                                    .font(.system(size: 27, weight: .bold))
                                     .foregroundColor(.white)
                             }
                         }
@@ -1554,11 +1851,11 @@ struct FullPlayerDeckView: View {
                         } label: {
                             Image(systemName: "repeat")
                                 .font(.title3)
-                                .foregroundColor(engine.isRepeat ? .purple : .white.opacity(0.5))
+                                .foregroundColor(engine.isRepeat ? .white : .white.opacity(0.45))
                         }
                     }
 
-                    // Bottom Action Bar (DSP, Lyrics, Tag Editor, Queue)
+                    // Bottom Action Bar (DSP, Edit Lyrics, Tag Editor, Queue)
                     HStack(spacing: 28) {
                         Button {
                             activeBottomSheet = .dsp
@@ -1604,8 +1901,8 @@ struct FullPlayerDeckView: View {
                             .foregroundColor(.white.opacity(0.85))
                         }
                     }
-                    .padding(.top, 6)
-                    .padding(.bottom, 14)
+                    .padding(.top, 4)
+                    .padding(.bottom, 12)
                 }
             }
             .offset(x: max(0, dragOffset.width), y: max(0, dragOffset.height * 0.3))
@@ -1632,7 +1929,7 @@ struct FullPlayerDeckView: View {
                         .presentationDetents([.medium])
                 case .lyrics:
                     if let current = engine.currentTrack {
-                        LyricsSheetView(track: current)
+                        LyricsSheetView(engine: engine, track: current)
                             .presentationDetents([.medium, .large])
                     }
                 case .tagEditor:
@@ -1665,7 +1962,7 @@ struct IsolatedScrubberView: View {
     let onCommitSeek: (Double) -> Void
 
     var body: some View {
-        VStack(spacing: 6) {
+        VStack(spacing: 4) {
             Slider(
                 value: Binding(
                     get: { min(progress.currentTime, max(progress.duration, 1)) },
@@ -1687,11 +1984,11 @@ struct IsolatedScrubberView: View {
             HStack {
                 Text(formatTime(progress.currentTime))
                     .font(.caption.monospacedDigit())
-                    .foregroundColor(.white.opacity(0.75))
+                    .foregroundColor(.white.opacity(0.8))
                 Spacer()
                 Text("-" + formatTime(max(0, progress.duration - progress.currentTime)))
                     .font(.caption.monospacedDigit())
-                    .foregroundColor(.white.opacity(0.75))
+                    .foregroundColor(.white.opacity(0.8))
             }
         }
     }
@@ -1777,12 +2074,10 @@ struct PlayerVisualizerStage: View {
         }
     }
 
-    // Metallic Walkman Portable CD Player Housing + Spinning Circular CD Window
     @ViewBuilder
     private func walkmanCDUnit(size: CGFloat) -> some View {
         let discSize = size * 0.78
         ZStack {
-            // Walkman Outer Brushed Metal Body
             RoundedRectangle(cornerRadius: 34)
                 .fill(
                     LinearGradient(
@@ -1798,7 +2093,6 @@ struct PlayerVisualizerStage: View {
                 )
                 .shadow(color: .black.opacity(0.6), radius: 14, x: 0, y: 8)
 
-            // Walkman Top-Left Status Badge & Right Clasp Detail
             VStack {
                 HStack {
                     HStack(spacing: 4) {
@@ -1831,7 +2125,6 @@ struct PlayerVisualizerStage: View {
             }
             .frame(width: size * 1.06, height: size * 1.02)
 
-            // Recessed Circular CD Tray & Optical Pickup Sled
             Circle()
                 .fill(Color(red: 0.05, green: 0.05, blue: 0.07))
                 .frame(width: discSize + 12, height: discSize + 12)
@@ -1840,13 +2133,11 @@ struct PlayerVisualizerStage: View {
                         .stroke(Color.white.opacity(0.15), lineWidth: 2)
                 )
 
-            // Optical Laser Lens Slot (visible under transparent window)
             RoundedRectangle(cornerRadius: 6)
                 .fill(Color.black.opacity(0.8))
                 .frame(width: discSize * 0.36, height: 18)
                 .offset(x: discSize * 0.22, y: discSize * 0.22)
 
-            // Spinning Circular CD with Auto-Cropped Artwork
             ContinuousSpinView(isSpinning: isPlaying, rpm: 22.0) {
                 ZStack {
                     Circle()
@@ -1872,7 +2163,6 @@ struct PlayerVisualizerStage: View {
                             .clipShape(Circle())
                     }
 
-                    // Iridescent CD sheen overlay
                     Circle()
                         .stroke(
                             AngularGradient(
@@ -1884,7 +2174,6 @@ struct PlayerVisualizerStage: View {
                         .frame(width: discSize * 0.5, height: discSize * 0.5)
                         .clipShape(Circle())
 
-                    // Center spindle clamping ring
                     Circle()
                         .fill(Color(white: 0.85).opacity(0.3))
                         .frame(width: discSize * 0.28, height: discSize * 0.28)
@@ -1897,7 +2186,6 @@ struct PlayerVisualizerStage: View {
                 }
             }
 
-            // Walkman Acrylic Lid Reflection Glare
             Circle()
                 .fill(
                     LinearGradient(
@@ -1911,7 +2199,6 @@ struct PlayerVisualizerStage: View {
         }
     }
 
-    // 1:1 Square Auto-Cropped Album Cover
     @ViewBuilder
     private func sleeveCover(size: CGFloat) -> some View {
         if let img = artworkImage {
@@ -1922,7 +2209,7 @@ struct PlayerVisualizerStage: View {
                 .clipShape(RoundedRectangle(cornerRadius: 18))
                 .overlay(
                     RoundedRectangle(cornerRadius: 18)
-                        .stroke(Color.white.opacity(0.12), lineWidth: 1)
+                        .stroke(Color.white.opacity(0.16), lineWidth: 1)
                 )
                 .shadow(color: .black.opacity(0.55), radius: 14, x: 0, y: 8)
         } else {
@@ -1939,8 +2226,9 @@ struct PlayerVisualizerStage: View {
     }
 }
 
-// MARK: - Restored Lyrics & Notes Sheet
+// MARK: - Synced Lyrics Editor & Auto-Fetcher Sheet
 struct LyricsSheetView: View {
+    @ObservedObject var engine: MusiQEngine
     let track: Track
     @State private var lyricsText: String = ""
     @State private var isFetching: Bool = false
@@ -1966,7 +2254,7 @@ struct LyricsSheetView: View {
                         if isFetching {
                             ProgressView()
                         } else {
-                            Label("Auto-Fetch", systemImage: "sparkles")
+                            Label("Auto-Fetch Synced", systemImage: "sparkles")
                                 .font(.caption.bold())
                         }
                     }
@@ -1984,7 +2272,7 @@ struct LyricsSheetView: View {
                 }
 
                 TextEditor(text: $lyricsText)
-                    .font(.system(size: 16, weight: .medium, design: .rounded))
+                    .font(.system(size: 15, weight: .medium, design: .rounded))
                     .padding(10)
                     .background(Color.white.opacity(0.05))
                     .clipShape(RoundedRectangle(cornerRadius: 12))
@@ -1992,7 +2280,7 @@ struct LyricsSheetView: View {
 
                 Spacer()
             }
-            .navigationTitle("Lyrics & Notes")
+            .navigationTitle("Synced Lyrics & Notes")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
@@ -2001,7 +2289,7 @@ struct LyricsSheetView: View {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("Save") {
                         LyricsManager.shared.saveLyrics(lyricsText, for: track)
-                        statusNote = "Saved lyrics!"
+                        engine.reloadLyricsForCurrentTrack()
                         dismiss()
                     }
                     .fontWeight(.bold)
@@ -2015,26 +2303,27 @@ struct LyricsSheetView: View {
 
     private func fetchOnline() {
         isFetching = true
-        statusNote = "Searching LRCLIB..."
+        statusNote = "Searching LRCLIB for time-synced lyrics..."
         Task {
             if let found = await LyricsManager.shared.fetchOnlineLyrics(title: track.title, artist: track.artist) {
                 await MainActor.run {
                     lyricsText = found
                     LyricsManager.shared.saveLyrics(found, for: track)
+                    engine.reloadLyricsForCurrentTrack()
                     isFetching = false
-                    statusNote = "Fetched & saved online lyrics!"
+                    statusNote = "Fetched & synced lyrics!"
                 }
             } else {
                 await MainActor.run {
                     isFetching = false
-                    statusNote = "No online match found. You can paste lyrics manually below."
+                    statusNote = "No online match found. Paste lyrics or [mm:ss.xx] lines below."
                 }
             }
         }
     }
 }
 
-// MARK: - Restored Built-In Tag & Cover Art Editor (With Auto-Square Crop)
+// MARK: - Built-In Tag & Cover Art Editor
 struct BuiltInTagEditorSheet: View {
     @ObservedObject var engine: MusiQEngine
     let track: Track
@@ -2051,7 +2340,6 @@ struct BuiltInTagEditorSheet: View {
                 Section("Cover Art (Auto-Cropped to 1:1 Square & Circle)") {
                     HStack(spacing: 20) {
                         Spacer()
-                        // Square Preview
                         if let img = previewImage {
                             Image(uiImage: img)
                                 .resizable()
@@ -2065,7 +2353,6 @@ struct BuiltInTagEditorSheet: View {
                                 .overlay(Image(systemName: "photo").foregroundColor(.secondary))
                         }
 
-                        // Disc Circle Preview
                         if let img = previewImage {
                             Image(uiImage: img)
                                 .resizable()
@@ -2205,8 +2492,7 @@ struct QueueSheetView: View {
     }
 }
 
-// MARK: - Tab 3: Integrated YouTube Downloader (Validates Real Audio Bytes & Auto-Crops Artwork)
-// MARK: - Tab 3: Integrated YouTube Downloader (Direct InnerTube + On-Device M4A Transcoder)
+// MARK: - Tab 3: Multi-Engine YouTube Downloader (VisitorData InnerTube + Chunked Range + Loader/Invidious Proxy)
 struct YouTubeDownloaderView: View {
     @ObservedObject var engine: MusiQEngine
     @State private var urlInput: String = ""
@@ -2215,17 +2501,18 @@ struct YouTubeDownloaderView: View {
     @State private var statusMessage: String = "Paste a YouTube link or direct audio URL."
     @State private var isDownloading: Bool = false
 
+    private let invidiousEndpoints = [
+        "https://inv.nadeko.net",
+        "https://invidious.nerdvpn.de",
+        "https://inv.tux.pizza",
+        "https://yewtu.be"
+    ]
+
     private let cobaltEndpoints = [
         "https://rue-cobalt.xenon.zone/",
         "https://cobaltapi.cjs.nz/",
         "https://nuko-c.meowing.de/",
         "https://cobalt-api.lamps-dev.dev/"
-    ]
-
-    private let invidiousEndpoints = [
-        "https://inv.tux.pizza",
-        "https://invidious.nerdvpn.de",
-        "https://invidious.privacyredirect.com"
     ]
 
     var body: some View {
@@ -2280,7 +2567,7 @@ struct YouTubeDownloaderView: View {
         }
 
         isDownloading = true
-        statusMessage = "Fetching metadata & extracting direct audio stream..."
+        statusMessage = "Authenticating session & resolving audio stream..."
 
         Task {
             do {
@@ -2339,9 +2626,15 @@ struct YouTubeDownloaderView: View {
                     ArtworkCache.shared.setCustomArtwork(image.autoCroppedToSquare(), for: safeFileName)
                 }
 
+                // Pre-fetch synced lyrics right when downloaded
+                if let lyrics = await LyricsManager.shared.fetchOnlineLyrics(title: resolvedTitle, artist: resolvedArtist) {
+                    let tempTrack = Track(id: UUID(), title: resolvedTitle, artist: resolvedArtist, fileName: safeFileName, duration: 0)
+                    LyricsManager.shared.saveLyrics(lyrics, for: tempTrack)
+                }
+
                 await MainActor.run {
                     isDownloading = false
-                    statusMessage = "✅ Saved '\(resolvedTitle)' (\(fileExt.uppercased())) to your Songs library!"
+                    statusMessage = "✅ Saved '\(resolvedTitle)' with synced lyrics & cover!"
                     urlInput = ""
                     customTitle = ""
                     customArtist = ""
@@ -2372,31 +2665,25 @@ struct YouTubeDownloaderView: View {
         return nil
     }
 
-    // Downloads candidate streams and converts MP4/DASH containers into clean native .m4a if needed
     private func downloadAndPreparePlayableAudio(from inputURL: URL) async throws -> (URL, String) {
         let candidateURLs = try await resolveCandidateStreamURLs(from: inputURL)
 
         for streamURL in candidateURLs {
-            var req = URLRequest(url: streamURL)
-            req.timeoutInterval = 25
-            req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko)", forHTTPHeaderField: "User-Agent")
+            await MainActor.run {
+                statusMessage = "Downloading audio stream..."
+            }
 
-            guard let (tempURL, response) = try? await URLSession.shared.download(for: req) else { continue }
-            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 200
-            let mime = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Type")?.lowercased() ?? ""
-
-            if statusCode >= 400 || mime.contains("text/html") || mime.contains("application/json") {
-                try? FileManager.default.removeItem(at: tempURL)
+            guard let tempURL = await downloadStreamWithRangeSupport(url: streamURL) else {
                 continue
             }
 
             guard let attrs = try? FileManager.default.attributesOfItem(atPath: tempURL.path),
-                  let fileSize = attrs[.size] as? UInt64, fileSize > 16384 else {
+                  let fileSize = attrs[.size] as? UInt64, fileSize > 24576 else {
                 try? FileManager.default.removeItem(at: tempURL)
                 continue
             }
 
-            // 1. Try direct AVAudioFile read (.m4a or .mp3)
+            // 1. Try direct AVAudioFile verification (.m4a or .mp3)
             for ext in ["m4a", "mp3", "mp4"] {
                 let testURL = FileManager.default.temporaryDirectory.appendingPathComponent("test_\(UUID().uuidString).\(ext)")
                 try? FileManager.default.copyItem(at: tempURL, to: testURL)
@@ -2410,7 +2697,7 @@ struct YouTubeDownloaderView: View {
                 try? FileManager.default.removeItem(at: testURL)
             }
 
-            // 2. If it's a fragmented MP4 or muxed video+audio MP4 from YouTube, remux to clean .m4a on-device
+            // 2. Hardware remux fragmented MP4 or video+audio stream into pure Apple M4A
             let rawMP4URL = FileManager.default.temporaryDirectory.appendingPathComponent("raw_\(UUID().uuidString).mp4")
             try? FileManager.default.moveItem(at: tempURL, to: rawMP4URL)
 
@@ -2423,8 +2710,65 @@ struct YouTubeDownloaderView: View {
         }
 
         throw NSError(domain: "MusiQDownloader", code: -1, userInfo: [
-            NSLocalizedDescriptionKey: "Could not extract a playable audio stream for this link. Check if the video is age-restricted or region-locked."
+            NSLocalizedDescriptionKey: "All stream extractors timed out on this track. Try pasting the link again or use the Files importer."
         ])
+    }
+
+    /// Downloads googlevideo & proxy streams using Range headers so YouTube never throttles or 403-blocks mid-download
+    private func downloadStreamWithRangeSupport(url: URL) async -> URL? {
+        let outURL = FileManager.default.temporaryDirectory.appendingPathComponent("dl_\(UUID().uuidString).bin")
+        try? FileManager.default.removeItem(at: outURL)
+
+        // If it's a googlevideo stream, append range query or fetch in 4MB chunks
+        if url.host?.contains("googlevideo.com") == true {
+            FileManager.default.createFile(atPath: outURL.path, contents: nil)
+            guard let handle = try? FileHandle(forWritingTo: outURL) else { return nil }
+            defer { try? handle.close() }
+
+            var offset: Int64 = 0
+            let chunkSize: Int64 = 4_194_304 // 4 MB chunks bypass throttling
+            var totalReceived: Int64 = 0
+
+            while true {
+                let endByte = offset + chunkSize - 1
+                var req = URLRequest(url: url)
+                req.timeoutInterval = 18
+                req.setValue("bytes=\(offset)-\(endByte)", forHTTPHeaderField: "Range")
+                req.setValue("com.google.android.youtube/19.45.4 (Linux; U; Android 14) gzip", forHTTPHeaderField: "User-Agent")
+
+                guard let (data, resp) = try? await URLSession.shared.data(for: req),
+                      let http = resp as? HTTPURLResponse,
+                      (200...206).contains(http.statusCode),
+                      !data.isEmpty else {
+                    break
+                }
+
+                handle.write(data)
+                totalReceived += Int64(data.count)
+                if Int64(data.count) < chunkSize || http.statusCode == 200 {
+                    break
+                }
+                offset += Int64(data.count)
+            }
+
+            return totalReceived > 24576 ? outURL : nil
+        } else {
+            var req = URLRequest(url: url)
+            req.timeoutInterval = 25
+            req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)", forHTTPHeaderField: "User-Agent")
+            guard let (tempURL, resp) = try? await URLSession.shared.download(for: req),
+                  let http = resp as? HTTPURLResponse,
+                  (200...299).contains(http.statusCode) else {
+                return nil
+            }
+            let mime = http.value(forHTTPHeaderField: "Content-Type")?.lowercased() ?? ""
+            if mime.contains("text/html") || mime.contains("application/json") {
+                try? FileManager.default.removeItem(at: tempURL)
+                return nil
+            }
+            try? FileManager.default.moveItem(at: tempURL, to: outURL)
+            return outURL
+        }
     }
 
     private func remuxToNativeM4A(sourceURL: URL) async -> URL? {
@@ -2452,40 +2796,29 @@ struct YouTubeDownloaderView: View {
 
         var results: [URL] = []
 
-        // 1. Direct On-Device YouTube InnerTube API Extraction (Signed for User's Own IP)
         if let videoID = extractYouTubeID(from: inputURL.absoluteString) {
+            // 1. Direct InnerTube Extraction with live VisitorData session token
             let directStreams = await fetchDirectInnerTubeStreams(videoID: videoID)
             results.append(contentsOf: directStreams)
 
-            // 2. Fallback to Invidious instances with local proxy enabled
+            // 2. Loader.to / OceanSaver Cloud M4A Transcoder Fallback (works on VEVO/ciphered music videos)
+            if let cloudURL = await fetchOceanSaverTranscodedStream(videoURL: "https://www.youtube.com/watch?v=\(videoID)") {
+                results.append(cloudURL)
+            }
+
+            // 3. Invidious Local-Proxied Streams (?local=true bypasses IP locks!)
             for invBase in invidiousEndpoints {
-                guard let api = URL(string: "\(invBase)/api/v1/videos/\(videoID)") else { continue }
-                var req = URLRequest(url: api)
-                req.timeoutInterval = 8
-                if let (data, _) = try? await URLSession.shared.data(for: req),
-                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                    if let adaptive = json["adaptiveFormats"] as? [[String: Any]] {
-                        for fmt in adaptive {
-                            let type = (fmt["type"] as? String)?.lowercased() ?? ""
-                            if type.contains("audio/mp4") || type.contains("audio/m4a") {
-                                if let uStr = fmt["url"] as? String, let u = URL(string: uStr) {
-                                    results.append(u)
-                                }
-                            }
-                        }
-                    }
-                    if let fmtStreams = json["formatStreams"] as? [[String: Any]] {
-                        for fmt in fmtStreams {
-                            if let uStr = fmt["url"] as? String, let u = URL(string: uStr) {
-                                results.append(u)
-                            }
-                        }
-                    }
+                // Direct local-proxied itag 140 (M4A) & itag 18 (MP4) endpoints
+                if let directProxy140 = URL(string: "\(invBase)/latest_version?id=\(videoID)&itag=140&local=true") {
+                    results.append(directProxy140)
+                }
+                if let directProxy18 = URL(string: "\(invBase)/latest_version?id=\(videoID)&itag=18&local=true") {
+                    results.append(directProxy18)
                 }
             }
         }
 
-        // 3. Fallback to Cobalt API instances
+        // 4. Cobalt API Fallback
         for endpoint in cobaltEndpoints {
             guard let apiEndpoint = URL(string: endpoint) else { continue }
             var request = URLRequest(url: apiEndpoint)
@@ -2515,10 +2848,39 @@ struct YouTubeDownloaderView: View {
         return results
     }
 
-    // Queries YouTube's internal player API directly from the device so stream URLs match the phone's IP
+    /// Fetches a fresh visitorData token from YouTube so InnerTube never returns LOGIN_REQUIRED
+    private func fetchYouTubeVisitorData() async -> String? {
+        guard let url = URL(string: "https://www.youtube.com/sw.js_data") else { return nil }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 6
+        req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)", forHTTPHeaderField: "User-Agent")
+        guard let (data, _) = try? await URLSession.shared.data(for: req),
+              let text = String(data: data, encoding: .utf8) else { return nil }
+
+        let pattern = #""Cgt[A-Za-z0-9_\-]+""#
+        if let range = text.range(of: pattern, options: .regularExpression) {
+            return String(text[range]).replacingOccurrences(of: "\"", with: "")
+        }
+        return nil
+    }
+
     private func fetchDirectInnerTubeStreams(videoID: String) async -> [URL] {
         var found: [URL] = []
+        let visitorData = await fetchYouTubeVisitorData()
+
         let clients: [([String: Any], String)] = [
+            (
+                [
+                    "clientName": "ANDROID_TESTSUITE",
+                    "clientVersion": "1.9",
+                    "androidSdkVersion": 34,
+                    "osName": "Android",
+                    "osVersion": "14",
+                    "hl": "en",
+                    "gl": "US"
+                ],
+                "com.google.android.youtube/1.9 (Linux; U; Android 14; en_US) gzip"
+            ),
             (
                 [
                     "clientName": "ANDROID_VR",
@@ -2527,7 +2889,9 @@ struct YouTubeDownloaderView: View {
                     "deviceModel": "Quest 3",
                     "androidSdkVersion": 32,
                     "osName": "Android",
-                    "osVersion": "12L"
+                    "osVersion": "12L",
+                    "hl": "en",
+                    "gl": "US"
                 ],
                 "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"
             ),
@@ -2538,7 +2902,9 @@ struct YouTubeDownloaderView: View {
                     "deviceMake": "Apple",
                     "deviceModel": "iPhone16,2",
                     "osName": "iPhone",
-                    "osVersion": "18.1.0.22B83"
+                    "osVersion": "18.1.0.22B83",
+                    "hl": "en",
+                    "gl": "US"
                 ],
                 "com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1 like Mac OS X)"
             )
@@ -2548,12 +2914,20 @@ struct YouTubeDownloaderView: View {
             return []
         }
 
-        for (clientDict, userAgent) in clients {
+        for (baseClientDict, userAgent) in clients {
+            var clientDict = baseClientDict
+            if let vd = visitorData {
+                clientDict["visitorData"] = vd
+            }
+
             var req = URLRequest(url: endpoint)
             req.httpMethod = "POST"
             req.timeoutInterval = 10
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
             req.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+            if let vd = visitorData {
+                req.setValue(vd, forHTTPHeaderField: "X-Goog-Visitor-Id")
+            }
 
             let body: [String: Any] = [
                 "videoId": videoID,
@@ -2569,7 +2943,6 @@ struct YouTubeDownloaderView: View {
                 continue
             }
 
-            // 1. Check adaptiveFormats for itag 140 (M4A audio)
             if let adaptive = streamingData["adaptiveFormats"] as? [[String: Any]] {
                 for fmt in adaptive {
                     let mime = (fmt["mimeType"] as? String)?.lowercased() ?? ""
@@ -2581,7 +2954,6 @@ struct YouTubeDownloaderView: View {
                 }
             }
 
-            // 2. Check standard muxed MP4 formats (itag 18) which remuxToNativeM4A converts to pure M4A
             if let formats = streamingData["formats"] as? [[String: Any]] {
                 for fmt in formats {
                     let mime = (fmt["mimeType"] as? String)?.lowercased() ?? ""
@@ -2598,7 +2970,42 @@ struct YouTubeDownloaderView: View {
 
         return found
     }
+
+    /// Cloud M4A transcoder fallback for VEVO / signature-ciphered music videos
+    private func fetchOceanSaverTranscodedStream(videoURL: String) async -> URL? {
+        guard let encoded = videoURL.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+              let initURL = URL(string: "https://p.oceansaver.in/ajax/download.php?format=m4a&url=\(encoded)") else {
+            return nil
+        }
+
+        var req = URLRequest(url: initURL)
+        req.timeoutInterval = 10
+        req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)", forHTTPHeaderField: "User-Agent")
+
+        guard let (data, _) = try? await URLSession.shared.data(for: req),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let jobID = json["id"] as? String else {
+            return nil
+        }
+
+        guard let progressURL = URL(string: "https://p.oceansaver.in/ajax/progress.php?id=\(jobID)") else {
+            return nil
+        }
+
+        for _ in 0..<8 {
+            try? await Task.sleep(nanoseconds: 1_200_000_000)
+            if let (pData, _) = try? await URLSession.shared.data(from: progressURL),
+               let pJson = try? JSONSerialization.jsonObject(with: pData) as? [String: Any],
+               let dlStr = pJson["download_url"] as? String,
+               !dlStr.isEmpty,
+               let dlURL = URL(string: dlStr) {
+                return dlURL
+            }
+        }
+        return nil
+    }
 }
+
 // MARK: - Tab 4: Listening Minutes Tracker View
 struct ListeningStatsView: View {
     @ObservedObject var engine: MusiQEngine
