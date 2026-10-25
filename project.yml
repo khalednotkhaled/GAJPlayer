@@ -12,18 +12,19 @@ targets:
     info:
       path: Info.plist
       properties:
-        CFBundleDisplayName: "GAJ Vault"
+        CFBundleDisplayName: "MusiQ"
+        CFBundleName: "MusiQ"
         UILaunchScreen: {}
         UIBackgroundModes:
           - audio
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
-        NSPhotoLibraryUsageDescription: "Select custom album and track cover art from your photo library."
+        NSPhotoLibraryUsageDescription: "Select custom cover art from your photo library."
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.custom.gajplayer
+        PRODUCT_BUNDLE_IDENTIFIER: com.custom.musiqplayer
         CODE_SIGN_IDENTITY: ""
         CODE_SIGNING_REQUIRED: NO
         CODE_SIGNING_ALLOWED: NO
