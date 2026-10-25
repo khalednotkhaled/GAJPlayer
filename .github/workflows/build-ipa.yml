@@ -1,0 +1,42 @@
+name: Build Standalone iOS IPA
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Generate Xcode Project via XcodeGen
+        run: |
+          brew install xcodegen
+          xcodegen generate
+
+      - name: Compile Unsigned iOS App
+        run: |
+          xcodebuild -project GAJPlayer.xcodeproj \
+            -scheme GAJPlayer \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            clean build
+
+      - name: Package into .ipa
+        run: |
+          mkdir -p Payload
+          cp -r build/Build/Products/Release-iphoneos/GAJPlayer.app Payload/
+          zip -r GAJPlayer.ipa Payload
+
+      - name: Upload Compiled IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: GAJPlayer-IPA
+          path: GAJPlayer.ipa
