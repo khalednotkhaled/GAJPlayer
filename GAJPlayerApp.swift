@@ -702,7 +702,7 @@ struct PlaylistsHomeView: View {
                                 HStack(spacing: 14) {
                                     ZStack {
                                         RoundedRectangle(cornerRadius: 10)
-                                            .fill(LinearGradient(colors: [.purple.opacity(0.7), .indigo.opacity(0.4)], startAngle: .topLeading, endAngle: .bottomTrailing))
+                                            .fill(LinearGradient(colors: [.purple.opacity(0.7), .indigo.opacity(0.4)], startPoint: .topLeading, endPoint: .bottomTrailing))
                                             .frame(width: 54, height: 54)
                                         Image(systemName: "music.note.list")
                                             .font(.title3)
