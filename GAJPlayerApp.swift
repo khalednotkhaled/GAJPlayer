@@ -1,6 +1,7 @@
 import SwiftUI
 import AVFoundation
 import MediaPlayer
+import UniformTypeIdentifiers
 
 // MARK: - App Entry
 @main
@@ -845,10 +846,12 @@ struct PlaylistDetailView: View {
 }
 
 // MARK: - Tab 2: Global Searchable Songs Library
+// MARK: - Tab 2: Global Searchable Songs Library
 struct AllSongsSearchView: View {
     @ObservedObject var engine: MusiQEngine
     @Binding var showFullPlayer: Bool
     @State private var searchText: String = ""
+    @State private var showFileImporter: Bool = false
 
     var filteredTracks: [Track] {
         if searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -867,23 +870,37 @@ struct AllSongsSearchView: View {
                 Color(red: 0.06, green: 0.06, blue: 0.08).ignoresSafeArea()
 
                 if engine.allTracks.isEmpty {
-                    VStack(spacing: 12) {
+                    VStack(spacing: 14) {
                         Image(systemName: "waveform.circle")
-                            .font(.system(size: 48))
-                            .foregroundColor(.secondary)
+                            .font(.system(size: 52))
+                            .foregroundColor(.purple)
                         Text("No Songs Found")
                             .font(.headline)
-                        Text("Drop audio files into MusiQ via iTunes File Sharing or the Files app, or download tracks from the YouTube DL tab.")
+                        Text("Import audio files directly from your iPhone Files app, or download tracks from the YouTube DL tab.")
                             .font(.caption)
                             .foregroundColor(.secondary)
                             .multilineTextAlignment(.center)
                             .padding(.horizontal, 36)
-                        Button("Rescan Files") {
+
+                        Button {
+                            showFileImporter = true
+                        } label: {
+                            Label("Import from Files App", systemImage: "folder.badge.plus")
+                                .font(.headline)
+                                .padding(.horizontal, 20)
+                                .padding(.vertical, 12)
+                                .background(Color.purple)
+                                .foregroundColor(.white)
+                                .clipShape(Capsule())
+                        }
+                        .padding(.top, 6)
+
+                        Button("Rescan Library") {
                             engine.scanLocalLibrary()
                         }
-                        .buttonStyle(.borderedProminent)
-                        .tint(.purple)
-                        .padding(.top, 6)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .padding(.top, 4)
                     }
                 } else {
                     List(filteredTracks) { track in
@@ -911,12 +928,39 @@ struct AllSongsSearchView: View {
             }
             .navigationTitle("All Songs (\(engine.allTracks.count))")
             .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
+                ToolbarItem(placement: .topBarLeading) {
                     Button {
                         engine.scanLocalLibrary()
                     } label: {
                         Image(systemName: "arrow.clockwise")
                     }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        showFileImporter = true
+                    } label: {
+                        Label("Import Files", systemImage: "folder.badge.plus")
+                    }
+                }
+            }
+            .fileImporter(
+                isPresented: $showFileImporter,
+                allowedContentTypes: [.audio, .mp3, .mpeg4Audio, .wav],
+                allowsMultipleSelection: true
+            ) { result in
+                switch result {
+                case .success(let urls):
+                    let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+                    for url in urls {
+                        let gotAccess = url.startAccessingSecurityScopedResource()
+                        defer { if gotAccess { url.stopAccessingSecurityScopedResource() } }
+                        let dest = docs.appendingPathComponent(url.lastPathComponent)
+                        try? FileManager.default.removeItem(at: dest)
+                        try? FileManager.default.copyItem(at: url, to: dest)
+                    }
+                    engine.scanLocalLibrary()
+                case .failure(let err):
+                    print("Import failed: \(err)")
                 }
             }
         }
@@ -1509,18 +1553,29 @@ struct YouTubeDownloaderView: View {
     @State private var urlInput: String = ""
     @State private var customTitle: String = ""
     @State private var customArtist: String = ""
-    @State private var statusMessage: String = "Paste a YouTube video/playlist link or direct audio stream URL."
+    @State private var statusMessage: String = "Paste a YouTube link or direct audio URL."
     @State private var isDownloading: Bool = false
 
-    private let cobaltInstances = [
-        "https://api.cobalt.tools/api/json"
+    // Active 2026 Cobalt v11 & Piped Fallback Instances
+    private let cobaltEndpoints = [
+        "https://rue-cobalt.xenon.zone/",
+        "https://cobaltapi.cjs.nz/",
+        "https://nuko-c.meowing.de/",
+        "https://cobalt-api.lamps-dev.dev/",
+        "https://capi.3kh0.net/"
+    ]
+
+    private let pipedEndpoints = [
+        "https://pipedapi.kavin.rocks",
+        "https://pipedapi.tokhmi.xyz",
+        "https://pipedapi.moomoo.me"
     ]
 
     var body: some View {
         NavigationStack {
             Form {
                 Section("YouTube / Audio Link") {
-                    TextField("https://youtube.com/watch?v=... or playlist", text: $urlInput)
+                    TextField("https://youtu.be/... or direct audio link", text: $urlInput)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                 }
@@ -1568,16 +1623,16 @@ struct YouTubeDownloaderView: View {
         }
 
         isDownloading = true
-        statusMessage = "Fetching metadata and audio stream..."
+        statusMessage = "Fetching metadata and resolving audio stream..."
 
         Task {
             do {
-                // 1. Fetch Title & Thumbnail via YouTube oEmbed if YouTube URL
                 var resolvedTitle = customTitle.trimmingCharacters(in: .whitespacesAndNewlines)
                 var thumbnailData: Data? = nil
 
                 if trimmedURL.contains("youtube.com") || trimmedURL.contains("youtu.be") {
-                    if let oembedURL = URL(string: "https://www.youtube.com/oembed?url=\(trimmedURL)&format=json"),
+                    if let encoded = trimmedURL.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+                       let oembedURL = URL(string: "https://www.youtube.com/oembed?url=\(encoded)&format=json"),
                        let (data, _) = try? await URLSession.shared.data(from: oembedURL),
                        let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
                         if resolvedTitle.isEmpty, let ytTitle = json["title"] as? String {
@@ -1594,14 +1649,20 @@ struct YouTubeDownloaderView: View {
                 if resolvedTitle.isEmpty {
                     resolvedTitle = targetURL.deletingPathExtension().lastPathComponent
                 }
+                if resolvedTitle.isEmpty || resolvedTitle == "watch" {
+                    resolvedTitle = "Track_\(Int(Date().timeIntervalSince1970))"
+                }
 
-                // 2. Resolve direct audio stream
+                let artistPrefix = customArtist.trimmingCharacters(in: .whitespacesAndNewlines)
+                let finalDisplayName = artistPrefix.isEmpty ? resolvedTitle : "\(artistPrefix) - \(resolvedTitle)"
+
                 let directAudioURL = try await resolveAudioStreamURL(from: targetURL)
                 let (tempFileURL, _) = try await URLSession.shared.download(from: directAudioURL)
 
-                let safeFileName = resolvedTitle
+                let safeFileName = finalDisplayName
                     .replacingOccurrences(of: "/", with: "-")
-                    .replacingOccurrences(of: ":", with: "-") + ".m4a"
+                    .replacingOccurrences(of: ":", with: "-")
+                    .replacingOccurrences(of: "?", with: "") + ".m4a"
 
                 let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
                 let destinationURL = docs.appendingPathComponent(safeFileName)
@@ -1617,7 +1678,7 @@ struct YouTubeDownloaderView: View {
 
                 await MainActor.run {
                     isDownloading = false
-                    statusMessage = "Saved '\(resolvedTitle)' to your Songs library!"
+                    statusMessage = "✅ Saved '\(finalDisplayName)' to your Songs library!"
                     urlInput = ""
                     customTitle = ""
                     engine.scanLocalLibrary()
@@ -1625,40 +1686,74 @@ struct YouTubeDownloaderView: View {
             } catch {
                 await MainActor.run {
                     isDownloading = false
-                    statusMessage = "Download failed: \(error.localizedDescription)"
+                    statusMessage = "Download failed: \(error.localizedDescription). Try importing via the Files button in the Songs tab."
                 }
             }
         }
     }
 
+    private func extractYouTubeID(from urlString: String) -> String? {
+        if let url = URL(string: urlString) {
+            if url.host?.contains("youtu.be") == true {
+                return url.pathComponents.dropFirst().first
+            }
+            if let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
+               let v = comps.queryItems?.first(where: { $0.name == "v" })?.value {
+                return v
+            }
+        }
+        return nil
+    }
+
     private func resolveAudioStreamURL(from inputURL: URL) async throws -> URL {
         let ext = inputURL.pathExtension.lowercased()
-        if ["mp3", "m4a", "wav", "flac"].contains(ext) {
+        if ["mp3", "m4a", "wav", "flac", "aac"].contains(ext) {
             return inputURL
         }
 
-        guard let apiEndpoint = URL(string: cobaltInstances[0]) else {
-            return inputURL
+        // 1. Try modern Cobalt v10/v11 API instances
+        for endpoint in cobaltEndpoints {
+            guard let apiEndpoint = URL(string: endpoint) else { continue }
+            var request = URLRequest(url: apiEndpoint)
+            request.httpMethod = "POST"
+            request.timeoutInterval = 10
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.setValue("application/json", forHTTPHeaderField: "Accept")
+            request.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)", forHTTPHeaderField: "User-Agent")
+
+            // v10/v11 payload
+            let payload: [String: Any] = [
+                "url": inputURL.absoluteString,
+                "downloadMode": "audio",
+                "audioFormat": "mp3"
+            ]
+            request.httpBody = try? JSONSerialization.data(withJSONObject: payload)
+
+            if let (data, _) = try? await URLSession.shared.data(for: request),
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let streamURLStr = json["url"] as? String,
+               let streamURL = URL(string: streamURLStr) {
+                return streamURL
+            }
         }
 
-        var request = URLRequest(url: apiEndpoint)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
-
-        let payload: [String: Any] = [
-            "url": inputURL.absoluteString,
-            "isAudioOnly": true,
-            "aFormat": "mp3"
-        ]
-        request.httpBody = try JSONSerialization.data(withJSONObject: payload)
-
-        let (data, _) = try await URLSession.shared.data(for: request)
-        if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let streamURLStr = json["url"] as? String,
-           let streamURL = URL(string: streamURLStr) {
-            return streamURL
+        // 2. Fallback to Piped Streams API if YouTube ID is detected
+        if let videoID = extractYouTubeID(from: inputURL.absoluteString) {
+            for pipedBase in pipedEndpoints {
+                guard let streamAPI = URL(string: "\(pipedBase)/streams/\(videoID)") else { continue }
+                var req = URLRequest(url: streamAPI)
+                req.timeoutInterval = 10
+                if let (data, _) = try? await URLSession.shared.data(for: req),
+                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let audioStreams = json["audioStreams"] as? [[String: Any]],
+                   let bestStream = audioStreams.first,
+                   let urlStr = bestStream["url"] as? String,
+                   let streamURL = URL(string: urlStr) {
+                    return streamURL
+                }
+            }
         }
+
         throw URLError(.cannotFindHost)
     }
 }
