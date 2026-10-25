@@ -1412,7 +1412,7 @@ struct PlayerVisualizerStage: View {
                 .shadow(color: .black.opacity(0.55), radius: 14, x: 0, y: 8)
         } else {
             RoundedRectangle(cornerRadius: 18)
-                .fill(LinearGradient(colors: [.purple.opacity(0.6), .indigo.opacity(0.3)], startAngle: .topLeading, endAngle: .bottomTrailing))
+                .fill(LinearGradient(colors: [.purple.opacity(0.6), .indigo.opacity(0.3)], startPoint: .topLeading, endPoint: .bottomTrailing))
                 .frame(width: size, height: size)
                 .overlay(
                     Image(systemName: "music.quarternote.3")
