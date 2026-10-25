@@ -2206,6 +2206,7 @@ struct QueueSheetView: View {
 }
 
 // MARK: - Tab 3: Integrated YouTube Downloader (Validates Real Audio Bytes & Auto-Crops Artwork)
+// MARK: - Tab 3: Integrated YouTube Downloader (Direct InnerTube + On-Device M4A Transcoder)
 struct YouTubeDownloaderView: View {
     @ObservedObject var engine: MusiQEngine
     @State private var urlInput: String = ""
@@ -2218,14 +2219,13 @@ struct YouTubeDownloaderView: View {
         "https://rue-cobalt.xenon.zone/",
         "https://cobaltapi.cjs.nz/",
         "https://nuko-c.meowing.de/",
-        "https://cobalt-api.lamps-dev.dev/",
-        "https://capi.3kh0.net/"
+        "https://cobalt-api.lamps-dev.dev/"
     ]
 
-    private let pipedEndpoints = [
-        "https://pipedapi.kavin.rocks",
-        "https://pipedapi.tokhmi.xyz",
-        "https://pipedapi.moomoo.me"
+    private let invidiousEndpoints = [
+        "https://inv.tux.pizza",
+        "https://invidious.nerdvpn.de",
+        "https://invidious.privacyredirect.com"
     ]
 
     var body: some View {
@@ -2251,7 +2251,7 @@ struct YouTubeDownloaderView: View {
                             if isDownloading {
                                 ProgressView()
                                     .padding(.trailing, 8)
-                                Text("Downloading & Auto-Cropping...")
+                                Text("Extracting & Converting Audio...")
                             } else {
                                 Label("Download to MusiQ Library", systemImage: "arrow.down.circle.fill")
                                     .font(.headline)
@@ -2280,7 +2280,7 @@ struct YouTubeDownloaderView: View {
         }
 
         isDownloading = true
-        statusMessage = "Fetching high-res cover & resolving audio stream..."
+        statusMessage = "Fetching metadata & extracting direct audio stream..."
 
         Task {
             do {
@@ -2317,7 +2317,7 @@ struct YouTubeDownloaderView: View {
                     resolvedArtist = "YouTube Import"
                 }
 
-                let (tempFileURL, fileExt) = try await downloadVerifiedAudioFile(from: targetURL)
+                let (readyFileURL, fileExt) = try await downloadAndPreparePlayableAudio(from: targetURL)
 
                 let safeBaseName = resolvedTitle
                     .replacingOccurrences(of: "/", with: "-")
@@ -2332,9 +2332,8 @@ struct YouTubeDownloaderView: View {
                 if FileManager.default.fileExists(atPath: destinationURL.path) {
                     try FileManager.default.removeItem(at: destinationURL)
                 }
-                try FileManager.default.moveItem(at: tempFileURL, to: destinationURL)
+                try FileManager.default.moveItem(at: readyFileURL, to: destinationURL)
 
-                // Save Custom Metadata & Auto-Square-Cropped Cover Art
                 ArtworkCache.shared.saveCustomMetadata(title: resolvedTitle, artist: resolvedArtist, for: safeFileName)
                 if let thumbData = thumbnailData, let image = UIImage(data: thumbData) {
                     ArtworkCache.shared.setCustomArtwork(image.autoCroppedToSquare(), for: safeFileName)
@@ -2342,7 +2341,7 @@ struct YouTubeDownloaderView: View {
 
                 await MainActor.run {
                     isDownloading = false
-                    statusMessage = "✅ Saved '\(resolvedTitle)' with square-cropped cover!"
+                    statusMessage = "✅ Saved '\(resolvedTitle)' (\(fileExt.uppercased())) to your Songs library!"
                     urlInput = ""
                     customTitle = ""
                     customArtist = ""
@@ -2362,6 +2361,9 @@ struct YouTubeDownloaderView: View {
             if url.host?.contains("youtu.be") == true {
                 return url.pathComponents.dropFirst().first
             }
+            if url.pathComponents.contains("shorts"), let last = url.pathComponents.last {
+                return last
+            }
             if let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
                let v = comps.queryItems?.first(where: { $0.name == "v" })?.value {
                 return v
@@ -2370,50 +2372,76 @@ struct YouTubeDownloaderView: View {
         return nil
     }
 
-    // Verifies the downloaded file is real audio and returns the matching file extension (.mp3 or .m4a)
-    private func downloadVerifiedAudioFile(from inputURL: URL) async throws -> (URL, String) {
+    // Downloads candidate streams and converts MP4/DASH containers into clean native .m4a if needed
+    private func downloadAndPreparePlayableAudio(from inputURL: URL) async throws -> (URL, String) {
         let candidateURLs = try await resolveCandidateStreamURLs(from: inputURL)
 
         for streamURL in candidateURLs {
             var req = URLRequest(url: streamURL)
-            req.timeoutInterval = 20
-            req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)", forHTTPHeaderField: "User-Agent")
+            req.timeoutInterval = 25
+            req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko)", forHTTPHeaderField: "User-Agent")
 
             guard let (tempURL, response) = try? await URLSession.shared.download(for: req) else { continue }
+            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 200
             let mime = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Type")?.lowercased() ?? ""
 
-            // Reject HTML/JSON error pages disguised as downloads
-            if mime.contains("text/html") || mime.contains("application/json") {
+            if statusCode >= 400 || mime.contains("text/html") || mime.contains("application/json") {
+                try? FileManager.default.removeItem(at: tempURL)
                 continue
             }
 
-            guard let headerData = try? Data(contentsOf: tempURL, options: .mappedIfSafe),
-                  headerData.count > 8192 else {
+            guard let attrs = try? FileManager.default.attributesOfItem(atPath: tempURL.path),
+                  let fileSize = attrs[.size] as? UInt64, fileSize > 16384 else {
+                try? FileManager.default.removeItem(at: tempURL)
                 continue
             }
 
-            // Detect real container format from magic bytes so AVAudioFile always decodes properly
-            let bytes = [UInt8](headerData.prefix(12))
-            var detectedExt = "mp3"
-            if bytes.count >= 8 && bytes[4] == 0x66 && bytes[5] == 0x74 && bytes[6] == 0x79 && bytes[7] == 0x70 {
-                detectedExt = "m4a" // ISO Base Media / MP4 / M4A ('ftyp')
-            } else if mime.contains("mp4") || mime.contains("m4a") {
-                detectedExt = "m4a"
+            // 1. Try direct AVAudioFile read (.m4a or .mp3)
+            for ext in ["m4a", "mp3", "mp4"] {
+                let testURL = FileManager.default.temporaryDirectory.appendingPathComponent("test_\(UUID().uuidString).\(ext)")
+                try? FileManager.default.copyItem(at: tempURL, to: testURL)
+                if let audioFile = try? AVAudioFile(forReading: testURL), audioFile.length > 0 {
+                    try? FileManager.default.removeItem(at: tempURL)
+                    let finalExt = (ext == "mp4") ? "m4a" : ext
+                    let finalURL = FileManager.default.temporaryDirectory.appendingPathComponent("ready_\(UUID().uuidString).\(finalExt)")
+                    try? FileManager.default.moveItem(at: testURL, to: finalURL)
+                    return (finalURL, finalExt)
+                }
+                try? FileManager.default.removeItem(at: testURL)
             }
 
-            // Final verification: ensure AVAudioFile can open the downloaded file before accepting it
-            let checkURL = FileManager.default.temporaryDirectory.appendingPathComponent("verify_\(UUID().uuidString).\(detectedExt)")
-            try? FileManager.default.moveItem(at: tempURL, to: checkURL)
-            if (try? AVAudioFile(forReading: checkURL)) != nil {
-                return (checkURL, detectedExt)
-            } else {
-                try? FileManager.default.removeItem(at: checkURL)
+            // 2. If it's a fragmented MP4 or muxed video+audio MP4 from YouTube, remux to clean .m4a on-device
+            let rawMP4URL = FileManager.default.temporaryDirectory.appendingPathComponent("raw_\(UUID().uuidString).mp4")
+            try? FileManager.default.moveItem(at: tempURL, to: rawMP4URL)
+
+            if let convertedM4A = await remuxToNativeM4A(sourceURL: rawMP4URL),
+               let verified = try? AVAudioFile(forReading: convertedM4A), verified.length > 0 {
+                try? FileManager.default.removeItem(at: rawMP4URL)
+                return (convertedM4A, "m4a")
             }
+            try? FileManager.default.removeItem(at: rawMP4URL)
         }
 
         throw NSError(domain: "MusiQDownloader", code: -1, userInfo: [
-            NSLocalizedDescriptionKey: "All stream servers returned an unreadable format for this video. Try another link or import from the Files app."
+            NSLocalizedDescriptionKey: "Could not extract a playable audio stream for this link. Check if the video is age-restricted or region-locked."
         ])
+    }
+
+    private func remuxToNativeM4A(sourceURL: URL) async -> URL? {
+        let asset = AVURLAsset(url: sourceURL)
+        guard let exporter = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetAppleM4A) else {
+            return nil
+        }
+        let outURL = FileManager.default.temporaryDirectory.appendingPathComponent("remux_\(UUID().uuidString).m4a")
+        try? FileManager.default.removeItem(at: outURL)
+        exporter.outputURL = outURL
+        exporter.outputFileType = .m4a
+
+        await exporter.export()
+        if exporter.status == .completed {
+            return outURL
+        }
+        return nil
     }
 
     private func resolveCandidateStreamURLs(from inputURL: URL) async throws -> [URL] {
@@ -2424,31 +2452,40 @@ struct YouTubeDownloaderView: View {
 
         var results: [URL] = []
 
-        // 1. Try Piped Streams API first (delivers native M4A audio streams directly)
+        // 1. Direct On-Device YouTube InnerTube API Extraction (Signed for User's Own IP)
         if let videoID = extractYouTubeID(from: inputURL.absoluteString) {
-            for pipedBase in pipedEndpoints {
-                guard let streamAPI = URL(string: "\(pipedBase)/streams/\(videoID)") else { continue }
-                var req = URLRequest(url: streamAPI)
+            let directStreams = await fetchDirectInnerTubeStreams(videoID: videoID)
+            results.append(contentsOf: directStreams)
+
+            // 2. Fallback to Invidious instances with local proxy enabled
+            for invBase in invidiousEndpoints {
+                guard let api = URL(string: "\(invBase)/api/v1/videos/\(videoID)") else { continue }
+                var req = URLRequest(url: api)
                 req.timeoutInterval = 8
                 if let (data, _) = try? await URLSession.shared.data(for: req),
-                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                   let audioStreams = json["audioStreams"] as? [[String: Any]] {
-                    // Prefer M4A / MP4 streams for native iOS AVAudioEngine decoding
-                    let sorted = audioStreams.sorted { a, b in
-                        let aMime = (a["mimeType"] as? String) ?? ""
-                        let bMime = (b["mimeType"] as? String) ?? ""
-                        return aMime.contains("mp4") && !bMime.contains("mp4")
+                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                    if let adaptive = json["adaptiveFormats"] as? [[String: Any]] {
+                        for fmt in adaptive {
+                            let type = (fmt["type"] as? String)?.lowercased() ?? ""
+                            if type.contains("audio/mp4") || type.contains("audio/m4a") {
+                                if let uStr = fmt["url"] as? String, let u = URL(string: uStr) {
+                                    results.append(u)
+                                }
+                            }
+                        }
                     }
-                    for stream in sorted {
-                        if let urlStr = stream["url"] as? String, let sURL = URL(string: urlStr) {
-                            results.append(sURL)
+                    if let fmtStreams = json["formatStreams"] as? [[String: Any]] {
+                        for fmt in fmtStreams {
+                            if let uStr = fmt["url"] as? String, let u = URL(string: uStr) {
+                                results.append(u)
+                            }
                         }
                     }
                 }
             }
         }
 
-        // 2. Try Cobalt v10/v11 API instances
+        // 3. Fallback to Cobalt API instances
         for endpoint in cobaltEndpoints {
             guard let apiEndpoint = URL(string: endpoint) else { continue }
             var request = URLRequest(url: apiEndpoint)
@@ -2456,7 +2493,6 @@ struct YouTubeDownloaderView: View {
             request.timeoutInterval = 8
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             request.setValue("application/json", forHTTPHeaderField: "Accept")
-            request.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)", forHTTPHeaderField: "User-Agent")
 
             let payload: [String: Any] = [
                 "url": inputURL.absoluteString,
@@ -2478,8 +2514,91 @@ struct YouTubeDownloaderView: View {
         }
         return results
     }
-}
 
+    // Queries YouTube's internal player API directly from the device so stream URLs match the phone's IP
+    private func fetchDirectInnerTubeStreams(videoID: String) async -> [URL] {
+        var found: [URL] = []
+        let clients: [([String: Any], String)] = [
+            (
+                [
+                    "clientName": "ANDROID_VR",
+                    "clientVersion": "1.60.19",
+                    "deviceMake": "Oculus",
+                    "deviceModel": "Quest 3",
+                    "androidSdkVersion": 32,
+                    "osName": "Android",
+                    "osVersion": "12L"
+                ],
+                "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"
+            ),
+            (
+                [
+                    "clientName": "IOS",
+                    "clientVersion": "19.45.4",
+                    "deviceMake": "Apple",
+                    "deviceModel": "iPhone16,2",
+                    "osName": "iPhone",
+                    "osVersion": "18.1.0.22B83"
+                ],
+                "com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1 like Mac OS X)"
+            )
+        ]
+
+        guard let endpoint = URL(string: "https://www.youtube.com/youtubei/v1/player?prettyPrint=false") else {
+            return []
+        }
+
+        for (clientDict, userAgent) in clients {
+            var req = URLRequest(url: endpoint)
+            req.httpMethod = "POST"
+            req.timeoutInterval = 10
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+
+            let body: [String: Any] = [
+                "videoId": videoID,
+                "context": ["client": clientDict],
+                "contentCheckOk": true,
+                "racyCheckOk": true
+            ]
+            req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+
+            guard let (data, _) = try? await URLSession.shared.data(for: req),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let streamingData = json["streamingData"] as? [String: Any] else {
+                continue
+            }
+
+            // 1. Check adaptiveFormats for itag 140 (M4A audio)
+            if let adaptive = streamingData["adaptiveFormats"] as? [[String: Any]] {
+                for fmt in adaptive {
+                    let mime = (fmt["mimeType"] as? String)?.lowercased() ?? ""
+                    if mime.contains("audio/mp4") || (fmt["itag"] as? Int) == 140 {
+                        if let urlStr = fmt["url"] as? String, let u = URL(string: urlStr) {
+                            found.append(u)
+                        }
+                    }
+                }
+            }
+
+            // 2. Check standard muxed MP4 formats (itag 18) which remuxToNativeM4A converts to pure M4A
+            if let formats = streamingData["formats"] as? [[String: Any]] {
+                for fmt in formats {
+                    let mime = (fmt["mimeType"] as? String)?.lowercased() ?? ""
+                    if mime.contains("mp4") {
+                        if let urlStr = fmt["url"] as? String, let u = URL(string: urlStr) {
+                            found.append(u)
+                        }
+                    }
+                }
+            }
+
+            if !found.isEmpty { break }
+        }
+
+        return found
+    }
+}
 // MARK: - Tab 4: Listening Minutes Tracker View
 struct ListeningStatsView: View {
     @ObservedObject var engine: MusiQEngine
