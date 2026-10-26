@@ -27,6 +27,12 @@ struct Track: Identifiable, Hashable, Codable {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
             .appendingPathComponent(fileName)
     }
+
+    var formattedDuration: String {
+        guard duration.isFinite && duration > 0 else { return "0:00" }
+        let total = Int(duration.rounded())
+        return String(format: "%d:%02d", total / 60, total % 60)
+    }
 }
 
 struct CustomTrackMetadata: Codable {
@@ -38,7 +44,7 @@ struct Playlist: Identifiable, Hashable, Codable {
     var id: UUID = UUID()
     var name: String
     var trackFileNames: [String] = []
-    var customCoverKey: String? = nil
+    var hasCustomCover: Bool = false
 }
 
 struct LyricLine: Identifiable, Equatable {
@@ -176,7 +182,7 @@ extension UIImage {
     }
 }
 
-// MARK: - Fast Artwork, Gradient & Custom Tag Cache
+// MARK: - Fast Artwork, Playlist Cover & Custom Tag Cache
 final class ArtworkCache {
     static let shared = ArtworkCache()
     private let cache = NSCache<NSString, UIImage>()
@@ -211,6 +217,32 @@ final class ArtworkCache {
             }
         }
         return nil
+    }
+
+    func playlistCover(for playlistID: UUID) -> UIImage? {
+        let key = "playlist_\(playlistID.uuidString)"
+        if let cached = cache.object(forKey: key as NSString) {
+            return cached
+        }
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let url = docs.appendingPathComponent("\(key).jpg")
+        if let data = try? Data(contentsOf: url), let img = UIImage(data: data) {
+            let squared = img.autoCroppedToSquare()
+            cache.setObject(squared, forKey: key as NSString)
+            return squared
+        }
+        return nil
+    }
+
+    func setPlaylistCover(_ image: UIImage, for playlistID: UUID) {
+        let key = "playlist_\(playlistID.uuidString)"
+        let squared = image.autoCroppedToSquare()
+        cache.setObject(squared, forKey: key as NSString)
+        if let data = squared.jpegData(compressionQuality: 0.9) {
+            let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            let url = docs.appendingPathComponent("\(key).jpg")
+            try? data.write(to: url)
+        }
     }
 
     func playerGradient(for fileName: String?) -> [Color] {
@@ -260,10 +292,11 @@ final class ArtworkCache {
     }
 }
 
-// MARK: - Synced Lyrics Storage, LRC Parser & Auto-Fetcher
+// MARK: - Synced Lyrics Storage, Per-Track Intro Offset & Auto-Fetcher
 final class LyricsManager {
     static let shared = LyricsManager()
     private let storageKey = "MusiQ_Saved_Lyrics_v3"
+    private let offsetStorageKey = "MusiQ_Lyrics_Offsets_v1"
 
     func getLyrics(for track: Track) -> String {
         if let dict = UserDefaults.standard.dictionary(forKey: storageKey) as? [String: String],
@@ -281,6 +314,18 @@ final class LyricsManager {
         var dict = (UserDefaults.standard.dictionary(forKey: storageKey) as? [String: String]) ?? [:]
         dict[track.fileName] = text
         UserDefaults.standard.set(dict, forKey: storageKey)
+    }
+
+    /// Returns per-song lyric timing offset in seconds (e.g., +12.5s if the track has a video intro)
+    func getOffset(for fileName: String) -> Double {
+        let dict = (UserDefaults.standard.dictionary(forKey: offsetStorageKey) as? [String: Double]) ?? [:]
+        return dict[fileName] ?? 0.0
+    }
+
+    func saveOffset(_ offset: Double, for fileName: String) {
+        var dict = (UserDefaults.standard.dictionary(forKey: offsetStorageKey) as? [String: Double]) ?? [:]
+        dict[fileName] = offset
+        UserDefaults.standard.set(dict, forKey: offsetStorageKey)
     }
 
     func parseLyrics(_ raw: String) -> [LyricLine] {
@@ -316,7 +361,7 @@ final class LyricsManager {
                     parsed.append(LyricLine(index: idx, time: timestamp, text: lyricText))
                     idx += 1
                 }
-            } else if !trimmed.hasPrefix("[ti:") && !trimmed.hasPrefix("[ar:") && !trimmed.hasPrefix("[al:") && !trimmed.hasPrefix("[by:") && !trimmed.hasPrefix("[length:") && !trimmed.hasPrefix("[offset:") {
+            } else if !trimmed.hasPrefix("[ti:") && !trimmed.hasPrefix("[ar:") && !trimmed.hasPrefix("[al:") && !trimmed.hasPrefix("[by:") && !trimmed.hasPrefix("[length:") {
                 parsed.append(LyricLine(index: idx, time: nil, text: trimmed))
                 idx += 1
             }
@@ -325,19 +370,23 @@ final class LyricsManager {
         return parsed
     }
 
-    static func activeLineIndex(in lines: [LyricLine], currentTime: Double, duration: Double) -> Int? {
+    /// Evaluates active lyric index taking the user's custom Intro Offset into account
+    static func activeLineIndex(in lines: [LyricLine], currentTime: Double, duration: Double, offsetSeconds: Double) -> Int? {
         guard !lines.isEmpty else { return nil }
+        // Positive offset means the song has a longer intro than the lyrics (delays lyrics by offsetSeconds)
+        let adjustedTime = max(0, currentTime - offsetSeconds)
+
         if lines.contains(where: { $0.time != nil }) {
-            var lastMatch: Int = 0
+            var lastMatch: Int? = nil
             for (i, line) in lines.enumerated() {
-                if let t = line.time, t <= currentTime + 0.15 {
+                if let t = line.time, t <= adjustedTime + 0.15 {
                     lastMatch = i
                 }
             }
-            return lastMatch
+            return lastMatch ?? 0
         } else {
             let dur = max(duration, 1)
-            let ratio = min(max(currentTime / dur, 0), 0.999)
+            let ratio = min(max(adjustedTime / dur, 0), 0.999)
             return Int(ratio * Double(lines.count))
         }
     }
@@ -352,7 +401,7 @@ final class LyricsManager {
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
         var query = cleanTitle
-        if artist != "Unknown Artist" && artist != "Direct Audio Import" && !artist.isEmpty {
+        if artist != "Unknown Artist" && artist != "Audio Import" && !artist.isEmpty {
             query = "\(artist) \(cleanTitle)"
         }
 
@@ -363,7 +412,7 @@ final class LyricsManager {
 
         do {
             var req = URLRequest(url: url)
-            req.setValue("MusiQ iOS Player v2.2", forHTTPHeaderField: "User-Agent")
+            req.setValue("MusiQ iOS Player v2.5", forHTTPHeaderField: "User-Agent")
             let (data, _) = try await URLSession.shared.data(for: req)
             if let results = try JSONSerialization.jsonObject(with: data) as? [[String: Any]],
                !results.isEmpty {
@@ -389,7 +438,7 @@ final class PlaybackProgressObserver: ObservableObject {
     var isScrubbing: Bool = false
 }
 
-// MARK: - High-Performance Audio, Library & Listening Tracker Engine
+// MARK: - High-Performance Audio Engine (Sample-Rate Safe & Interruption Proof)
 final class MusiQEngine: ObservableObject {
     @Published var allTracks: [Track] = []
     @Published var playlists: [Playlist] = []
@@ -407,6 +456,7 @@ final class MusiQEngine: ObservableObject {
     @Published var playbackErrorMessage: String? = nil
 
     @Published var currentTrackLyrics: [LyricLine] = []
+    @Published var currentTrackLyricOffset: Double = 0.0
     @Published var isFetchingLyricsInBackground: Bool = false
 
     @Published var listenedSecondsByFile: [String: Double] = [:]
@@ -429,7 +479,7 @@ final class MusiQEngine: ObservableObject {
     private var scheduleGeneration: Int = 0
     private var tickCounter: Int = 0
 
-    private let playlistsStorageKey = "MusiQ_User_Playlists_v3"
+    private let playlistsStorageKey = "MusiQ_User_Playlists_v2"
     private let listeningStatsKey = "MusiQ_Listening_Seconds_v2"
 
     var currentTrack: Track? {
@@ -440,6 +490,7 @@ final class MusiQEngine: ObservableObject {
     init() {
         configureAudioSession()
         setupEngineGraph()
+        registerAudioInterruptionObservers()
         loadSavedPlaylists()
         loadListeningStats()
         scanLocalLibrary()
@@ -489,30 +540,104 @@ final class MusiQEngine: ObservableObject {
         }
     }
 
-    /// Rebuilds the entire DSP chain at the exact sample rate (44.1kHz, 48kHz, 96kHz) of the active file so songs NEVER pitch-down or slow-down
-    private func rebuildAudioGraph(for fileFormat: AVAudioFormat) {
-        engine.stop()
-        engine.disconnectNodeOutput(playerNode)
-        engine.disconnectNodeOutput(timePitchNode)
-        engine.disconnectNodeOutput(eqNode)
+    // MARK: - Fix for PiP / Background App Audio Interruption Desync
+    private func registerAudioInterruptionObservers() {
+        NotificationCenter.default.addObserver(
+            forName: AVAudioSession.interruptionNotification,
+            object: AVAudioSession.sharedInstance(),
+            queue: .main
+        ) { [weak self] notification in
+            guard let self = self,
+                  let userInfo = notification.userInfo,
+                  let typeVal = userInfo[AVAudioSessionInterruptionTypeKey] as? UInt,
+                  let type = AVAudioSession.InterruptionType(rawValue: typeVal) else { return }
 
-        engine.connect(playerNode, to: timePitchNode, format: fileFormat)
-        engine.connect(timePitchNode, to: eqNode, format: fileFormat)
-        engine.connect(eqNode, to: engine.mainMixerNode, format: fileFormat)
+            switch type {
+            case .began:
+                // External video/PiP/call took over audio: immediately sync UI to paused state!
+                self.captureCurrentPlaybackPosition()
+                self.playerNode.pause()
+                self.isPlaying = false
+                self.stopProgressTimer()
+                self.saveListeningStats()
+                self.updateNowPlayingInfo()
 
-        timePitchNode.pitch = pitchCents
-        timePitchNode.rate = playbackRate
-        setEQ(eqPreset)
+            case .ended:
+                let optionsVal = userInfo[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
+                let options = AVAudioSession.InterruptionOptions(rawValue: optionsVal)
+                if options.contains(.shouldResume) {
+                    self.resumeAfterInterruption()
+                }
+            @unknown default:
+                break
+            }
+        }
 
-        engine.prepare()
-        try? engine.start()
+        NotificationCenter.default.addObserver(
+            forName: AVAudioSession.routeChangeNotification,
+            object: AVAudioSession.sharedInstance(),
+            queue: .main
+        ) { [weak self] notification in
+            guard let self = self,
+                  let userInfo = notification.userInfo,
+                  let reasonVal = userInfo[AVAudioSessionRouteChangeReasonKey] as? UInt,
+                  let reason = AVAudioSession.RouteChangeReason(rawValue: reasonVal) else { return }
+
+            if reason == .oldDeviceUnavailable {
+                self.captureCurrentPlaybackPosition()
+                self.playerNode.pause()
+                self.isPlaying = false
+                self.stopProgressTimer()
+                self.updateNowPlayingInfo()
+            }
+        }
+
+        NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: engine,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self = self else { return }
+            // If hardware sample rate or route changed while backgrounded, sync state cleanly
+            if !self.engine.isRunning && self.isPlaying {
+                self.captureCurrentPlaybackPosition()
+                self.isPlaying = false
+                self.stopProgressTimer()
+                self.updateNowPlayingInfo()
+            }
+        }
     }
 
+    private func captureCurrentPlaybackPosition() {
+        if let nodeTime = playerNode.lastRenderTime,
+           let playerTime = playerNode.playerTime(forNodeTime: nodeTime) {
+            let currentFrame = seekFrameOffset + playerTime.sampleTime
+            let clamped = max(0, min(currentFrame, totalFrames - 100))
+            seekFrameOffset = clamped
+            progress.currentTime = Double(clamped) / max(sampleRate, 1)
+        }
+    }
+
+    private func resumeAfterInterruption() {
+        try? AVAudioSession.sharedInstance().setActive(true)
+        seek(to: progress.currentTime)
+        if !engine.isRunning {
+            try? engine.start()
+        }
+        playerNode.play()
+        isPlaying = true
+        startProgressTimer()
+        updateNowPlayingInfo()
+    }
+
+    // MARK: - Live Synced Lyrics & Offset Loader
     func reloadLyricsForCurrentTrack() {
         guard let track = currentTrack else {
             currentTrackLyrics = []
+            currentTrackLyricOffset = 0
             return
         }
+        currentTrackLyricOffset = LyricsManager.shared.getOffset(for: track.fileName)
         let saved = LyricsManager.shared.getLyrics(for: track)
         if !saved.isEmpty {
             currentTrackLyrics = LyricsManager.shared.parseLyrics(saved)
@@ -537,6 +662,16 @@ final class MusiQEngine: ObservableObject {
                 }
             }
         }
+    }
+
+    func adjustLyricOffset(by delta: Double) {
+        guard let track = currentTrack else { return }
+        if delta == 0 {
+            currentTrackLyricOffset = 0
+        } else {
+            currentTrackLyricOffset = (currentTrackLyricOffset + delta * 10).rounded() / 10
+        }
+        LyricsManager.shared.saveOffset(currentTrackLyricOffset, for: track.fileName)
     }
 
     private func loadListeningStats() {
@@ -659,7 +794,6 @@ final class MusiQEngine: ObservableObject {
         updateNowPlayingInfo()
     }
 
-    // MARK: - Playlist Management + Custom Playlist Artwork
     func loadSavedPlaylists() {
         guard let data = UserDefaults.standard.data(forKey: playlistsStorageKey),
               let decoded = try? JSONDecoder().decode([Playlist].self, from: data) else {
@@ -682,18 +816,16 @@ final class MusiQEngine: ObservableObject {
         savePlaylists()
     }
 
-    func renamePlaylist(id: UUID, newName: String) {
+    func updatePlaylistDetails(id: UUID, newName: String, customCover: UIImage?) {
+        guard let idx = playlists.firstIndex(where: { $0.id == id }) else { return }
         let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, let idx = playlists.firstIndex(where: { $0.id == id }) else { return }
-        playlists[idx].name = trimmed
-        savePlaylists()
-    }
-
-    func setPlaylistCustomCover(_ image: UIImage, for playlistID: UUID) {
-        guard let idx = playlists.firstIndex(where: { $0.id == playlistID }) else { return }
-        let key = "playlist_cover_\(playlistID.uuidString)"
-        ArtworkCache.shared.setCustomArtwork(image, for: key)
-        playlists[idx].customCoverKey = key
+        if !trimmed.isEmpty {
+            playlists[idx].name = trimmed
+        }
+        if let cover = customCover {
+            ArtworkCache.shared.setPlaylistCover(cover, for: id)
+            playlists[idx].hasCustomCover = true
+        }
         savePlaylists()
         artworkRefreshID = UUID()
     }
@@ -723,7 +855,6 @@ final class MusiQEngine: ObservableObject {
         }
     }
 
-    // MARK: - Playback Controls (With Sample-Rate Safe Graph Rebuilder)
     func playTrack(_ track: Track, in queue: [Track]) {
         let validQueue = queue.isEmpty ? allTracks : queue
         currentQueue = validQueue
@@ -736,6 +867,7 @@ final class MusiQEngine: ObservableObject {
         loadAndScheduleCurrentTrack(startFrame: 0, autoPlay: true)
     }
 
+    // MARK: - Sample-Rate Matched Scheduling (Fixes 48kHz / 44.1kHz Pitch & Slowdown Bug!)
     private func loadAndScheduleCurrentTrack(startFrame: AVAudioFramePosition, autoPlay: Bool) {
         guard let track = currentTrack else { return }
         scheduleGeneration += 1
@@ -753,9 +885,11 @@ final class MusiQEngine: ObservableObject {
         reloadLyricsForCurrentTrack()
 
         do {
+            try AVAudioSession.sharedInstance().setActive(true)
             let file = try AVAudioFile(forReading: track.fileURL)
             activeAudioFile = file
-            sampleRate = file.processingFormat.sampleRate
+            let fileFormat = file.processingFormat
+            sampleRate = fileFormat.sampleRate
             totalFrames = file.length
             seekFrameOffset = max(0, min(startFrame, totalFrames))
 
@@ -768,8 +902,23 @@ final class MusiQEngine: ObservableObject {
             progress.duration = max(1, Double(totalFrames) / sampleRate)
             progress.currentTime = Double(seekFrameOffset) / sampleRate
 
-            // Rebuild graph using the exact file sample rate so 48kHz / 44.1kHz tracks never pitch-shift!
-            rebuildAudioGraph(for: file.processingFormat)
+            // Connect the entire DSP chain using the file's exact sample rate & channel layout
+            // so mainMixerNode handles 48kHz -> 44.1kHz conversion without pitching down!
+            engine.disconnectNodeOutput(playerNode)
+            engine.disconnectNodeOutput(timePitchNode)
+            engine.disconnectNodeOutput(eqNode)
+
+            engine.connect(playerNode, to: timePitchNode, format: fileFormat)
+            engine.connect(timePitchNode, to: eqNode, format: fileFormat)
+            engine.connect(eqNode, to: engine.mainMixerNode, format: fileFormat)
+
+            timePitchNode.pitch = pitchCents
+            timePitchNode.rate = playbackRate
+
+            if !engine.isRunning {
+                engine.prepare()
+                try engine.start()
+            }
 
             playerNode.scheduleSegment(
                 file,
@@ -805,14 +954,22 @@ final class MusiQEngine: ObservableObject {
             return
         }
 
+        // If engine stopped in background due to PiP/System interruption, treat as paused and resume cleanly
+        if isPlaying && (!engine.isRunning || !playerNode.isPlaying) {
+            isPlaying = false
+        }
+
         if isPlaying {
+            captureCurrentPlaybackPosition()
             playerNode.pause()
             isPlaying = false
             stopProgressTimer()
             saveListeningStats()
         } else {
+            try? AVAudioSession.sharedInstance().setActive(true)
             if !engine.isRunning {
                 try? engine.start()
+                seek(to: progress.currentTime)
             }
             playerNode.play()
             isPlaying = true
@@ -833,6 +990,10 @@ final class MusiQEngine: ObservableObject {
         playerNode.stop()
         let remaining = AVAudioFrameCount(max(0, totalFrames - clampedFrame))
         guard remaining > 0 else { return }
+
+        if !engine.isRunning {
+            try? engine.start()
+        }
 
         playerNode.scheduleSegment(
             file,
@@ -928,6 +1089,14 @@ final class MusiQEngine: ObservableObject {
         progressTimer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: true) { [weak self] _ in
             guard let self = self, self.isPlaying, self.activeAudioFile != nil else { return }
 
+            // Auto-detect if iOS paused the engine externally without firing an interruption
+            if !self.engine.isRunning || !self.playerNode.isPlaying {
+                self.isPlaying = false
+                self.stopProgressTimer()
+                self.updateNowPlayingInfo()
+                return
+            }
+
             if let activeFile = self.currentTrack?.fileName {
                 self.listenedSecondsByFile[activeFile, default: 0] += 0.15
                 self.tickCounter += 1
@@ -959,11 +1128,13 @@ final class MusiQEngine: ObservableObject {
     private func setupRemoteTransportControls() {
         let commandCenter = MPRemoteCommandCenter.shared()
         commandCenter.playCommand.addTarget { [weak self] _ in
-            self?.togglePlayPause()
+            guard let self = self else { return .commandFailed }
+            if !self.isPlaying { self.togglePlayPause() }
             return .success
         }
         commandCenter.pauseCommand.addTarget { [weak self] _ in
-            self?.togglePlayPause()
+            guard let self = self else { return .commandFailed }
+            if self.isPlaying { self.togglePlayPause() }
             return .success
         }
         commandCenter.nextTrackCommand.addTarget { [weak self] _ in
@@ -1030,7 +1201,6 @@ struct LoopingMarqueeText: View {
     let text: String
     let font: Font
     let textColor: Color
-    var alignment: Alignment = .center
 
     @State private var textWidth: CGFloat = 0
     @State private var containerWidth: CGFloat = 0
@@ -1063,7 +1233,7 @@ struct LoopingMarqueeText: View {
                         .font(font)
                         .foregroundColor(textColor)
                         .lineLimit(1)
-                        .frame(width: geo.size.width, alignment: alignment)
+                        .frame(width: geo.size.width, alignment: .center)
                 }
             }
             .background(
@@ -1090,7 +1260,7 @@ struct LoopingMarqueeText: View {
             )
             .clipped()
         }
-        .frame(height: 28)
+        .frame(height: 30)
     }
 
     private func startScrollIfNeeded(container: CGFloat, text: CGFloat) {
@@ -1104,10 +1274,11 @@ struct LoopingMarqueeText: View {
     }
 }
 
-// MARK: - Polished Spotify-Style Inline Lyric Line (Fixed Alignment & Smooth Crossfade)
-struct SpotifyInlineLyricView: View {
+// MARK: - Polished In-Player Synced Lyric Line (Balanced Between Artist & Scrubber)
+struct PolishedInlineLyricView: View {
     @ObservedObject var progress: PlaybackProgressObserver
     let lines: [LyricLine]
+    let offsetSeconds: Double
     let isFetching: Bool
     let onTap: () -> Void
 
@@ -1115,54 +1286,54 @@ struct SpotifyInlineLyricView: View {
         LyricsManager.activeLineIndex(
             in: lines,
             currentTime: progress.currentTime,
-            duration: progress.duration
+            duration: progress.duration,
+            offsetSeconds: offsetSeconds
         )
     }
 
     var body: some View {
         Button(action: onTap) {
-            ZStack(alignment: .leading) {
+            ZStack {
                 if let idx = activeIndex {
                     let currentLine = lines[idx].text
                     Text(currentLine)
-                        .font(.system(size: 17, weight: .bold, design: .rounded))
+                        .font(.system(size: 16, weight: .bold, design: .rounded))
                         .foregroundColor(.white.opacity(0.95))
                         .shadow(color: .black.opacity(0.35), radius: 4, x: 0, y: 2)
-                        .lineLimit(2)
-                        .minimumScaleFactor(0.82)
-                        .multilineTextAlignment(.leading)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.75)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: .infinity, alignment: .center)
                         .id("inline_lyric_\(idx)")
-                        .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .leading)))
-                        .animation(.easeOut(duration: 0.24), value: idx)
+                        .transition(
+                            .asymmetric(
+                                insertion: .move(edge: .bottom).combined(with: .opacity),
+                                removal: .move(edge: .top).combined(with: .opacity)
+                            )
+                        )
+                        .animation(.spring(response: 0.32, dampingFraction: 0.85), value: idx)
                 } else if isFetching {
-                    HStack(spacing: 6) {
-                        ProgressView()
-                            .scaleEffect(0.7)
-                            .tint(.white.opacity(0.5))
-                        Text("Syncing lyrics...")
-                            .font(.system(size: 13, weight: .medium, design: .rounded))
-                            .foregroundColor(.white.opacity(0.45))
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    Text("Syncing lyrics...")
+                        .font(.system(size: 13, weight: .medium, design: .rounded))
+                        .foregroundColor(.white.opacity(0.45))
                 } else {
-                    HStack(spacing: 6) {
+                    HStack(spacing: 5) {
                         Image(systemName: "quote.bubble")
-                            .font(.system(size: 12))
+                            .font(.system(size: 11))
                         Text("Tap for lyrics")
-                            .font(.system(size: 13, weight: .medium, design: .rounded))
+                            .font(.system(size: 12, weight: .medium, design: .rounded))
                     }
                     .foregroundColor(.white.opacity(0.32))
-                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
-            .frame(height: 44)
+            .frame(height: 30)
+            .padding(.horizontal, 12)
         }
         .buttonStyle(.plain)
     }
 }
 
-// MARK: - Apple Music-Style Blurred Scrolling Lyrics Sheet (Refined Blur & Spacing)
+// MARK: - Apple Music-Style Blurred Scrolling Lyrics Sheet + Intro Sync Offset Calibration
 struct AppleMusicLyricsSheetView: View {
     @ObservedObject var engine: MusiQEngine
     @ObservedObject var progress: PlaybackProgressObserver
@@ -1177,7 +1348,8 @@ struct AppleMusicLyricsSheetView: View {
         LyricsManager.activeLineIndex(
             in: engine.currentTrackLyrics,
             currentTime: progress.currentTime,
-            duration: progress.duration
+            duration: progress.duration,
+            offsetSeconds: engine.currentTrackLyricOffset
         )
     }
 
@@ -1194,7 +1366,7 @@ struct AppleMusicLyricsSheetView: View {
             )
             .ignoresSafeArea()
 
-            Color.black.opacity(0.32)
+            Color.black.opacity(0.30)
                 .ignoresSafeArea()
 
             VStack(spacing: 0) {
@@ -1204,7 +1376,7 @@ struct AppleMusicLyricsSheetView: View {
                     .padding(.top, 10)
                     .padding(.bottom, 12)
 
-                // Compact Header
+                // Compact Top Header
                 HStack(spacing: 14) {
                     if let art = ArtworkCache.shared.artwork(for: track.fileName) {
                         Image(uiImage: art)
@@ -1220,14 +1392,14 @@ struct AppleMusicLyricsSheetView: View {
                             .overlay(Image(systemName: "music.note").foregroundColor(.white))
                     }
 
-                    VStack(alignment: .leading, spacing: 3) {
+                    VStack(alignment: .leading, spacing: 2) {
                         Text(track.title)
                             .font(.system(size: 17, weight: .bold))
                             .foregroundColor(.white)
                             .lineLimit(1)
                         Text(track.artist)
                             .font(.system(size: 14, weight: .medium))
-                            .foregroundColor(.white.opacity(0.65))
+                            .foregroundColor(.white.opacity(0.68))
                             .lineLimit(1)
                     }
 
@@ -1264,7 +1436,64 @@ struct AppleMusicLyricsSheetView: View {
                     }
                 }
                 .padding(.horizontal, 24)
-                .padding(.bottom, 14)
+                .padding(.bottom, 10)
+
+                // Per-Song Intro Timing Offset Calibrator (Fixes Video Intro Delays like Through The Wire!)
+                HStack(spacing: 10) {
+                    Image(systemName: "timer")
+                        .font(.caption)
+                        .foregroundColor(.white.opacity(0.7))
+
+                    Text(offsetLabel)
+                        .font(.caption.monospacedDigit().weight(.semibold))
+                        .foregroundColor(.white.opacity(0.88))
+
+                    Spacer()
+
+                    Button {
+                        engine.adjustLyricOffset(by: -0.5)
+                    } label: {
+                        Text("-0.5s")
+                            .font(.caption2.weight(.bold))
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 5)
+                            .background(Color.white.opacity(0.15))
+                            .clipShape(Capsule())
+                            .foregroundColor(.white)
+                    }
+
+                    if abs(engine.currentTrackLyricOffset) > 0.05 {
+                        Button {
+                            engine.adjustLyricOffset(by: 0)
+                        } label: {
+                            Text("Reset")
+                                .font(.caption2.weight(.semibold))
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 5)
+                                .background(Color.purple.opacity(0.55))
+                                .clipShape(Capsule())
+                                .foregroundColor(.white)
+                        }
+                    }
+
+                    Button {
+                        engine.adjustLyricOffset(by: 0.5)
+                    } label: {
+                        Text("+0.5s")
+                            .font(.caption2.weight(.bold))
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 5)
+                            .background(Color.white.opacity(0.15))
+                            .clipShape(Capsule())
+                            .foregroundColor(.white)
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 7)
+                .background(Color.black.opacity(0.24))
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+                .padding(.horizontal, 24)
+                .padding(.bottom, 8)
 
                 if showRawEditor {
                     VStack(spacing: 12) {
@@ -1346,7 +1575,7 @@ struct AppleMusicLyricsSheetView: View {
                     } else {
                         ScrollViewReader { proxy in
                             ScrollView(showsIndicators: false) {
-                                VStack(alignment: .leading, spacing: 22) {
+                                VStack(alignment: .leading, spacing: 24) {
                                     Spacer().frame(height: 20)
 
                                     ForEach(engine.currentTrackLyrics) { line in
@@ -1356,14 +1585,15 @@ struct AppleMusicLyricsSheetView: View {
 
                                         Button {
                                             if let t = line.time {
-                                                engine.seek(to: t)
+                                                let seekTarget = max(0, t + engine.currentTrackLyricOffset)
+                                                engine.seek(to: seekTarget)
                                             }
                                         } label: {
                                             Text(line.text)
-                                                .font(.system(size: 27, weight: .bold, design: .rounded))
-                                                .foregroundColor(.white.opacity(isCurrent ? 1.0 : max(0.26, 0.52 - Double(distance) * 0.07)))
-                                                .blur(radius: isCurrent ? 0 : min(CGFloat(distance) * 1.1, 3.6))
-                                                .scaleEffect(isCurrent ? 1.0 : 0.95, anchor: .leading)
+                                                .font(.system(size: isCurrent ? 29 : 25, weight: .bold, design: .rounded))
+                                                .foregroundColor(.white.opacity(isCurrent ? 1.0 : max(0.22, 0.50 - Double(distance) * 0.08)))
+                                                .blur(radius: isCurrent ? 0 : min(CGFloat(distance) * 1.35, 4.8))
+                                                .scaleEffect(isCurrent ? 1.0 : 0.96, anchor: .leading)
                                                 .multilineTextAlignment(.leading)
                                                 .frame(maxWidth: .infinity, alignment: .leading)
                                                 .animation(.spring(response: 0.36, dampingFraction: 0.84), value: currentIdx)
@@ -1372,7 +1602,7 @@ struct AppleMusicLyricsSheetView: View {
                                         .id(line.index)
                                     }
 
-                                    Spacer().frame(height: 140)
+                                    Spacer().frame(height: 150)
                                 }
                                 .padding(.horizontal, 26)
                             }
@@ -1381,7 +1611,7 @@ struct AppleMusicLyricsSheetView: View {
                                     stops: [
                                         .init(color: .clear, location: 0.0),
                                         .init(color: .black, location: 0.07),
-                                        .init(color: .black, location: 0.88),
+                                        .init(color: .black, location: 0.89),
                                         .init(color: .clear, location: 1.0)
                                     ],
                                     startPoint: .top,
@@ -1390,19 +1620,19 @@ struct AppleMusicLyricsSheetView: View {
                             )
                             .onAppear {
                                 if let idx = activeIndex {
-                                    proxy.scrollTo(idx, anchor: UnitPoint(x: 0.5, y: 0.30))
+                                    proxy.scrollTo(idx, anchor: UnitPoint(x: 0.5, y: 0.28))
                                 }
                             }
                             .onChange(of: activeIndex) { newIdx in
                                 guard let idx = newIdx else { return }
                                 withAnimation(.spring(response: 0.42, dampingFraction: 0.85)) {
-                                    proxy.scrollTo(idx, anchor: UnitPoint(x: 0.5, y: 0.30))
+                                    proxy.scrollTo(idx, anchor: UnitPoint(x: 0.5, y: 0.28))
                                 }
                             }
                         }
                     }
 
-                    // Bottom Scrubber & Transport Controls
+                    // Bottom Playback Controls Inside Lyrics Sheet
                     VStack(spacing: 12) {
                         IsolatedScrubberView(progress: engine.progress) { newSeconds in
                             engine.seek(to: newSeconds)
@@ -1442,6 +1672,17 @@ struct AppleMusicLyricsSheetView: View {
         }
     }
 
+    private var offsetLabel: String {
+        let val = engine.currentTrackLyricOffset
+        if abs(val) < 0.05 {
+            return "Intro Sync: 0.0s"
+        } else if val > 0 {
+            return String(format: "Intro Delay: +%.1fs", val)
+        } else {
+            return String(format: "Intro Early: %.1fs", val)
+        }
+    }
+
     private func autoFetchSynced() {
         isFetchingOnline = true
         Task {
@@ -1460,80 +1701,54 @@ struct AppleMusicLyricsSheetView: View {
     }
 }
 
-// MARK: - Dynamic Playlist Cover View (Custom Photo or Automatic 2x2 Album Grid Collage)
-struct PlaylistCoverThumbnail: View {
-    @ObservedObject var engine: MusiQEngine
+// MARK: - Playlist Cover View (Supports Custom Photo OR 2x2 Album Art Collage!)
+struct PlaylistArtworkThumbnailView: View {
     let playlist: Playlist
+    let tracks: [Track]
     let size: CGFloat
     let cornerRadius: CGFloat
 
-    private var playlistTracks: [Track] {
-        engine.tracks(for: playlist)
-    }
-
-    private var customCoverImage: UIImage? {
-        let _ = engine.artworkRefreshID
-        guard let key = playlist.customCoverKey else { return nil }
-        return ArtworkCache.shared.artwork(for: key)
-    }
-
-    private var trackCovers: [UIImage] {
-        let _ = engine.artworkRefreshID
-        var imgs: [UIImage] = []
-        for t in playlistTracks {
-            if let art = ArtworkCache.shared.artwork(for: t.fileName) {
-                imgs.append(art)
-                if imgs.count == 4 { break }
-            }
-        }
-        return imgs
-    }
-
     var body: some View {
-        Group {
-            if let custom = customCoverImage {
-                Image(uiImage: custom)
-                    .resizable()
-                    .scaledToFill()
-                    .frame(width: size, height: size)
-            } else if trackCovers.count >= 4 {
-                // Automatic 2x2 Album Art Grid Collage (Like Spotify Playlists)
+        if let customImg = ArtworkCache.shared.playlistCover(for: playlist.id) {
+            Image(uiImage: customImg)
+                .resizable()
+                .scaledToFill()
+                .frame(width: size, height: size)
+                .clipShape(RoundedRectangle(cornerRadius: cornerRadius))
+        } else {
+            let covers = tracks.compactMap { ArtworkCache.shared.artwork(for: $0.fileName) }
+            if covers.count >= 4 {
+                // Spotify-Style 2x2 Album Art Grid Collage
                 let half = size / 2.0
                 VStack(spacing: 0) {
                     HStack(spacing: 0) {
-                        Image(uiImage: trackCovers[0]).resizable().scaledToFill().frame(width: half, height: half).clipped()
-                        Image(uiImage: trackCovers[1]).resizable().scaledToFill().frame(width: half, height: half).clipped()
+                        Image(uiImage: covers[0]).resizable().scaledToFill().frame(width: half, height: half).clipped()
+                        Image(uiImage: covers[1]).resizable().scaledToFill().frame(width: half, height: half).clipped()
                     }
                     HStack(spacing: 0) {
-                        Image(uiImage: trackCovers[2]).resizable().scaledToFill().frame(width: half, height: half).clipped()
-                        Image(uiImage: trackCovers[3]).resizable().scaledToFill().frame(width: half, height: half).clipped()
+                        Image(uiImage: covers[2]).resizable().scaledToFill().frame(width: half, height: half).clipped()
+                        Image(uiImage: covers[3]).resizable().scaledToFill().frame(width: half, height: half).clipped()
                     }
                 }
                 .frame(width: size, height: size)
-            } else if let firstCover = trackCovers.first {
-                Image(uiImage: firstCover)
+                .clipShape(RoundedRectangle(cornerRadius: cornerRadius))
+            } else if let first = covers.first {
+                Image(uiImage: first)
                     .resizable()
                     .scaledToFill()
                     .frame(width: size, height: size)
+                    .clipShape(RoundedRectangle(cornerRadius: cornerRadius))
             } else {
                 ZStack {
-                    LinearGradient(
-                        colors: [Color.purple.opacity(0.75), Color.indigo.opacity(0.45)],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
+                    RoundedRectangle(cornerRadius: cornerRadius)
+                        .fill(LinearGradient(colors: [.purple.opacity(0.75), .indigo.opacity(0.45)], startPoint: .topLeading, endPoint: .bottomTrailing))
+                        .frame(width: size, height: size)
                     Image(systemName: "music.note.list")
-                        .font(.system(size: size * 0.34, weight: .semibold))
-                        .foregroundColor(.white.opacity(0.85))
+                        .font(.system(size: size * 0.36, weight: .semibold))
+                        .foregroundColor(.white)
                 }
-                .frame(width: size, height: size)
             }
         }
-        .clipShape(RoundedRectangle(cornerRadius: cornerRadius))
-        .overlay(
-            RoundedRectangle(cornerRadius: cornerRadius)
-                .stroke(Color.white.opacity(0.12), lineWidth: 1)
-        )
     }
 }
 
@@ -1560,7 +1775,7 @@ struct MusiQRootView: View {
 
                 DirectAudioImporterView(engine: engine)
                     .tabItem {
-                        Label("Import", systemImage: "arrow.down.circle.fill")
+                        Label("Audio URL", systemImage: "arrow.down.circle.fill")
                     }
                     .tag(2)
 
@@ -1587,7 +1802,7 @@ struct MusiQRootView: View {
     }
 }
 
-// MARK: - Tab 1: Polished Playlists Home View
+// MARK: - Tab 1: Playlists Home View
 struct PlaylistsHomeView: View {
     @ObservedObject var engine: MusiQEngine
     @Binding var showFullPlayer: Bool
@@ -1606,7 +1821,7 @@ struct PlaylistsHomeView: View {
                             .foregroundColor(.purple.opacity(0.8))
                         Text("No Playlists Yet")
                             .font(.title3.bold())
-                        Text("Create custom playlists with your own cover art or 2x2 album grids.")
+                        Text("Playlists are only created when you make them.\nTap '+' to build a custom playlist with custom cover art.")
                             .font(.subheadline)
                             .foregroundColor(.secondary)
                             .multilineTextAlignment(.center)
@@ -1628,15 +1843,22 @@ struct PlaylistsHomeView: View {
                 } else {
                     List {
                         ForEach(engine.playlists) { playlist in
+                            let pTracks = engine.tracks(for: playlist)
                             NavigationLink(destination: PlaylistDetailView(engine: engine, playlistID: playlist.id, showFullPlayer: $showFullPlayer)) {
                                 HStack(spacing: 14) {
-                                    PlaylistCoverThumbnail(engine: engine, playlist: playlist, size: 58, cornerRadius: 10)
+                                    PlaylistArtworkThumbnailView(
+                                        playlist: playlist,
+                                        tracks: pTracks,
+                                        size: 56,
+                                        cornerRadius: 10
+                                    )
+                                    .shadow(color: .black.opacity(0.35), radius: 4, x: 0, y: 2)
 
                                     VStack(alignment: .leading, spacing: 4) {
                                         Text(playlist.name)
                                             .font(.headline)
                                             .foregroundColor(.white)
-                                        Text("\(playlist.trackFileNames.count) songs")
+                                        Text("\(pTracks.count) songs")
                                             .font(.caption)
                                             .foregroundColor(.secondary)
                                     }
@@ -1683,63 +1905,62 @@ struct PlaylistsHomeView: View {
     }
 }
 
-// MARK: - Spotify-Inspired Playlist Detail View (Custom Art, Hero Banner, Duration & Search)
+// MARK: - Spotify-Inspired Playlist Detail View (Custom Art Header, Duration, Play/Shuffle & Search)
 struct PlaylistDetailView: View {
     @ObservedObject var engine: MusiQEngine
     let playlistID: UUID
     @Binding var showFullPlayer: Bool
 
     @State private var showSongPicker = false
-    @State private var showRenameAlert = false
-    @State private var editedName = ""
-    @State private var selectedCoverPhoto: PhotosPickerItem? = nil
+    @State private var showEditPlaylistSheet = false
+    @State private var searchText = ""
 
     var playlist: Playlist? {
         engine.playlists.first(where: { $0.id == playlistID })
     }
 
-    var tracks: [Track] {
-        playlist.map { engine.tracks(for: $0) } ?? []
-    }
-
     private var headerGradientColors: [Color] {
-        let _ = engine.artworkRefreshID
-        if let customKey = playlist?.customCoverKey {
-            return ArtworkCache.shared.playerGradient(for: customKey)
+        if let customImg = ArtworkCache.shared.playlistCover(for: playlistID) {
+            return customImg.extractPlayerGradientColors()
         }
-        if let firstFile = tracks.first?.fileName {
-            return ArtworkCache.shared.playerGradient(for: firstFile)
+        if let firstTrack = playlist.flatMap({ engine.tracks(for: $0).first }) {
+            return ArtworkCache.shared.playerGradient(for: firstTrack.fileName)
         }
-        return [Color.purple.opacity(0.55), Color(red: 0.08, green: 0.07, blue: 0.12), Color(red: 0.06, green: 0.06, blue: 0.08)]
-    }
-
-    private var formattedTotalDuration: String {
-        let totalSecs = Int(tracks.reduce(0) { $0 + $1.duration })
-        let hours = totalSecs / 3600
-        let mins = (totalSecs % 3600) / 60
-        if hours > 0 {
-            return "\(hours) hr \(mins) min"
-        }
-        return "\(max(1, mins)) min"
+        return [Color.purple.opacity(0.55), Color(red: 0.08, green: 0.06, blue: 0.14), Color(red: 0.06, green: 0.06, blue: 0.08)]
     }
 
     var body: some View {
+        let allPlaylistTracks = playlist.map { engine.tracks(for: $0) } ?? []
+        let tracks = searchText.isEmpty ? allPlaylistTracks : allPlaylistTracks.filter {
+            $0.title.localizedCaseInsensitiveContains(searchText) ||
+            $0.artist.localizedCaseInsensitiveContains(searchText)
+        }
+        let totalMinutes = Int(allPlaylistTracks.reduce(0) { $0 + $1.duration } / 60.0)
+
         ZStack {
             Color(red: 0.06, green: 0.06, blue: 0.08).ignoresSafeArea()
 
             List {
-                // Hero Header Section
+                // Hero Header Section (Spotify-Inspired Cover + Metadata + Action Row)
                 Section {
                     VStack(alignment: .leading, spacing: 16) {
                         HStack(alignment: .bottom, spacing: 18) {
-                            if let pl = playlist {
-                                PlaylistCoverThumbnail(engine: engine, playlist: pl, size: 128, cornerRadius: 14)
-                                    .shadow(color: .black.opacity(0.55), radius: 12, x: 0, y: 6)
+                            if let p = playlist {
+                                PlaylistArtworkThumbnailView(
+                                    playlist: p,
+                                    tracks: allPlaylistTracks,
+                                    size: 118,
+                                    cornerRadius: 12
+                                )
+                                .shadow(color: .black.opacity(0.55), radius: 12, x: 0, y: 6)
+                                .onTapGesture {
+                                    showEditPlaylistSheet = true
+                                }
                             }
 
                             VStack(alignment: .leading, spacing: 6) {
                                 Text("CUSTOM PLAYLIST")
-                                    .font(.system(size: 10, weight: .bold, design: .rounded))
+                                    .font(.system(size: 10, weight: .bold))
                                     .foregroundColor(.white.opacity(0.65))
 
                                 Text(playlist?.name ?? "Playlist")
@@ -1747,21 +1968,62 @@ struct PlaylistDetailView: View {
                                     .foregroundColor(.white)
                                     .lineLimit(2)
 
-                                Text("\(tracks.count) songs • \(formattedTotalDuration)")
+                                Text("\(allPlaylistTracks.count) songs • \(totalMinutes) min")
                                     .font(.caption.weight(.medium))
                                     .foregroundColor(.white.opacity(0.75))
                             }
-                            Spacer(minLength: 0)
+                            Spacer()
                         }
 
-                        // Action Bar (Play, Shuffle, Add Songs, Customize Art & Name)
+                        // Action Buttons Row (Add Songs, Edit Cover & Name, Shuffle, Big Play Button)
                         HStack(spacing: 12) {
                             Button {
-                                if let first = tracks.first {
-                                    engine.isShuffle = false
-                                    engine.playTrack(first, in: tracks)
+                                showSongPicker = true
+                            } label: {
+                                Label("Add", systemImage: "plus")
+                                    .font(.caption.weight(.bold))
+                                    .padding(.horizontal, 14)
+                                    .padding(.vertical, 8)
+                                    .background(Color.white.opacity(0.14))
+                                    .foregroundColor(.white)
+                                    .clipShape(Capsule())
+                            }
+                            .buttonStyle(.plain)
+
+                            Button {
+                                showEditPlaylistSheet = true
+                            } label: {
+                                Label("Cover & Name", systemImage: "pencil")
+                                    .font(.caption.weight(.bold))
+                                    .padding(.horizontal, 14)
+                                    .padding(.vertical, 8)
+                                    .background(Color.white.opacity(0.14))
+                                    .foregroundColor(.white)
+                                    .clipShape(Capsule())
+                            }
+                            .buttonStyle(.plain)
+
+                            Spacer()
+
+                            Button {
+                                guard !allPlaylistTracks.isEmpty else { return }
+                                engine.isShuffle = true
+                                if let randomTrack = allPlaylistTracks.randomElement() {
+                                    engine.playTrack(randomTrack, in: allPlaylistTracks)
                                     showFullPlayer = true
                                 }
+                            } label: {
+                                Image(systemName: "shuffle")
+                                    .font(.title3.weight(.semibold))
+                                    .foregroundColor(engine.isShuffle ? .purple : .white.opacity(0.8))
+                                    .frame(width: 40, height: 40)
+                            }
+                            .buttonStyle(.plain)
+
+                            Button {
+                                guard let first = allPlaylistTracks.first else { return }
+                                engine.playTrack(first, in: allPlaylistTracks)
+                                showFullPlayer = true
                             } label: {
                                 ZStack {
                                     Circle()
@@ -1769,101 +2031,34 @@ struct PlaylistDetailView: View {
                                         .frame(width: 50, height: 50)
                                         .shadow(color: .purple.opacity(0.45), radius: 8, x: 0, y: 4)
                                     Image(systemName: "play.fill")
-                                        .font(.title3.bold())
+                                        .font(.title3.weight(.bold))
                                         .foregroundColor(.white)
                                 }
                             }
                             .buttonStyle(.plain)
-                            .disabled(tracks.isEmpty)
-
-                            Button {
-                                if let randomTrack = tracks.randomElement() {
-                                    engine.isShuffle = true
-                                    engine.playTrack(randomTrack, in: tracks)
-                                    showFullPlayer = true
-                                }
-                            } label: {
-                                Image(systemName: "shuffle")
-                                    .font(.headline)
-                                    .foregroundColor(engine.isShuffle ? .purple : .white)
-                                    .frame(width: 42, height: 42)
-                                    .background(Color.white.opacity(0.12))
-                                    .clipShape(Circle())
-                            }
-                            .buttonStyle(.plain)
-                            .disabled(tracks.isEmpty)
-
-                            Button {
-                                showSongPicker = true
-                            } label: {
-                                Label("Add", systemImage: "plus")
-                                    .font(.caption.weight(.bold))
-                                    .padding(.horizontal, 14)
-                                    .padding(.vertical, 10)
-                                    .background(Color.white.opacity(0.12))
-                                    .foregroundColor(.white)
-                                    .clipShape(Capsule())
-                            }
-                            .buttonStyle(.plain)
-
-                            PhotosPicker(selection: $selectedCoverPhoto, matching: .images) {
-                                Label("Cover", systemImage: "photo")
-                                    .font(.caption.weight(.bold))
-                                    .padding(.horizontal, 14)
-                                    .padding(.vertical, 10)
-                                    .background(Color.white.opacity(0.12))
-                                    .foregroundColor(.white)
-                                    .clipShape(Capsule())
-                            }
-                            .buttonStyle(.plain)
-                            .onChange(of: selectedCoverPhoto) { newItem in
-                                guard let newItem = newItem else { return }
-                                Task {
-                                    if let data = try? await newItem.loadTransferable(type: Data.self),
-                                       let img = UIImage(data: data) {
-                                        await MainActor.run {
-                                            engine.setPlaylistCustomCover(img, for: playlistID)
-                                        }
-                                    }
-                                }
-                            }
-
-                            Button {
-                                editedName = playlist?.name ?? ""
-                                showRenameAlert = true
-                            } label: {
-                                Image(systemName: "pencil")
-                                    .font(.subheadline.bold())
-                                    .foregroundColor(.white)
-                                    .frame(width: 36, height: 36)
-                                    .background(Color.white.opacity(0.12))
-                                    .clipShape(Circle())
-                            }
-                            .buttonStyle(.plain)
-
-                            Spacer()
                         }
                     }
                     .padding(.vertical, 8)
                     .listRowBackground(
                         LinearGradient(
-                            colors: [headerGradientColors[0].opacity(0.65), Color.white.opacity(0.04)],
+                            colors: [headerGradientColors.first ?? .purple.opacity(0.4), Color.white.opacity(0.04)],
                             startPoint: .topLeading,
                             endPoint: .bottomTrailing
                         )
                     )
                 }
 
-                // Track List Section
+                // Tracks Section
                 Section {
                     if tracks.isEmpty {
                         VStack(spacing: 10) {
-                            Text("This playlist is empty.")
+                            Text("No songs in this playlist yet.")
+                                .font(.subheadline)
                                 .foregroundColor(.secondary)
-                            Button("Add Songs from Library") {
+                            Button("Tap '+ Add' above to pick songs") {
                                 showSongPicker = true
                             }
-                            .font(.subheadline.bold())
+                            .font(.caption.weight(.bold))
                             .foregroundColor(.purple)
                         }
                         .frame(maxWidth: .infinity)
@@ -1871,16 +2066,9 @@ struct PlaylistDetailView: View {
                         .listRowBackground(Color.clear)
                     } else {
                         ForEach(Array(tracks.enumerated()), id: \.element.id) { idx, track in
-                            HStack(spacing: 10) {
-                                Text("\(idx + 1)")
-                                    .font(.caption.monospacedDigit())
-                                    .foregroundColor(.secondary)
-                                    .frame(width: 20, alignment: .leading)
-
-                                TrackRowView(engine: engine, track: track) {
-                                    engine.playTrack(track, in: tracks)
-                                    showFullPlayer = true
-                                }
+                            TrackRowView(indexNumber: idx + 1, track: track) {
+                                engine.playTrack(track, in: tracks)
+                                showFullPlayer = true
                             }
                             .listRowBackground(Color.white.opacity(0.04))
                         }
@@ -1893,17 +2081,11 @@ struct PlaylistDetailView: View {
                 }
             }
             .scrollContentBackground(.hidden)
+            .searchable(text: $searchText, prompt: "Search in playlist...")
             .padding(.bottom, engine.currentTrack != nil ? 70 : 0)
         }
         .navigationTitle(playlist?.name ?? "Playlist")
         .navigationBarTitleDisplayMode(.inline)
-        .alert("Rename Playlist", isPresented: $showRenameAlert) {
-            TextField("Playlist Name", text: $editedName)
-            Button("Cancel", role: .cancel) {}
-            Button("Save") {
-                engine.renamePlaylist(id: playlistID, newName: editedName)
-            }
-        }
         .sheet(isPresented: $showSongPicker) {
             NavigationStack {
                 Group {
@@ -1924,7 +2106,7 @@ struct PlaylistDetailView: View {
                                     VStack(alignment: .leading, spacing: 2) {
                                         Text(track.title)
                                             .foregroundColor(.white)
-                                        Text(track.artist)
+                                        Text("\(track.artist) • \(track.formattedDuration)")
                                             .font(.caption)
                                             .foregroundColor(.secondary)
                                     }
@@ -1946,10 +2128,95 @@ struct PlaylistDetailView: View {
                 }
             }
         }
+        .sheet(isPresented: $showEditPlaylistSheet) {
+            if let p = playlist {
+                PlaylistEditorSheet(engine: engine, playlist: p)
+            }
+        }
     }
 }
 
-// MARK: - Tab 2: Global Searchable Songs & Artist Browser
+// MARK: - Custom Playlist Cover & Name Editor Sheet
+struct PlaylistEditorSheet: View {
+    @ObservedObject var engine: MusiQEngine
+    let playlist: Playlist
+
+    @State private var editedName: String = ""
+    @State private var selectedPhoto: PhotosPickerItem? = nil
+    @State private var previewCover: UIImage? = nil
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Custom Playlist Cover Art") {
+                    HStack {
+                        Spacer()
+                        if let img = previewCover {
+                            Image(uiImage: img)
+                                .resizable()
+                                .scaledToFill()
+                                .frame(width: 120, height: 120)
+                                .clipShape(RoundedRectangle(cornerRadius: 14))
+                        } else {
+                            PlaylistArtworkThumbnailView(
+                                playlist: playlist,
+                                tracks: engine.tracks(for: playlist),
+                                size: 120,
+                                cornerRadius: 14
+                            )
+                        }
+                        Spacer()
+                    }
+                    .padding(.vertical, 6)
+
+                    PhotosPicker(selection: $selectedPhoto, matching: .images) {
+                        Label("Choose Custom Playlist Cover", systemImage: "photo.on.rectangle.angled")
+                    }
+                    .onChange(of: selectedPhoto) { newItem in
+                        guard let newItem = newItem else { return }
+                        Task {
+                            if let data = try? await newItem.loadTransferable(type: Data.self),
+                               let uiImg = UIImage(data: data) {
+                                await MainActor.run {
+                                    previewCover = uiImg.autoCroppedToSquare()
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Section("Playlist Name") {
+                    TextField("Playlist Name", text: $editedName)
+                }
+            }
+            .navigationTitle("Edit Playlist")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Save") {
+                        engine.updatePlaylistDetails(
+                            id: playlist.id,
+                            newName: editedName,
+                            customCover: previewCover
+                        )
+                        dismiss()
+                    }
+                    .fontWeight(.bold)
+                }
+            }
+            .onAppear {
+                editedName = playlist.name
+                previewCover = ArtworkCache.shared.playlistCover(for: playlist.id)
+            }
+        }
+    }
+}
+
+// MARK: - Tab 2: Global Searchable Songs & Artists Library
 struct AllSongsSearchView: View {
     @ObservedObject var engine: MusiQEngine
     @Binding var showFullPlayer: Bool
@@ -1959,7 +2226,7 @@ struct AllSongsSearchView: View {
     @State private var trackToTag: Track? = nil
 
     enum BrowseMode: String, CaseIterable {
-        case songs = "All Songs"
+        case songs = "Songs"
         case artists = "Artists"
     }
 
@@ -1975,8 +2242,8 @@ struct AllSongsSearchView: View {
     }
 
     var groupedArtists: [(artist: String, tracks: [Track])] {
-        let dict = Dictionary(grouping: filteredTracks) { $0.artist }
-        return dict.map { (artist: $0.key, tracks: $0.value) }
+        let grouped = Dictionary(grouping: filteredTracks) { $0.artist }
+        return grouped.map { (artist: $0.key, tracks: $0.value) }
             .sorted { $0.artist.localizedCaseInsensitiveCompare($1.artist) == .orderedAscending }
     }
 
@@ -2020,7 +2287,6 @@ struct AllSongsSearchView: View {
                     }
                 } else {
                     VStack(spacing: 0) {
-                        // Segmented Songs vs Artists Filter
                         Picker("Browse Mode", selection: $browseMode) {
                             ForEach(BrowseMode.allCases, id: \.self) { mode in
                                 Text(mode.rawValue).tag(mode)
@@ -2033,7 +2299,7 @@ struct AllSongsSearchView: View {
                         if browseMode == .songs {
                             List {
                                 ForEach(filteredTracks) { track in
-                                    TrackRowView(engine: engine, track: track) {
+                                    TrackRowView(indexNumber: nil, track: track) {
                                         engine.playTrack(track, in: filteredTracks)
                                         showFullPlayer = true
                                     }
@@ -2068,10 +2334,10 @@ struct AllSongsSearchView: View {
                             }
                             .scrollContentBackground(.hidden)
                         } else {
-                            // Browse by Artist View
+                            // Browse By Artist View
                             List {
                                 ForEach(groupedArtists, id: \.artist) { group in
-                                    NavigationLink(destination: ArtistDetailView(engine: engine, artistName: group.artist, tracks: group.tracks, showFullPlayer: $showFullPlayer)) {
+                                    NavigationLink(destination: ArtistDetailSongsView(engine: engine, artistName: group.artist, tracks: group.tracks, showFullPlayer: $showFullPlayer)) {
                                         HStack(spacing: 14) {
                                             if let firstTrack = group.tracks.first,
                                                let art = ArtworkCache.shared.artwork(for: firstTrack.fileName) {
@@ -2091,12 +2357,12 @@ struct AllSongsSearchView: View {
                                                 Text(group.artist)
                                                     .font(.headline)
                                                     .foregroundColor(.white)
-                                                Text("\(group.tracks.count) \(group.tracks.count == 1 ? "song" : "songs")")
+                                                Text("\(group.tracks.count) songs")
                                                     .font(.caption)
                                                     .foregroundColor(.secondary)
                                             }
                                         }
-                                        .padding(.vertical, 4)
+                                        .padding(.vertical, 3)
                                     }
                                     .listRowBackground(Color.white.opacity(0.04))
                                 }
@@ -2152,8 +2418,7 @@ struct AllSongsSearchView: View {
     }
 }
 
-// MARK: - Artist Discography Detail View
-struct ArtistDetailView: View {
+struct ArtistDetailSongsView: View {
     @ObservedObject var engine: MusiQEngine
     let artistName: String
     let tracks: [Track]
@@ -2162,60 +2427,12 @@ struct ArtistDetailView: View {
     var body: some View {
         ZStack {
             Color(red: 0.06, green: 0.06, blue: 0.08).ignoresSafeArea()
-
-            List {
-                Section {
-                    HStack(spacing: 16) {
-                        if let first = tracks.first,
-                           let art = ArtworkCache.shared.artwork(for: first.fileName) {
-                            Image(uiImage: art)
-                                .resizable()
-                                .scaledToFill()
-                                .frame(width: 76, height: 76)
-                                .clipShape(Circle())
-                        } else {
-                            Circle()
-                                .fill(Color.purple.opacity(0.35))
-                                .frame(width: 76, height: 76)
-                                .overlay(Image(systemName: "person.fill").font(.title).foregroundColor(.white))
-                        }
-
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(artistName)
-                                .font(.title2.bold())
-                                .foregroundColor(.white)
-                            Text("\(tracks.count) tracks in library")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
-
-                        Spacer()
-
-                        Button {
-                            if let first = tracks.first {
-                                engine.playTrack(first, in: tracks)
-                                showFullPlayer = true
-                            }
-                        } label: {
-                            Image(systemName: "play.circle.fill")
-                                .font(.system(size: 44))
-                                .foregroundColor(.purple)
-                        }
-                        .buttonStyle(.plain)
-                    }
-                    .padding(.vertical, 6)
-                    .listRowBackground(Color.white.opacity(0.06))
+            List(Array(tracks.enumerated()), id: \.element.id) { idx, track in
+                TrackRowView(indexNumber: idx + 1, track: track) {
+                    engine.playTrack(track, in: tracks)
+                    showFullPlayer = true
                 }
-
-                Section("Songs") {
-                    ForEach(tracks) { track in
-                        TrackRowView(engine: engine, track: track) {
-                            engine.playTrack(track, in: tracks)
-                            showFullPlayer = true
-                        }
-                        .listRowBackground(Color.white.opacity(0.04))
-                    }
-                }
+                .listRowBackground(Color.white.opacity(0.04))
             }
             .scrollContentBackground(.hidden)
             .padding(.bottom, engine.currentTrack != nil ? 70 : 0)
@@ -2224,14 +2441,22 @@ struct ArtistDetailView: View {
     }
 }
 
+// MARK: - Track Row View (Displays Artist + Song Duration Instead of Listen Time!)
 struct TrackRowView: View {
-    @ObservedObject var engine: MusiQEngine
+    let indexNumber: Int?
     let track: Track
     let onTap: () -> Void
 
     var body: some View {
         Button(action: onTap) {
             HStack(spacing: 12) {
+                if let num = indexNumber {
+                    Text("\(num)")
+                        .font(.caption.monospacedDigit().weight(.semibold))
+                        .foregroundColor(.secondary)
+                        .frame(width: 20, alignment: .center)
+                }
+
                 if let uiImage = ArtworkCache.shared.artwork(for: track.fileName) {
                     Image(uiImage: uiImage)
                         .resizable()
@@ -2258,9 +2483,9 @@ struct TrackRowView: View {
                         Text("•")
                             .font(.caption2)
                             .foregroundColor(.secondary)
-                        Text(engine.formattedListenTime(for: track.fileName))
-                            .font(.caption2.monospacedDigit())
-                            .foregroundColor(.purple.opacity(0.9))
+                        Text(track.formattedDuration)
+                            .font(.caption.monospacedDigit())
+                            .foregroundColor(.secondary)
                     }
                 }
                 Spacer()
@@ -2354,7 +2579,7 @@ struct FullPlayerDeckView: View {
     var body: some View {
         GeometryReader { geo in
             let safeWidth = geo.size.width
-            let artBoxSize = min(safeWidth - 96, 238)
+            let artBoxSize = min(safeWidth - 100, 236)
 
             ZStack {
                 LinearGradient(
@@ -2426,18 +2651,8 @@ struct FullPlayerDeckView: View {
                         boxSize: artBoxSize,
                         refreshID: engine.artworkRefreshID
                     )
-                    .frame(width: safeWidth - 24, height: artBoxSize + 16)
+                    .frame(width: safeWidth - 24, height: artBoxSize + 18)
                     .clipped()
-
-                    // Refined Spotify-Style Inline Lyric Line
-                    SpotifyInlineLyricView(
-                        progress: engine.progress,
-                        lines: engine.currentTrackLyrics,
-                        isFetching: engine.isFetchingLyricsInBackground
-                    ) {
-                        activeBottomSheet = .lyrics
-                    }
-                    .padding(.horizontal, 26)
 
                     if let err = engine.playbackErrorMessage {
                         Text(err)
@@ -2447,28 +2662,38 @@ struct FullPlayerDeckView: View {
                             .padding(.horizontal, 20)
                     }
 
-                    // Left-Aligned Song Title + Artist (Matches Spotify Layout)
-                    VStack(alignment: .leading, spacing: 2) {
+                    // Song Title + Artist
+                    VStack(spacing: 3) {
                         LoopingMarqueeText(
                             text: engine.currentTrack?.title ?? "No Track Selected",
                             font: .system(size: 22, weight: .bold),
-                            textColor: .white,
-                            alignment: .leading
+                            textColor: .white
                         )
-                        .frame(width: safeWidth - 52)
+                        .frame(width: safeWidth - 48)
 
                         Text(engine.currentTrack?.artist ?? "MusiQ Local Library")
                             .font(.subheadline.weight(.medium))
                             .foregroundColor(.white.opacity(0.72))
                             .lineLimit(1)
                     }
-                    .frame(width: safeWidth - 52, alignment: .leading)
+                    .padding(.horizontal, 24)
+
+                    // Polished Single-Line Synced Lyric Display (Between Artist & Scrubber)
+                    PolishedInlineLyricView(
+                        progress: engine.progress,
+                        lines: engine.currentTrackLyrics,
+                        offsetSeconds: engine.currentTrackLyricOffset,
+                        isFetching: engine.isFetchingLyricsInBackground
+                    ) {
+                        activeBottomSheet = .lyrics
+                    }
+                    .padding(.horizontal, 20)
 
                     // Isolated Scrubber + Timers
                     IsolatedScrubberView(progress: engine.progress) { newSeconds in
                         engine.seek(to: newSeconds)
                     }
-                    .padding(.horizontal, 26)
+                    .padding(.horizontal, 24)
 
                     // A-B Loop Pill
                     Button {
@@ -3056,9 +3281,14 @@ struct QueueSheetView: View {
                     engine.playTrack(track, in: engine.currentQueue)
                 } label: {
                     HStack {
-                        Text(track.title)
-                            .foregroundColor(idx == engine.currentIndex ? .purple : .white)
-                            .fontWeight(idx == engine.currentIndex ? .bold : .regular)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(track.title)
+                                .foregroundColor(idx == engine.currentIndex ? .purple : .white)
+                                .fontWeight(idx == engine.currentIndex ? .bold : .regular)
+                            Text("\(track.artist) • \(track.formattedDuration)")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
                         Spacer()
                         if idx == engine.currentIndex {
                             Image(systemName: "speaker.wave.2.fill")
@@ -3072,33 +3302,32 @@ struct QueueSheetView: View {
     }
 }
 
-// MARK: - Tab 3: Direct Audio URL & Files Importer
+// MARK: - Tab 3: Direct & Cloud Audio URL Importer (.mp3, .m4a, .wav, Dropbox, Google Drive)
 struct DirectAudioImporterView: View {
     @ObservedObject var engine: MusiQEngine
     @State private var urlInput: String = ""
     @State private var customTitle: String = ""
     @State private var customArtist: String = ""
-    @State private var statusMessage: String = "Paste a direct audio file link (.mp3, .m4a, .wav, .flac) or import from the Files app."
+    @State private var statusMessage: String = "Paste a direct audio URL (.mp3, .m4a, .wav) or Dropbox / Google Drive audio share link."
     @State private var isDownloading: Bool = false
-    @State private var showFileImporter: Bool = false
 
     var body: some View {
         NavigationStack {
             Form {
-                Section("Quick Local Import") {
-                    Button {
-                        showFileImporter = true
-                    } label: {
-                        Label("Select Audio Files from iPhone Files App", systemImage: "folder.fill.badge.plus")
-                            .font(.subheadline.weight(.semibold))
-                            .foregroundColor(.purple)
+                Section("Audio File or Cloud Share Link") {
+                    HStack {
+                        TextField("https://example.com/song.mp3", text: $urlInput)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                        if let clip = UIPasteboard.general.string, !clip.isEmpty {
+                            Button("Paste") {
+                                urlInput = clip
+                            }
+                            .font(.caption.weight(.bold))
+                            .buttonStyle(.bordered)
+                            .tint(.purple)
+                        }
                     }
-                }
-
-                Section("Direct Audio File URL") {
-                    TextField("https://example.com/audio.mp3", text: $urlInput)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
                 }
 
                 Section("Optional Custom Metadata") {
@@ -3115,9 +3344,9 @@ struct DirectAudioImporterView: View {
                             if isDownloading {
                                 ProgressView()
                                     .padding(.trailing, 8)
-                                Text("Downloading Audio...")
+                                Text("Downloading & Tagging...")
                             } else {
-                                Label("Download Direct Audio Link", systemImage: "arrow.down.circle.fill")
+                                Label("Download to MusiQ Library", systemImage: "arrow.down.circle.fill")
                                     .font(.headline)
                             }
                             Spacer()
@@ -3132,40 +3361,37 @@ struct DirectAudioImporterView: View {
                         .foregroundColor(.secondary)
                 }
             }
-            .navigationTitle("Audio Importer")
-            .fileImporter(
-                isPresented: $showFileImporter,
-                allowedContentTypes: [.audio, .mp3, .mpeg4Audio, .wav],
-                allowsMultipleSelection: true
-            ) { result in
-                switch result {
-                case .success(let urls):
-                    let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-                    for url in urls {
-                        let gotAccess = url.startAccessingSecurityScopedResource()
-                        defer { if gotAccess { url.stopAccessingSecurityScopedResource() } }
-                        let dest = docs.appendingPathComponent(url.lastPathComponent)
-                        try? FileManager.default.removeItem(at: dest)
-                        try? FileManager.default.copyItem(at: url, to: dest)
-                    }
-                    statusMessage = "✅ Imported \(urls.count) file(s) into your MusiQ library!"
-                    engine.scanLocalLibrary()
-                case .failure(let err):
-                    statusMessage = "File import failed: \(err.localizedDescription)"
-                }
-            }
+            .navigationTitle("Audio URL Importer")
         }
     }
 
+    private func normalizeCloudAudioURL(_ raw: String) -> URL? {
+        var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Automatically convert Dropbox share links to direct download streams
+        if s.contains("dropbox.com") {
+            s = s.replacingOccurrences(of: "?dl=0", with: "?dl=1")
+            if !s.contains("dl=1") {
+                s += (s.contains("?") ? "&dl=1" : "?dl=1")
+            }
+        }
+        // Automatically convert Google Drive file links to direct download streams
+        if s.contains("drive.google.com/file/d/") {
+            let parts = s.components(separatedBy: "/file/d/")
+            if parts.count > 1, let fileID = parts[1].components(separatedBy: "/").first {
+                s = "https://drive.google.com/uc?export=download&id=\(fileID)"
+            }
+        }
+        return URL(string: s)
+    }
+
     private func startDirectDownload() {
-        let trimmedURL = urlInput.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let targetURL = URL(string: trimmedURL) else {
+        guard let targetURL = normalizeCloudAudioURL(urlInput) else {
             statusMessage = "Invalid URL format."
             return
         }
 
         isDownloading = true
-        statusMessage = "Downloading direct audio file..."
+        statusMessage = "Downloading audio stream..."
 
         Task {
             do {
@@ -3179,15 +3405,16 @@ struct DirectAudioImporterView: View {
 
                 var resolvedTitle = customTitle.trimmingCharacters(in: .whitespacesAndNewlines)
                 if resolvedTitle.isEmpty {
-                    resolvedTitle = targetURL.deletingPathExtension().lastPathComponent
+                    resolvedTitle = response.suggestedFilename?.replacingOccurrences(of: ".\(ext)", with: "")
+                        ?? targetURL.deletingPathExtension().lastPathComponent
                 }
-                if resolvedTitle.isEmpty {
+                if resolvedTitle.isEmpty || resolvedTitle == "uc" {
                     resolvedTitle = "Track_\(Int(Date().timeIntervalSince1970))"
                 }
 
                 var resolvedArtist = customArtist.trimmingCharacters(in: .whitespacesAndNewlines)
                 if resolvedArtist.isEmpty {
-                    resolvedArtist = "Direct Audio Import"
+                    resolvedArtist = "Audio Import"
                 }
 
                 let safeBaseName = resolvedTitle
@@ -3207,7 +3434,7 @@ struct DirectAudioImporterView: View {
                 guard (try? AVAudioFile(forReading: destinationURL)) != nil else {
                     try? FileManager.default.removeItem(at: destinationURL)
                     throw NSError(domain: "MusiQ", code: -1, userInfo: [
-                        NSLocalizedDescriptionKey: "URL did not point to a valid direct audio file."
+                        NSLocalizedDescriptionKey: "URL did not point to a valid direct audio file. Use the Files importer in the Songs tab for local files."
                     ])
                 }
 
