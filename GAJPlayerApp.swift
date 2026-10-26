@@ -967,7 +967,7 @@ final class PlaybackProgressObserver: ObservableObject {
     var isScrubbing: Bool = false
 }
 
-// MARK: - Crash-Proof, Sample-Rate Resampling Audio Engine
+// MARK: - Dual-Deck Crash-Proof Audio Engine (With Optional Smooth Crossfader)
 final class MusiQEngine: ObservableObject {
     @Published var allTracks: [Track] = []
     @Published var playlists: [Playlist] = []
@@ -985,6 +985,25 @@ final class MusiQEngine: ObservableObject {
     @Published var artworkRefreshID: UUID = UUID()
     @Published var playbackErrorMessage: String? = nil
 
+    // Optional Crossfader Settings (Persisted)
+    @Published var crossfadeEnabled: Bool = UserDefaults.standard.bool(forKey: "MusiQ_Crossfade_Enabled_v1") {
+        didSet {
+            UserDefaults.standard.set(crossfadeEnabled, forKey: "MusiQ_Crossfade_Enabled_v1")
+            if !crossfadeEnabled && isCrossfading {
+                cancelActiveCrossfade()
+            }
+        }
+    }
+    @Published var crossfadeSeconds: Double = {
+        let saved = UserDefaults.standard.double(forKey: "MusiQ_Crossfade_Seconds_v1")
+        return saved >= 1.0 ? saved : 5.0
+    }() {
+        didSet {
+            UserDefaults.standard.set(crossfadeSeconds, forKey: "MusiQ_Crossfade_Seconds_v1")
+        }
+    }
+    @Published var isCrossfading: Bool = false
+
     @Published var skipTransitionDirection: Int = 1
 
     @Published var currentTrackLyrics: [LyricLine] = []
@@ -998,18 +1017,36 @@ final class MusiQEngine: ObservableObject {
 
     let progress = PlaybackProgressObserver()
 
+    // Dual-Deck Audio Graph: Deck A and Deck B mix into the shared EQ & MainMixerNode
     private let engine = AVAudioEngine()
-    private let playerNode = AVAudioPlayerNode()
-    private let timePitchNode = AVAudioUnitTimePitch()
+    private let playerNodeA = AVAudioPlayerNode()
+    private let playerNodeB = AVAudioPlayerNode()
+    private let timePitchNodeA = AVAudioUnitTimePitch()
+    private let timePitchNodeB = AVAudioUnitTimePitch()
     private let eqNode = AVAudioUnitEQ(numberOfBands: 3)
+
+    private var activeDeckIsA: Bool = true
+    private var primaryPlayerNode: AVAudioPlayerNode { activeDeckIsA ? playerNodeA : playerNodeB }
+    private var secondaryPlayerNode: AVAudioPlayerNode { activeDeckIsA ? playerNodeB : playerNodeA }
 
     private let graphFormat = AVAudioFormat(standardFormatWithSampleRate: 44100, channels: 2)!
 
+    // Active Deck State
     private var activeAudioFile: AVAudioFile?
     private var activeConvertedBuffer: AVAudioPCMBuffer?
     private var seekFrameOffset: AVAudioFramePosition = 0
     private var sampleRate: Double = 44100
     private var totalFrames: AVAudioFramePosition = 0
+
+    // Incoming Crossfade Deck State
+    private var incomingAudioFile: AVAudioFile?
+    private var incomingConvertedBuffer: AVAudioPCMBuffer?
+    private var incomingSampleRate: Double = 44100
+    private var incomingTotalFrames: AVAudioFramePosition = 0
+    private var incomingDuration: Double = 1
+    private var incomingQueueIndex: Int? = nil
+    private var crossfadeElapsed: Double = 0
+
     private var progressTimer: Timer?
     private var scheduleGeneration: Int = 0
     private var tickCounter: Int = 0
@@ -1043,8 +1080,10 @@ final class MusiQEngine: ObservableObject {
     }
 
     private func setupEngineGraph() {
-        engine.attach(playerNode)
-        engine.attach(timePitchNode)
+        engine.attach(playerNodeA)
+        engine.attach(playerNodeB)
+        engine.attach(timePitchNodeA)
+        engine.attach(timePitchNodeB)
         engine.attach(eqNode)
 
         let bands = eqNode.bands
@@ -1064,8 +1103,21 @@ final class MusiQEngine: ObservableObject {
         bands[2].gain = 0
         bands[2].bypass = false
 
-        engine.connect(playerNode, to: timePitchNode, format: graphFormat)
-        engine.connect(timePitchNode, to: eqNode, format: graphFormat)
+        // Connect Deck A and Deck B into the main mixer, then route main mixer -> EQ -> output!
+        //Wait: mainMixerNode has multiple input buses automatically!
+        // Let's connect playerNodeA -> timePitchNodeA -> mainMixerNode (bus 0)
+        // and playerNodeB -> timePitchNodeB -> mainMixerNode (bus 1)
+        // or connect both into eqNode's mixer before mainMixerNode.
+        let deckMixer = AVAudioMixerNode()
+        engine.attach(deckMixer)
+
+        engine.connect(playerNodeA, to: timePitchNodeA, format: graphFormat)
+        engine.connect(timePitchNodeA, to: deckMixer, fromBus: 0, toBus: 0, format: graphFormat)
+
+        engine.connect(playerNodeB, to: timePitchNodeB, format: graphFormat)
+        engine.connect(timePitchNodeB, to: deckMixer, fromBus: 0, toBus: 1, format: graphFormat)
+
+        engine.connect(deckMixer, to: eqNode, format: graphFormat)
         engine.connect(eqNode, to: engine.mainMixerNode, format: graphFormat)
 
         do {
@@ -1089,8 +1141,9 @@ final class MusiQEngine: ObservableObject {
 
             switch type {
             case .began:
+                self.cancelActiveCrossfade()
                 self.captureCurrentPlaybackPosition()
-                self.playerNode.pause()
+                self.primaryPlayerNode.pause()
                 self.isPlaying = false
                 self.stopProgressTimer()
                 self.saveListeningStats()
@@ -1118,8 +1171,9 @@ final class MusiQEngine: ObservableObject {
                   let reason = AVAudioSession.RouteChangeReason(rawValue: reasonVal) else { return }
 
             if reason == .oldDeviceUnavailable {
+                self.cancelActiveCrossfade()
                 self.captureCurrentPlaybackPosition()
-                self.playerNode.pause()
+                self.primaryPlayerNode.pause()
                 self.isPlaying = false
                 self.stopProgressTimer()
                 self.updateNowPlayingInfo()
@@ -1133,6 +1187,7 @@ final class MusiQEngine: ObservableObject {
         ) { [weak self] _ in
             guard let self = self else { return }
             if !self.engine.isRunning && self.isPlaying {
+                self.cancelActiveCrossfade()
                 self.captureCurrentPlaybackPosition()
                 self.isPlaying = false
                 self.stopProgressTimer()
@@ -1142,8 +1197,8 @@ final class MusiQEngine: ObservableObject {
     }
 
     private func captureCurrentPlaybackPosition() {
-        if let nodeTime = playerNode.lastRenderTime,
-           let playerTime = playerNode.playerTime(forNodeTime: nodeTime) {
+        if let nodeTime = primaryPlayerNode.lastRenderTime,
+           let playerTime = primaryPlayerNode.playerTime(forNodeTime: nodeTime) {
             let currentFrame = seekFrameOffset + playerTime.sampleTime
             let clamped = max(0, min(currentFrame, totalFrames - 100))
             seekFrameOffset = clamped
@@ -1157,7 +1212,7 @@ final class MusiQEngine: ObservableObject {
             try? engine.start()
         }
         seek(to: progress.currentTime)
-        playerNode.play()
+        primaryPlayerNode.play()
         isPlaying = true
         startProgressTimer()
         updateNowPlayingInfo()
@@ -1311,7 +1366,8 @@ final class MusiQEngine: ObservableObject {
 
     func deleteTrackFromDisk(_ track: Track) {
         if currentTrack?.fileName == track.fileName {
-            playerNode.stop()
+            cancelActiveCrossfade()
+            primaryPlayerNode.stop()
             activeAudioFile = nil
             activeConvertedBuffer = nil
             isPlaying = false
@@ -1399,6 +1455,7 @@ final class MusiQEngine: ObservableObject {
     }
 
     func playTrack(_ track: Track, in queue: [Track]) {
+        cancelActiveCrossfade()
         let validQueue = queue.isEmpty ? allTracks : queue
         skipTransitionDirection = 1
         withAnimation(.spring(response: 0.44, dampingFraction: 0.84)) {
@@ -1415,10 +1472,15 @@ final class MusiQEngine: ObservableObject {
 
     private func loadAndScheduleCurrentTrack(startFrame: AVAudioFramePosition, autoPlay: Bool) {
         guard let track = currentTrack else { return }
+        cancelActiveCrossfade()
         scheduleGeneration += 1
         let currentGen = scheduleGeneration
 
-        playerNode.stop()
+        playerNodeA.stop()
+        playerNodeB.stop()
+        primaryPlayerNode.volume = 1.0
+        secondaryPlayerNode.volume = 0.0
+
         activeAudioFile = nil
         activeConvertedBuffer = nil
         isPlaying = false
@@ -1449,24 +1511,24 @@ final class MusiQEngine: ObservableObject {
                     activeConvertedBuffer = converted
                     totalFrames = AVAudioFramePosition(converted.frameLength)
                     seekFrameOffset = max(0, min(startFrame, totalFrames))
-                    scheduleSubBuffer(from: converted, startFrame: seekFrameOffset, generation: currentGen)
+                    scheduleSubBuffer(on: primaryPlayerNode, from: converted, startFrame: seekFrameOffset, generation: currentGen)
                 } else {
                     sampleRate = srcFormat.sampleRate
                     totalFrames = file.length
                     seekFrameOffset = max(0, min(startFrame, totalFrames))
-                    scheduleFileDirect(file: file, startFrame: seekFrameOffset, generation: currentGen)
+                    scheduleFileDirect(on: primaryPlayerNode, file: file, startFrame: seekFrameOffset, generation: currentGen)
                 }
             } else {
                 sampleRate = srcFormat.sampleRate
                 totalFrames = file.length
                 seekFrameOffset = max(0, min(startFrame, totalFrames))
-                scheduleFileDirect(file: file, startFrame: seekFrameOffset, generation: currentGen)
+                scheduleFileDirect(on: primaryPlayerNode, file: file, startFrame: seekFrameOffset, generation: currentGen)
             }
 
             progress.currentTime = Double(seekFrameOffset) / sampleRate
 
             if autoPlay {
-                playerNode.play()
+                primaryPlayerNode.play()
                 isPlaying = true
                 startProgressTimer()
             }
@@ -1509,7 +1571,7 @@ final class MusiQEngine: ObservableObject {
         return outBuffer.frameLength > 0 ? outBuffer : nil
     }
 
-    private func scheduleSubBuffer(from fullBuffer: AVAudioPCMBuffer, startFrame: AVAudioFramePosition, generation: Int) {
+    private func scheduleSubBuffer(on node: AVAudioPlayerNode, from fullBuffer: AVAudioPCMBuffer, startFrame: AVAudioFramePosition, generation: Int?) {
         let total = AVAudioFramePosition(fullBuffer.frameLength)
         let clampedStart = max(0, min(startFrame, total - 1))
         let count = AVAudioFrameCount(max(0, total - clampedStart))
@@ -1525,9 +1587,10 @@ final class MusiQEngine: ObservableObject {
             }
         }
 
-        playerNode.scheduleBuffer(sub, at: nil, options: []) { [weak self] in
+        node.scheduleBuffer(sub, at: nil, options: []) { [weak self] in
+            guard let gen = generation else { return }
             DispatchQueue.main.async {
-                guard let self = self, self.scheduleGeneration == generation else { return }
+                guard let self = self, self.scheduleGeneration == gen, !self.isCrossfading else { return }
                 if self.isPlaying {
                     self.handleTrackCompletion()
                 }
@@ -1535,22 +1598,153 @@ final class MusiQEngine: ObservableObject {
         }
     }
 
-    private func scheduleFileDirect(file: AVAudioFile, startFrame: AVAudioFramePosition, generation: Int) {
+    private func scheduleFileDirect(on node: AVAudioPlayerNode, file: AVAudioFile, startFrame: AVAudioFramePosition, generation: Int?) {
         let remainingFrames = AVAudioFrameCount(max(0, file.length - startFrame))
         guard remainingFrames > 0 else { return }
-        playerNode.scheduleSegment(
+        node.scheduleSegment(
             file,
             startingFrame: startFrame,
             frameCount: remainingFrames,
             at: nil
         ) { [weak self] in
+            guard let gen = generation else { return }
             DispatchQueue.main.async {
-                guard let self = self, self.scheduleGeneration == generation else { return }
+                guard let self = self, self.scheduleGeneration == gen, !self.isCrossfading else { return }
                 if self.isPlaying {
                     self.handleTrackCompletion()
                 }
             }
         }
+    }
+
+    // MARK: - Dual-Deck Crossfade Engine
+    private func computeNextTrackIndex() -> Int? {
+        guard !currentQueue.isEmpty else { return nil }
+        if isRepeat {
+            return currentIndex
+        }
+        if isShuffle && currentQueue.count > 1 {
+            var candidate = Int.random(in: 0..<currentQueue.count)
+            if candidate == currentIndex {
+                candidate = (currentIndex + 1) % currentQueue.count
+            }
+            return candidate
+        }
+        return (currentIndex + 1) % currentQueue.count
+    }
+
+    private func beginCrossfadeToNextTrack() {
+        guard !isCrossfading,
+              let nextIdx = computeNextTrackIndex(),
+              currentQueue.indices.contains(nextIdx) else { return }
+
+        let nextTrack = currentQueue[nextIdx]
+        do {
+            let nextFile = try AVAudioFile(forReading: nextTrack.fileURL)
+            let srcFormat = nextFile.processingFormat
+            let nextDur = max(1, Double(nextFile.length) / max(srcFormat.sampleRate, 1))
+
+            secondaryPlayerNode.stop()
+            secondaryPlayerNode.volume = 0.0
+
+            incomingAudioFile = nextFile
+            incomingDuration = nextDur
+            incomingQueueIndex = nextIdx
+            crossfadeElapsed = 0
+            isCrossfading = true
+
+            if abs(srcFormat.sampleRate - graphFormat.sampleRate) > 1.0 || srcFormat.channelCount != graphFormat.channelCount {
+                incomingSampleRate = graphFormat.sampleRate
+                if let converted = resampleFileToGraphFormat(file: nextFile) {
+                    incomingConvertedBuffer = converted
+                    incomingTotalFrames = AVAudioFramePosition(converted.frameLength)
+                    scheduleSubBuffer(on: secondaryPlayerNode, from: converted, startFrame: 0, generation: nil)
+                } else {
+                    incomingConvertedBuffer = nil
+                    incomingSampleRate = srcFormat.sampleRate
+                    incomingTotalFrames = nextFile.length
+                    scheduleFileDirect(on: secondaryPlayerNode, file: nextFile, startFrame: 0, generation: nil)
+                }
+            } else {
+                incomingConvertedBuffer = nil
+                incomingSampleRate = srcFormat.sampleRate
+                incomingTotalFrames = nextFile.length
+                scheduleFileDirect(on: secondaryPlayerNode, file: nextFile, startFrame: 0, generation: nil)
+            }
+
+            if !engine.isRunning {
+                try? engine.start()
+            }
+            secondaryPlayerNode.play()
+
+            // Smoothly transition cover & title halfway or right as crossfade begins
+            skipTransitionDirection = 1
+            withAnimation(.spring(response: 0.48, dampingFraction: 0.84)) {
+                currentIndex = nextIdx
+            }
+            reloadLyricsForCurrentTrack()
+            updateNowPlayingInfo()
+        } catch {
+            isCrossfading = false
+            print("Crossfade preload error: \(error)")
+        }
+    }
+
+    private func stepActiveCrossfade(dt: Double) {
+        guard isCrossfading else { return }
+        crossfadeElapsed += dt
+        let fadeSpan = max(1.0, crossfadeSeconds)
+        let fraction = Float(min(1.0, max(0.0, crossfadeElapsed / fadeSpan)))
+
+        // Equal-power / smooth linear ramp between outgoing and incoming decks
+        primaryPlayerNode.volume = 1.0 - fraction
+        secondaryPlayerNode.volume = fraction
+
+        // Show incoming track progress on scrubber during crossfade
+        progress.duration = incomingDuration
+        progress.currentTime = min(incomingDuration, crossfadeElapsed)
+
+        if fraction >= 1.0 {
+            completeCrossfadeHandoff()
+        }
+    }
+
+    private func completeCrossfadeHandoff() {
+        guard isCrossfading else { return }
+        // Stop old deck and swap active deck pointer!
+        primaryPlayerNode.stop()
+        primaryPlayerNode.volume = 0.0
+        secondaryPlayerNode.volume = 1.0
+
+        activeDeckIsA.toggle()
+        activeAudioFile = incomingAudioFile
+        activeConvertedBuffer = incomingConvertedBuffer
+        sampleRate = incomingSampleRate
+        totalFrames = incomingTotalFrames
+        seekFrameOffset = 0
+        progress.duration = incomingDuration
+
+        incomingAudioFile = nil
+        incomingConvertedBuffer = nil
+        incomingQueueIndex = nil
+        isCrossfading = false
+        crossfadeElapsed = 0
+
+        // Attach completion handler for the remainder of the newly promoted primary deck if needed
+        scheduleGeneration += 1
+        updateNowPlayingInfo()
+    }
+
+    private func cancelActiveCrossfade() {
+        guard isCrossfading else { return }
+        secondaryPlayerNode.stop()
+        secondaryPlayerNode.volume = 0.0
+        primaryPlayerNode.volume = 1.0
+        incomingAudioFile = nil
+        incomingConvertedBuffer = nil
+        incomingQueueIndex = nil
+        isCrossfading = false
+        crossfadeElapsed = 0
     }
 
     func togglePlayPause() {
@@ -1559,13 +1753,16 @@ final class MusiQEngine: ObservableObject {
             return
         }
 
-        if isPlaying && (!engine.isRunning || !playerNode.isPlaying) {
+        if isPlaying && (!engine.isRunning || !primaryPlayerNode.isPlaying) {
             isPlaying = false
         }
 
         if isPlaying {
+            if isCrossfading {
+                completeCrossfadeHandoff()
+            }
             captureCurrentPlaybackPosition()
-            playerNode.pause()
+            primaryPlayerNode.pause()
             isPlaying = false
             stopProgressTimer()
             saveListeningStats()
@@ -1575,7 +1772,7 @@ final class MusiQEngine: ObservableObject {
                 try? engine.start()
                 seek(to: progress.currentTime)
             }
-            playerNode.play()
+            primaryPlayerNode.play()
             isPlaying = true
             startProgressTimer()
         }
@@ -1583,6 +1780,9 @@ final class MusiQEngine: ObservableObject {
     }
 
     func seek(to seconds: Double) {
+        if isCrossfading {
+            completeCrossfadeHandoff()
+        }
         guard let file = activeAudioFile else { return }
         let targetFrame = AVAudioFramePosition(seconds * sampleRate)
         let clampedFrame = max(0, min(targetFrame, totalFrames - 100))
@@ -1591,19 +1791,20 @@ final class MusiQEngine: ObservableObject {
         scheduleGeneration += 1
         let currentGen = scheduleGeneration
 
-        playerNode.stop()
+        primaryPlayerNode.stop()
+        primaryPlayerNode.volume = 1.0
         if !engine.isRunning {
             try? engine.start()
         }
 
         if let converted = activeConvertedBuffer {
-            scheduleSubBuffer(from: converted, startFrame: clampedFrame, generation: currentGen)
+            scheduleSubBuffer(on: primaryPlayerNode, from: converted, startFrame: clampedFrame, generation: currentGen)
         } else {
-            scheduleFileDirect(file: file, startFrame: clampedFrame, generation: currentGen)
+            scheduleFileDirect(on: primaryPlayerNode, file: file, startFrame: clampedFrame, generation: currentGen)
         }
 
         if isPlaying {
-            playerNode.play()
+            primaryPlayerNode.play()
         }
         progress.currentTime = seconds
         updateNowPlayingInfo()
@@ -1611,17 +1812,9 @@ final class MusiQEngine: ObservableObject {
 
     func nextTrack() {
         guard !currentQueue.isEmpty else { return }
+        cancelActiveCrossfade()
         skipTransitionDirection = 1
-        let nextIdx: Int
-        if isShuffle && currentQueue.count > 1 {
-            var candidate = Int.random(in: 0..<currentQueue.count)
-            if candidate == currentIndex {
-                candidate = (currentIndex + 1) % currentQueue.count
-            }
-            nextIdx = candidate
-        } else {
-            nextIdx = (currentIndex + 1) % currentQueue.count
-        }
+        let nextIdx = computeNextTrackIndex() ?? 0
         withAnimation(.spring(response: 0.44, dampingFraction: 0.84)) {
             currentIndex = nextIdx
         }
@@ -1630,6 +1823,7 @@ final class MusiQEngine: ObservableObject {
 
     func previousTrack() {
         guard !currentQueue.isEmpty else { return }
+        cancelActiveCrossfade()
         if progress.currentTime > 3.0 {
             seek(to: 0)
             return
@@ -1652,12 +1846,14 @@ final class MusiQEngine: ObservableObject {
 
     func setPitch(_ cents: Float) {
         pitchCents = cents
-        timePitchNode.pitch = cents
+        timePitchNodeA.pitch = cents
+        timePitchNodeB.pitch = cents
     }
 
     func setRate(_ rate: Float) {
         playbackRate = rate
-        timePitchNode.rate = rate
+        timePitchNodeA.rate = rate
+        timePitchNodeB.rate = rate
     }
 
     func setEQ(_ preset: EQPreset) {
@@ -1692,10 +1888,11 @@ final class MusiQEngine: ObservableObject {
 
     private func startProgressTimer() {
         stopProgressTimer()
-        progressTimer = Timer.scheduledTimer(withTimeInterval: 0.12, repeats: true) { [weak self] _ in
+        let interval = 0.10
+        progressTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             guard let self = self, self.isPlaying, self.activeAudioFile != nil else { return }
 
-            if !self.engine.isRunning || !self.playerNode.isPlaying {
+            if !self.engine.isRunning || (!self.primaryPlayerNode.isPlaying && !self.secondaryPlayerNode.isPlaying) {
                 self.isPlaying = false
                 self.stopProgressTimer()
                 self.updateNowPlayingInfo()
@@ -1703,16 +1900,21 @@ final class MusiQEngine: ObservableObject {
             }
 
             if let activeFile = self.currentTrack?.fileName {
-                self.listenedSecondsByFile[activeFile, default: 0] += 0.12
+                self.listenedSecondsByFile[activeFile, default: 0] += interval
                 self.tickCounter += 1
-                if self.tickCounter % 30 == 0 {
+                if self.tickCounter % 35 == 0 {
                     self.saveListeningStats()
                 }
             }
 
+            if self.isCrossfading {
+                self.stepActiveCrossfade(dt: interval)
+                return
+            }
+
             guard !self.progress.isScrubbing else { return }
-            if let nodeTime = self.playerNode.lastRenderTime,
-               let playerTime = self.playerNode.playerTime(forNodeTime: nodeTime) {
+            if let nodeTime = self.primaryPlayerNode.lastRenderTime,
+               let playerTime = self.primaryPlayerNode.playerTime(forNodeTime: nodeTime) {
                 let currentFrame = self.seekFrameOffset + playerTime.sampleTime
                 let seconds = Double(currentFrame) / self.sampleRate
                 let clamped = max(0, min(seconds, self.progress.duration))
@@ -1720,6 +1922,19 @@ final class MusiQEngine: ObservableObject {
 
                 if let start = self.loopStart, let end = self.loopEnd, clamped >= end {
                     self.seek(to: start)
+                    return
+                }
+
+                // Trigger smooth Crossfade when entering the final `crossfadeSeconds` window of the song!
+                let remaining = self.progress.duration - clamped
+                if self.crossfadeEnabled,
+                   self.loopStart == nil,
+                   self.progress.duration > (self.crossfadeSeconds + 4.0),
+                   remaining <= self.crossfadeSeconds,
+                   remaining > 0.15 {
+                    self.beginCrossfadeToNextTrack()
+                } else if remaining <= 0.08 {
+                    self.handleTrackCompletion()
                 }
             }
         }
@@ -1768,7 +1983,7 @@ final class MusiQEngine: ObservableObject {
     }
 }
 
-// MARK: - Full-Screen Standalone iPod Classic Mode (With Top-Left Quit Button & High-Precision Click Wheel)
+// MARK: - Full-Screen Standalone iPod Classic Mode
 struct FullScreenIPodClassicModeView: View {
     @ObservedObject var engine: MusiQEngine
     @ObservedObject var progress: PlaybackProgressObserver
@@ -1815,7 +2030,6 @@ struct FullScreenIPodClassicModeView: View {
                 .ignoresSafeArea()
 
                 VStack(spacing: 0) {
-                    // Top Bar with "Quit" Button on Top Left
                     HStack {
                         Button {
                             triggerClickHaptic(heavy: true)
@@ -1845,7 +2059,6 @@ struct FullScreenIPodClassicModeView: View {
                     .padding(.top, 10)
                     .padding(.bottom, 16)
 
-                    // 4:3 Retro iPod Color LCD Screen
                     ZStack {
                         RoundedRectangle(cornerRadius: 14)
                             .fill(backlightOn ? Color(white: 0.97) : Color(red: 0.68, green: 0.72, blue: 0.66))
@@ -1932,7 +2145,6 @@ struct FullScreenIPodClassicModeView: View {
 
                     Spacer()
 
-                    // High-Precision Trigonometric Click Wheel
                     ZStack {
                         Circle()
                             .fill(
@@ -3015,7 +3227,7 @@ struct PlaylistArtworkThumbnailView: View {
     }
 }
 
-// MARK: - Root Tab View (Clean Without Dynamic Island Overlay)
+// MARK: - Root Tab View (Tab 3 is now "Settings" with Crossfader + iPod + Wi-Fi + URL Import)
 struct MusiQRootView: View {
     @StateObject private var engine = MusiQEngine()
     @State private var selectedTab: Int = 0
@@ -3036,9 +3248,9 @@ struct MusiQRootView: View {
                     }
                     .tag(1)
 
-                DirectAudioImporterView(engine: engine)
+                MusiQSettingsAndToolsView(engine: engine)
                     .tabItem {
-                        Label("Wi-Fi / URL", systemImage: "wifi.circle.fill")
+                        Label("Settings", systemImage: "gearshape.fill")
                     }
                     .tag(2)
 
@@ -3531,7 +3743,7 @@ struct AllSongsSearchView: View {
                             .foregroundColor(.purple)
                         Text("No Songs Found")
                             .font(.headline)
-                        Text("Import audio files from the Files app, or use the Wi-Fi Browser Drop in the Wi-Fi / URL tab.")
+                        Text("Import audio files from the Files app, or use the Wi-Fi Browser Drop in the Settings tab.")
                             .font(.caption)
                             .foregroundColor(.secondary)
                             .multilineTextAlignment(.center)
@@ -3764,7 +3976,7 @@ struct MiniPlayerBar: View {
     }
 }
 
-// MARK: - Full-Screen Player (Clean Top Bar + Scroll-Down Lyrics Card + Sticky Pinned 4-Column Bottom Bar)
+// MARK: - Full-Screen Player
 struct FullPlayerDeckView: View {
     @ObservedObject var engine: MusiQEngine
     @Binding var isPresented: Bool
@@ -3798,7 +4010,7 @@ struct FullPlayerDeckView: View {
                 .animation(.easeInOut(duration: 0.65), value: engine.currentTrack?.fileName)
 
                 VStack(spacing: 0) {
-                    // Clean Top Bar (Grabber Capsule Restored)
+                    // Clean Top Bar
                     HStack {
                         Button {
                             isPresented = false
@@ -3929,16 +4141,28 @@ struct FullPlayerDeckView: View {
                             .padding(.horizontal, 24)
 
                             // A-B Loop Pill
-                            Button {
-                                engine.toggleABLoop()
-                            } label: {
-                                Text(abLoopLabel)
-                                    .font(.caption2.weight(.semibold))
-                                    .padding(.horizontal, 14)
-                                    .padding(.vertical, 5)
-                                    .background(engine.loopStart != nil ? Color.purple : Color.black.opacity(0.26))
-                                    .foregroundColor(.white)
-                                    .clipShape(Capsule())
+                            HStack(spacing: 8) {
+                                Button {
+                                    engine.toggleABLoop()
+                                } label: {
+                                    Text(abLoopLabel)
+                                        .font(.caption2.weight(.semibold))
+                                        .padding(.horizontal, 14)
+                                        .padding(.vertical, 5)
+                                        .background(engine.loopStart != nil ? Color.purple : Color.black.opacity(0.26))
+                                        .foregroundColor(.white)
+                                        .clipShape(Capsule())
+                                }
+
+                                if engine.isCrossfading {
+                                    Text("Crossfading...")
+                                        .font(.caption2.weight(.bold))
+                                        .padding(.horizontal, 10)
+                                        .padding(.vertical, 5)
+                                        .background(Color.purple.opacity(0.75))
+                                        .foregroundColor(.white)
+                                        .clipShape(Capsule())
+                                }
                             }
 
                             // Transport Controls
@@ -4685,8 +4909,8 @@ struct QueueSheetView: View {
     }
 }
 
-// MARK: - Tab 3: iPod Mode Switch + Wi-Fi Browser Upload Bridge + Direct Cloud Audio URL Importer
-struct DirectAudioImporterView: View {
+// MARK: - Tab 3: Settings Tab (Optional Crossfader + iPod Mode + Wi-Fi Browser Drop + Audio URL Importer)
+struct MusiQSettingsAndToolsView: View {
     @ObservedObject var engine: MusiQEngine
     @StateObject private var wifiServer = WiFiUploadServer()
 
@@ -4699,7 +4923,36 @@ struct DirectAudioImporterView: View {
     var body: some View {
         NavigationStack {
             Form {
-                // 1. Full-Screen Standalone iPod Classic Mode Switch
+                // 1. Optional Dual-Deck Crossfader Settings
+                Section("Playback & Crossfader") {
+                    Toggle(isOn: $engine.crossfadeEnabled) {
+                        Label("Crossfade Songs", systemImage: "waveform.path.ecg")
+                            .font(.headline)
+                    }
+                    .tint(.purple)
+
+                    if engine.crossfadeEnabled {
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack {
+                                Text("Transition Duration")
+                                    .font(.subheadline)
+                                Spacer()
+                                Text(String(format: "%.0f Seconds", engine.crossfadeSeconds))
+                                    .font(.subheadline.monospacedDigit().weight(.bold))
+                                    .foregroundColor(.purple)
+                            }
+                            Slider(value: $engine.crossfadeSeconds, in: 1...12, step: 1)
+                                .tint(.purple)
+                        }
+                        .padding(.vertical, 4)
+                    }
+
+                    Text("When enabled, MusiQ smoothly fades out the ending song while fading in the next song across dual audio decks.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+
+                // 2. Full-Screen Standalone iPod Classic Mode Switch
                 Section("Classic Hardware Mode") {
                     Toggle(isOn: $engine.isIPodModeActive) {
                         Label("iPod Mode", systemImage: "ipod")
@@ -4712,7 +4965,7 @@ struct DirectAudioImporterView: View {
                         .foregroundColor(.secondary)
                 }
 
-                // 2. Local Wi-Fi Browser Drag & Drop Server Section
+                // 3. Local Wi-Fi Browser Drag & Drop Server Section
                 Section("Wi-Fi Browser Drag & Drop Bridge") {
                     Toggle(isOn: Binding(
                         get: { wifiServer.isRunning },
@@ -4757,7 +5010,7 @@ struct DirectAudioImporterView: View {
                     }
                 }
 
-                // 3. Direct & Cloud Audio URL Importer
+                // 4. Direct & Cloud Audio URL Importer
                 Section("Direct Audio File or Cloud Share Link") {
                     HStack {
                         TextField("https://example.com/song.mp3", text: $urlInput)
@@ -4772,14 +5025,10 @@ struct DirectAudioImporterView: View {
                             .tint(.purple)
                         }
                     }
-                }
 
-                Section("Optional Custom Metadata") {
                     TextField("Custom Song Title (Leave blank for auto)", text: $customTitle)
                     TextField("Artist Name (Optional)", text: $customArtist)
-                }
 
-                Section {
                     Button {
                         startDirectDownload()
                     } label: {
@@ -4797,15 +5046,14 @@ struct DirectAudioImporterView: View {
                         }
                     }
                     .disabled(urlInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isDownloading)
-                }
 
-                Section("Status") {
                     Text(statusMessage)
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
             }
-            .navigationTitle("Wi-Fi & Modes")
+            .navigationTitle("Settings")
+            .padding(.bottom, engine.currentTrack != nil ? 70 : 0)
         }
     }
 
