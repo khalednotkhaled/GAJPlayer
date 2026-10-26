@@ -141,8 +141,6 @@ extension UIImage {
         return UIImage(cgImage: croppedCG, scale: self.scale, orientation: self.imageOrientation)
     }
 
-    /// Extracts 5 spatial colors across the album cover from outer edges -> middle ring -> center
-    /// (So e.g. The College Dropout renders white on the sides, gold in the middle, and warm bronze in the center!)
     func extractCassetteZonePalette() -> [Color] {
         guard let cgImage = self.cgImage else {
             return [
@@ -172,11 +170,6 @@ extension UIImage {
 
         ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: grid, height: grid))
 
-        // 5 horizontal/radial zones across the cover:
-        // Zone 0: Outer border / left & right edges (0..<4 and 20..<24)
-        // Zone 1: Mid-left ring (4..<9)
-        // Zone 2: Center core (9..<15)
-        // Zone 3: Mid-right ring (15..<20)
         func averageColorInColumns(_ xRange: Range<Int>, yRange: Range<Int>, boostSaturation: Bool) -> Color {
             var rSum: CGFloat = 0, gSum: CGFloat = 0, bSum: CGFloat = 0, wSum: CGFloat = 0
             for y in yRange {
@@ -435,12 +428,12 @@ final class ArtworkCache {
     }
 }
 
-// MARK: - Multi-Tier Version-Aware Lyrics Engine (Handles Slash Artists, Unreleased/Collab Tags & Intro Duration Offsets)
+// MARK: - Strict Version-Aware Lyrics Engine (Never Assigns Random Lyrics to Unreleased/Yedits Tracks!)
 final class LyricsManager {
     static let shared = LyricsManager()
-    // Bumped storage key so previously mis-synced cached lyrics re-fetch cleanly
-    private let storageKey = "MusiQ_Saved_Lyrics_v5"
-    private let matchedDurationKey = "MusiQ_Lyrics_MatchedDur_v5"
+    // Bumped to v6 so any previously cached wrong lyrics on fanmade/Yedits tracks are cleared immediately
+    private let storageKey = "MusiQ_Saved_Lyrics_v6"
+    private let matchedDurationKey = "MusiQ_Lyrics_MatchedDur_v6"
 
     func getLyrics(for track: Track) -> String {
         if let dict = UserDefaults.standard.dictionary(forKey: storageKey) as? [String: String],
@@ -507,7 +500,6 @@ final class LyricsManager {
             }
         }
 
-        // Ensure timestamped lines are sorted chronologically
         if temp.contains(where: { $0.time != nil }) {
             temp.sort { ($0.time ?? 0) < ($1.time ?? 0) }
         }
@@ -530,18 +522,15 @@ final class LyricsManager {
         return finalLines
     }
 
-    /// Computes automatic intro offset ONLY when the audio file is an extended/video version compared to the LRC source duration
     func computeAutoVersionOffset(for track: Track, parsedLines: [LyricLine], lrcSourceDuration: Double?) -> Double {
         guard !parsedLines.isEmpty, parsedLines.first?.time != nil else { return 0.0 }
         guard let srcDur = lrcSourceDuration, srcDur > 30, track.duration > 30 else {
             return 0.0
         }
         let diff = track.duration - srcDur
-        // If our audio file is within 3 seconds of the official LRC duration, it's the exact same version -> 0 offset!
         if abs(diff) <= 3.0 {
             return 0.0
         }
-        // If our audio file is 3.5s to 60s longer (e.g. music video intro added before the song starts), shift by diff
         if diff > 3.0 && diff <= 60.0 {
             return diff
         }
@@ -579,30 +568,40 @@ final class LyricsManager {
         return min(line.words.count - 1, Int(progress * Double(line.words.count)))
     }
 
-    /// Cleans messy tags like "Kanye West/Syleena Johnson" -> "Kanye West" and searches with 3 fallback tiers
     func fetchVersionMatchedLyrics(title: String, artist: String, targetDuration: Double) async -> (lyrics: String, matchedDuration: Double?)? {
         let cleanTitle = Self.sanitizeTitle(title)
+        guard !cleanTitle.isEmpty else { return nil }
         let primaryArtist = Self.extractPrimaryArtist(artist)
 
-        // Tier 1: Primary Artist + Clean Title
         var queries: [String] = []
         if !primaryArtist.isEmpty {
             queries.append("\(primaryArtist) \(cleanTitle)")
         }
-        // Tier 2: Clean Title only (catches tracks where artist tag is a feature or producer like "The WRLDFMS Tony Williams")
-        if !cleanTitle.isEmpty && !queries.contains(cleanTitle) {
+        if !queries.contains(cleanTitle) {
             queries.append(cleanTitle)
         }
 
         for q in queries {
-            if let hit = await queryLRCLIB(searchQuery: q, cleanTitle: cleanTitle, primaryArtist: primaryArtist, targetDuration: targetDuration) {
+            if let hit = await queryLRCLIB(
+                searchQuery: q,
+                cleanTitle: cleanTitle,
+                rawArtist: artist,
+                primaryArtist: primaryArtist,
+                targetDuration: targetDuration
+            ) {
                 return hit
             }
         }
         return nil
     }
 
-    private func queryLRCLIB(searchQuery: String, cleanTitle: String, primaryArtist: String, targetDuration: Double) async -> (lyrics: String, matchedDuration: Double?)? {
+    private func queryLRCLIB(
+        searchQuery: String,
+        cleanTitle: String,
+        rawArtist: String,
+        primaryArtist: String,
+        targetDuration: Double
+    ) async -> (lyrics: String, matchedDuration: Double?)? {
         guard let encoded = searchQuery.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
               let url = URL(string: "https://lrclib.net/api/search?q=\(encoded)") else {
             return nil
@@ -611,47 +610,79 @@ final class LyricsManager {
         do {
             var req = URLRequest(url: url)
             req.timeoutInterval = 10
-            req.setValue("MusiQ iOS Player v3.5", forHTTPHeaderField: "User-Agent")
+            req.setValue("MusiQ iOS Player v4.0", forHTTPHeaderField: "User-Agent")
             let (data, _) = try await URLSession.shared.data(for: req)
             guard let results = try JSONSerialization.jsonObject(with: data) as? [[String: Any]],
                   !results.isEmpty else {
                 return nil
             }
 
-            // Score each result by:
-            // 1. Has syncedLyrics (+100 pts)
-            // 2. Title similarity (+50 pts)
-            // 3. Artist match (+40 pts)
-            // 4. Closeness to our audio file's duration (up to +60 pts for <2s difference!)
+            let targetNormTitle = Self.normalizeAlphanumeric(cleanTitle)
+            let targetNormArtist = Self.normalizeAlphanumeric(primaryArtist)
+            let rawNormArtist = Self.normalizeAlphanumeric(rawArtist)
+
+            // STRICT VERIFICATION GATE: Rejects random unrelated songs for Yedits / fanmade tracks!
             let scored: [(item: [String: Any], score: Double)] = results.compactMap { item in
                 let synced = (item["syncedLyrics"] as? String) ?? ""
                 let plain = (item["plainLyrics"] as? String) ?? ""
                 guard !synced.isEmpty || !plain.isEmpty else { return nil }
 
-                var score: Double = synced.isEmpty ? 0 : 100
-                let itemTitle = Self.sanitizeTitle((item["trackName"] as? String) ?? "").lowercased()
-                let itemArtist = ((item["artistName"] as? String) ?? "").lowercased()
+                let itemRawTitle = (item["trackName"] as? String) ?? ""
+                let itemCleanTitle = Self.sanitizeTitle(itemRawTitle)
+                let itemNormTitle = Self.normalizeAlphanumeric(itemCleanTitle)
+                let itemNormArtist = Self.normalizeAlphanumeric((item["artistName"] as? String) ?? "")
 
-                if itemTitle == cleanTitle.lowercased() {
-                    score += 55
-                } else if itemTitle.contains(cleanTitle.lowercased()) || cleanTitle.lowercased().contains(itemTitle) {
-                    score += 30
+                // 1. Strict Title Verification: The normalized title MUST match or share all core words
+                guard !itemNormTitle.isEmpty, !targetNormTitle.isEmpty else { return nil }
+                let isExactTitle = (itemNormTitle == targetNormTitle)
+                let isContainedTitle = (itemNormTitle.count >= 4 && targetNormTitle.count >= 4) &&
+                    (itemNormTitle.contains(targetNormTitle) || targetNormTitle.contains(itemNormTitle))
+
+                if !isExactTitle && !isContainedTitle {
+                    return nil
                 }
 
-                if !primaryArtist.isEmpty && itemArtist.contains(primaryArtist.lowercased()) {
-                    score += 45
+                // 2. Strict Artist / Duration Verification:
+                // Never accept a song by a completely random artist unless the duration is an exact match (< 2.5s) AND the title is exact
+                let artistMatches = !targetNormArtist.isEmpty && (
+                    itemNormArtist.contains(targetNormArtist) ||
+                    targetNormArtist.contains(itemNormArtist) ||
+                    rawNormArtist.contains(itemNormArtist)
+                )
+
+                let itemDur = (item["duration"] as? Double) ?? 0
+                let durDiff = targetDuration > 15 && itemDur > 15 ? abs(itemDur - targetDuration) : 999.0
+
+                if !artistMatches {
+                    // If the user's track has a known artist (e.g. Kanye West) and the result is a totally different artist,
+                    // only allow it if it's a collab alias (like The WRLDFMS Tony Williams) where the title is exact AND duration is within 3.5 seconds!
+                    if !isExactTitle || durDiff > 3.5 {
+                        return nil
+                    }
+                } else {
+                    // Even if the artist matches, reject completely different songs or 10-minute stems if duration is off by more than 65s
+                    if durDiff > 65.0 {
+                        return nil
+                    }
                 }
 
-                if let itemDur = item["duration"] as? Double, targetDuration > 15 {
-                    let diff = abs(itemDur - targetDuration)
-                    let durScore = max(0, 65.0 - (diff * 4.5))
-                    score += durScore
+                var score: Double = synced.isEmpty ? 20 : 100
+                if isExactTitle { score += 60 } else { score += 25 }
+                if artistMatches { score += 50 }
+                if durDiff < 60 {
+                    score += max(0, 65.0 - (durDiff * 4.0))
                 }
 
                 return (item, score)
             }
 
-            guard let best = scored.max(by: { $0.score < $1.score })?.item else { return nil }
+            // Require a minimum confidence score of 115 so weak/unrelated hits are never accepted
+            guard let bestEntry = scored.max(by: { $0.score < $1.score }),
+                  bestEntry.score >= 115 else {
+                return nil
+            }
+
+            let best = bestEntry.item
             let mDur = best["duration"] as? Double
             if let synced = best["syncedLyrics"] as? String, !synced.isEmpty {
                 return (synced, mDur)
@@ -665,12 +696,14 @@ final class LyricsManager {
         return nil
     }
 
+    private static func normalizeAlphanumeric(_ s: String) -> String {
+        s.lowercased().filter { $0.isLetter || $0.isNumber }
+    }
+
     private static func sanitizeTitle(_ raw: String) -> String {
         var s = raw
-        // Strip leading track numbers like "01 - " or "04. "
         s = s.replacingOccurrences(of: #"^\d{1,2}[\.\-\s]+"#, with: "", options: .regularExpression)
-        // Strip bracketed or parenthetical suffixes like (feat. ...), (Official Video), [Explicit]
-        s = s.replacingOccurrences(of: #"\s*[\(\[][^\)\]]*(feat|ft\.|official|video|audio|lyrics|explicit|clean|remaster|version|hq|hd)[^\)\]]*[\)\]]"#, with: "", options: [.regularExpression, .caseInsensitive])
+        s = s.replacingOccurrences(of: #"\s*[\(\[][^\)\]]*(feat|ft\.|official|video|audio|lyrics|explicit|clean|remaster|version|hq|hd|yedit|edit|v\d+)[^\)\]]*[\)\]]"#, with: "", options: [.regularExpression, .caseInsensitive])
         return s.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
@@ -679,7 +712,6 @@ final class LyricsManager {
         if trimmed.isEmpty || trimmed == "Unknown Artist" || trimmed == "Audio Import" {
             return ""
         }
-        // Split on "/", "&", ",", "feat.", "ft.", ";" and take the primary artist
         let separators = ["/", "&", ",", " feat.", " ft.", " featuring ", ";"]
         var primary = trimmed
         for sep in separators {
@@ -722,7 +754,6 @@ final class MusiQEngine: ObservableObject {
     @Published var playbackErrorMessage: String? = nil
 
     @Published var skipTransitionDirection: Int = 1
-    @Published var trackTransitionID: UUID = UUID()
 
     @Published var currentTrackLyrics: [LyricLine] = []
     @Published var autoDetectedLyricOffset: Double = 0.0
@@ -917,9 +948,7 @@ final class MusiQEngine: ObservableObject {
                 lrcSourceDuration: savedMatchedDur
             )
         } else {
-            if forceOnlineFetch {
-                currentTrackLyrics = []
-            }
+            currentTrackLyrics = []
             autoDetectedLyricOffset = 0
             isFetchingLyricsInBackground = true
             let requestedFile = track.fileName
@@ -945,6 +974,9 @@ final class MusiQEngine: ObservableObject {
                     }
                 } else {
                     await MainActor.run {
+                        if self.currentTrack?.fileName == requestedFile {
+                            self.currentTrackLyrics = []
+                        }
                         self.isFetchingLyricsInBackground = false
                     }
                 }
@@ -1134,18 +1166,18 @@ final class MusiQEngine: ObservableObject {
         }
     }
 
+    // MARK: - True Old-to-New Cover Transition on Skip & Play
     func playTrack(_ track: Track, in queue: [Track]) {
         let validQueue = queue.isEmpty ? allTracks : queue
-        currentQueue = validQueue
-        if let idx = currentQueue.firstIndex(where: { $0.fileName == track.fileName }) {
-            currentIndex = idx
-        } else {
-            currentQueue.insert(track, at: 0)
-            currentIndex = 0
-        }
         skipTransitionDirection = 1
-        withAnimation(.spring(response: 0.42, dampingFraction: 0.82)) {
-            trackTransitionID = UUID()
+        withAnimation(.spring(response: 0.44, dampingFraction: 0.84)) {
+            currentQueue = validQueue
+            if let idx = currentQueue.firstIndex(where: { $0.fileName == track.fileName }) {
+                currentIndex = idx
+            } else {
+                currentQueue.insert(track, at: 0)
+                currentIndex = 0
+            }
         }
         loadAndScheduleCurrentTrack(startFrame: 0, autoPlay: true)
     }
@@ -1349,13 +1381,20 @@ final class MusiQEngine: ObservableObject {
     func nextTrack() {
         guard !currentQueue.isEmpty else { return }
         skipTransitionDirection = 1
+        let nextIdx: Int
         if isShuffle && currentQueue.count > 1 {
-            currentIndex = Int.random(in: 0..<currentQueue.count)
+            var candidate = Int.random(in: 0..<currentQueue.count)
+            if candidate == currentIndex {
+                candidate = (currentIndex + 1) % currentQueue.count
+            }
+            nextIdx = candidate
         } else {
-            currentIndex = (currentIndex + 1) % currentQueue.count
+            nextIdx = (currentIndex + 1) % currentQueue.count
         }
-        withAnimation(.spring(response: 0.44, dampingFraction: 0.82)) {
-            trackTransitionID = UUID()
+        // Mutating currentIndex INSIDE withAnimation ensures the outgoing view keeps the OLD song's cover
+        // while the incoming view slides in with the NEW song's cover!
+        withAnimation(.spring(response: 0.44, dampingFraction: 0.84)) {
+            currentIndex = nextIdx
         }
         loadAndScheduleCurrentTrack(startFrame: 0, autoPlay: isPlaying)
     }
@@ -1367,9 +1406,9 @@ final class MusiQEngine: ObservableObject {
             return
         }
         skipTransitionDirection = -1
-        currentIndex = (currentIndex - 1 + currentQueue.count) % currentQueue.count
-        withAnimation(.spring(response: 0.44, dampingFraction: 0.82)) {
-            trackTransitionID = UUID()
+        let prevIdx = (currentIndex - 1 + currentQueue.count) % currentQueue.count
+        withAnimation(.spring(response: 0.44, dampingFraction: 0.84)) {
+            currentIndex = prevIdx
         }
         loadAndScheduleCurrentTrack(startFrame: 0, autoPlay: isPlaying)
     }
@@ -1611,7 +1650,7 @@ struct LoopingMarqueeText: View {
     }
 }
 
-// MARK: - 2-Line Capable Word-by-Word Karaoke Inline Lyric View (Never Cuts Off Long Lines!)
+// MARK: - 2-Line Capable Word-by-Word Karaoke Inline Lyric View
 struct WordByWordInlineLyricView: View {
     @ObservedObject var progress: PlaybackProgressObserver
     let lines: [LyricLine]
@@ -1775,7 +1814,14 @@ struct AppleMusicLyricsSheetView: View {
                             rawLyricsDraft = LyricsManager.shared.getLyrics(for: track)
                             showRawEditor.toggle()
                         } label: {
-                            Label(showRawEditor ? "View Synced Lyrics" : "Edit Raw Lyrics / LRC", systemImage: "pencil")
+                            Label(showRawEditor ? "View Synced Lyrics" : "Edit / Paste Raw Lyrics", systemImage: "pencil")
+                        }
+
+                        Button(role: .destructive) {
+                            LyricsManager.shared.saveLyrics("", matchedDuration: nil, for: track)
+                            engine.currentTrackLyrics = []
+                        } label: {
+                            Label("Clear Lyrics for This Track", systemImage: "trash")
                         }
 
                         Button(role: .destructive) {
@@ -1835,16 +1881,22 @@ struct AppleMusicLyricsSheetView: View {
                             if isFetchingOnline || engine.isFetchingLyricsInBackground {
                                 ProgressView()
                                     .tint(.white)
-                                Text("Matching song version & syncing lyrics...")
+                                Text("Verifying track version & syncing lyrics...")
                                     .font(.subheadline)
                                     .foregroundColor(.white.opacity(0.7))
                             } else {
                                 Image(systemName: "quote.bubble")
                                     .font(.system(size: 42))
                                     .foregroundColor(.white.opacity(0.45))
-                                Text("No Synced Lyrics Found")
+                                Text("No Public Lyrics for This Track")
                                     .font(.title3.bold())
                                     .foregroundColor(.white)
+                                Text("Unreleased / Yedit tracks without verified online lyrics stay clean.\nYou can paste custom lyrics below.")
+                                    .font(.caption)
+                                    .foregroundColor(.white.opacity(0.65))
+                                    .multilineTextAlignment(.center)
+                                    .padding(.horizontal, 32)
+
                                 HStack(spacing: 12) {
                                     Button {
                                         engine.reloadLyricsForCurrentTrack(forceOnlineFetch: true)
@@ -1999,7 +2051,7 @@ struct AppleMusicLyricsSheetView: View {
     }
 }
 
-// MARK: - Playlist Cover View (Supports Custom Photo OR 2x2 Album Art Collage)
+// MARK: - Playlist Cover View
 struct PlaylistArtworkThumbnailView: View {
     let playlist: Playlist
     let tracks: [Track]
@@ -2202,7 +2254,7 @@ struct PlaylistsHomeView: View {
     }
 }
 
-// MARK: - Clean, Un-Clustered Full-Bleed Playlist Detail View
+// MARK: - Clean Full-Bleed Playlist Detail View
 struct PlaylistDetailView: View {
     @ObservedObject var engine: MusiQEngine
     let playlistID: UUID
@@ -2238,7 +2290,6 @@ struct PlaylistDetailView: View {
             Color(red: 0.06, green: 0.06, blue: 0.08).ignoresSafeArea()
 
             List {
-                // Full-Bleed Spacious Hero Banner (No Cramped Inset Card!)
                 VStack(spacing: 18) {
                     HStack(alignment: .center, spacing: 18) {
                         if let p = playlist {
@@ -2272,7 +2323,6 @@ struct PlaylistDetailView: View {
                         Spacer(minLength: 0)
                     }
 
-                    // Clean Action Bar
                     HStack(spacing: 12) {
                         Button {
                             showSongPicker = true
@@ -2360,7 +2410,6 @@ struct PlaylistDetailView: View {
                 .listRowSeparator(.hidden)
                 .listRowBackground(Color.clear)
 
-                // Full-Bleed Tracks List
                 if tracks.isEmpty {
                     VStack(spacing: 10) {
                         Text("No songs in this playlist yet.")
@@ -2796,7 +2845,7 @@ struct MiniPlayerBar: View {
     }
 }
 
-// MARK: - Full-Screen Player (Proper Spacing Between Vinyl/Cover & Title + Multi-Color Cassette)
+// MARK: - Full-Screen Player (With Value-Captured Old-to-New Album Skip Transition)
 struct FullPlayerDeckView: View {
     @ObservedObject var engine: MusiQEngine
     @Binding var isPresented: Bool
@@ -2815,15 +2864,9 @@ struct FullPlayerDeckView: View {
         return ArtworkCache.shared.playerGradient(for: engine.currentTrack?.fileName)
     }
 
-    private var cassetteZoneColors: [Color] {
-        let _ = engine.artworkRefreshID
-        return ArtworkCache.shared.cassettePalette(for: engine.currentTrack?.fileName)
-    }
-
     var body: some View {
         GeometryReader { geo in
             let safeWidth = geo.size.width
-            // Balanced stage size so there's generous breathing room above the Song Title!
             let artBoxSize = min(safeWidth - 76, 268)
 
             ZStack {
@@ -2888,27 +2931,32 @@ struct FullPlayerDeckView: View {
 
                     Spacer(minLength: 8)
 
-                    // Visualizer Stage with Skip Slide Animation & Subtle Gyro Tilt
+                    // Value-Captured Visualizer Stage:
+                    // By binding `.id(activeTrack.fileName)` to the captured `activeTrack` value,
+                    // SwiftUI keeps the outgoing track's artwork on the exiting view while sliding in the new track's artwork!
                     ZStack {
-                        PlayerVisualizerStage(
-                            mode: engine.visualMode,
-                            track: engine.currentTrack,
-                            isPlaying: engine.isPlaying,
-                            boxSize: artBoxSize,
-                            refreshID: engine.artworkRefreshID,
-                            zonePalette: cassetteZoneColors
-                        )
-                        .id(engine.trackTransitionID)
-                        .transition(
-                            .asymmetric(
-                                insertion: .offset(x: engine.skipTransitionDirection >= 0 ? 110 : -110)
-                                    .combined(with: .scale(scale: 0.88))
-                                    .combined(with: .opacity),
-                                removal: .offset(x: engine.skipTransitionDirection >= 0 ? -110 : 110)
-                                    .combined(with: .scale(scale: 0.88))
-                                    .combined(with: .opacity)
+                        if let activeTrack = engine.currentTrack {
+                            let capturedPalette = ArtworkCache.shared.cassettePalette(for: activeTrack.fileName)
+                            PlayerVisualizerStage(
+                                mode: engine.visualMode,
+                                track: activeTrack,
+                                isPlaying: engine.isPlaying,
+                                boxSize: artBoxSize,
+                                refreshID: engine.artworkRefreshID,
+                                zonePalette: capturedPalette
                             )
-                        )
+                            .id(activeTrack.fileName)
+                            .transition(
+                                .asymmetric(
+                                    insertion: .offset(x: engine.skipTransitionDirection >= 0 ? 140 : -140)
+                                        .combined(with: .scale(scale: 0.86))
+                                        .combined(with: .opacity),
+                                    removal: .offset(x: engine.skipTransitionDirection >= 0 ? -140 : 140)
+                                        .combined(with: .scale(scale: 0.86))
+                                        .combined(with: .opacity)
+                                )
+                            )
+                        }
                     }
                     .rotation3DEffect(
                         .degrees(motion.pitch),
@@ -2922,7 +2970,6 @@ struct FullPlayerDeckView: View {
                     )
                     .offset(x: CGFloat(motion.roll * 1.3), y: CGFloat(motion.pitch * 1.3))
                     .frame(width: safeWidth - 16, height: artBoxSize + 10)
-                    // Dedicated breathing room below the Vinyl/Cover before the Song Title!
                     .padding(.bottom, 22)
 
                     if let err = engine.playbackErrorMessage {
@@ -3028,7 +3075,7 @@ struct FullPlayerDeckView: View {
                         }
                     }
 
-                    // Bottom Action Bar (DSP, Lyrics, Tags, Queue, Source)
+                    // Bottom Action Bar
                     HStack(spacing: 22) {
                         Button {
                             activeBottomSheet = .dsp
@@ -3182,10 +3229,10 @@ struct IsolatedScrubberView: View {
     }
 }
 
-// MARK: - 3-Way Visualizer Stage (Sleeve, Multi-Color Zone Cassette Without Cover Photo, Side Vinyl)
+// MARK: - 3-Way Visualizer Stage (Captures Track Snapshot for True Old->New Transition)
 struct PlayerVisualizerStage: View {
     let mode: VisualMode
-    let track: Track?
+    let track: Track
     let isPlaying: Bool
     let boxSize: CGFloat
     let refreshID: UUID
@@ -3193,8 +3240,7 @@ struct PlayerVisualizerStage: View {
 
     var artworkImage: UIImage? {
         let _ = refreshID
-        guard let fileName = track?.fileName else { return nil }
-        return ArtworkCache.shared.artwork(for: fileName)
+        return ArtworkCache.shared.artwork(for: track.fileName)
     }
 
     var body: some View {
@@ -3258,7 +3304,6 @@ struct PlayerVisualizerStage: View {
         }
     }
 
-    // Multi-Zone Album Palette Cassette (No Album Cover Image — Uses 5-Zone Spatial Colors: e.g. White Sides -> Gold Ring -> Warm Center!)
     @ViewBuilder
     private func multiColorPaletteCassetteView(width: CGFloat, height: CGFloat) -> some View {
         let reelSize = height * 0.36
@@ -3269,7 +3314,6 @@ struct PlayerVisualizerStage: View {
         let cRight = zonePalette.indices.contains(4) ? zonePalette[4] : .white
 
         ZStack {
-            // 1. Multi-Color Translucent Shell Tinted Across the 5 Zones of the Album Art
             RoundedRectangle(cornerRadius: 18)
                 .fill(
                     LinearGradient(
@@ -3302,7 +3346,6 @@ struct PlayerVisualizerStage: View {
                 )
                 .shadow(color: .black.opacity(0.55), radius: 16, x: 0, y: 10)
 
-            // 2. Corner Mechanical Screws
             VStack {
                 HStack {
                     cassetteScrew()
@@ -3319,7 +3362,6 @@ struct PlayerVisualizerStage: View {
             .padding(12)
             .frame(width: width, height: height)
 
-            // 3. Multi-Color Graphic Cassette Faceplate Label (No Photo — Pure Album Color Zones: Sides -> Middle!)
             ZStack {
                 RoundedRectangle(cornerRadius: 11)
                     .fill(
@@ -3339,7 +3381,6 @@ struct PlayerVisualizerStage: View {
                     )
                     .frame(width: width * 0.88, height: height * 0.62)
                     .overlay(
-                        // Classic Retro Horizontal Accent Stripes Using the Album's Accent Colors
                         VStack(spacing: 3) {
                             Spacer()
                             Rectangle()
@@ -3371,7 +3412,6 @@ struct PlayerVisualizerStage: View {
                             .stroke(Color.black.opacity(0.28), lineWidth: 1.2)
                     )
 
-                // Top-Left & Top-Right Cassette Metadata Markings on the Label
                 VStack {
                     HStack {
                         Text("SIDE A")
@@ -3398,7 +3438,6 @@ struct PlayerVisualizerStage: View {
                 }
                 .frame(width: width * 0.88, height: height * 0.62)
 
-                // Center Transparent Tape Window & Dual Spinning Reels
                 ZStack {
                     Capsule()
                         .fill(
@@ -3414,7 +3453,6 @@ struct PlayerVisualizerStage: View {
                                 .stroke(Color.white.opacity(0.35), lineWidth: 1.3)
                         )
 
-                    // Magnetic Tape Spools Behind Reels
                     HStack(spacing: width * 0.14) {
                         Circle()
                             .fill(Color(red: 0.12, green: 0.08, blue: 0.07).opacity(0.92))
@@ -3425,7 +3463,6 @@ struct PlayerVisualizerStage: View {
                     }
                     .clipShape(Capsule().scale(0.95))
 
-                    // Left & Right Synchronized Spinning Cassette Reels
                     HStack(spacing: width * 0.16) {
                         ContinuousSpinView(isSpinning: isPlaying, rpm: 20.0) {
                             cassetteSpindleWheel(size: reelSize, accent: cMidLeft)
@@ -3439,7 +3476,6 @@ struct PlayerVisualizerStage: View {
             }
             .offset(y: -height * 0.08)
 
-            // 4. Bottom Trapezoid Head Shield (With Track Title Etched)
             VStack {
                 Spacer()
                 ZStack {
@@ -3459,7 +3495,7 @@ struct PlayerVisualizerStage: View {
 
                     HStack(spacing: 16) {
                         Circle().fill(Color.black.opacity(0.8)).frame(width: 9, height: 9)
-                        Text(track?.title.uppercased() ?? "MUSIQ CASSETTE")
+                        Text(track.title.uppercased())
                             .font(.system(size: 8.5, weight: .black, design: .monospaced))
                             .foregroundColor(.white.opacity(0.90))
                             .lineLimit(1)
