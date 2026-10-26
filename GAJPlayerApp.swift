@@ -7,9 +7,6 @@ import PhotosUI
 import CoreMotion
 import Network
 import AudioToolbox
-#if canImport(ActivityKit)
-import ActivityKit
-#endif
 
 // MARK: - App Entry
 @main
@@ -19,50 +16,6 @@ struct MusiQApp: App {
             MusiQRootView()
                 .preferredColorScheme(.dark)
         }
-    }
-}
-
-// MARK: - Live Activity & Dynamic Island Attributes (ActivityKit)
-#if canImport(ActivityKit)
-@available(iOS 16.1, *)
-struct MusiQPlaybackAttributes: ActivityAttributes {
-    public struct ContentState: Codable, Hashable {
-        var title: String
-        var artist: String
-        var isPlaying: Bool
-        var currentTime: Double
-        var duration: Double
-        var modeName: String
-    }
-    var appName: String = "MusiQ"
-}
-#endif
-
-final class LiveActivityManager {
-    static let shared = LiveActivityManager()
-
-    func updateActivity(track: Track?, isPlaying: Bool, currentTime: Double, duration: Double, mode: VisualMode) {
-        #if canImport(ActivityKit)
-        if #available(iOS 16.2, *) {
-            guard ActivityAuthorizationInfo().areActivitiesEnabled, let track = track else { return }
-            let state = MusiQPlaybackAttributes.ContentState(
-                title: track.title,
-                artist: track.artist,
-                isPlaying: isPlaying,
-                currentTime: currentTime,
-                duration: duration,
-                modeName: mode.rawValue
-            )
-            let content = ActivityContent(state: state, staleDate: nil)
-            let existing = Activity<MusiQPlaybackAttributes>.activities
-            if let currentActivity = existing.first {
-                Task { await currentActivity.update(content) }
-            } else {
-                let attrs = MusiQPlaybackAttributes()
-                _ = try? Activity.request(attributes: attrs, content: content, pushType: nil)
-            }
-        }
-        #endif
     }
 }
 
@@ -1812,130 +1765,6 @@ final class MusiQEngine: ObservableObject {
             info[MPMediaItemPropertyArtwork] = MPMediaItemArtwork(boundsSize: art.size) { _ in art }
         }
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
-        LiveActivityManager.shared.updateActivity(
-            track: track,
-            isPlaying: isPlaying,
-            currentTime: progress.currentTime,
-            duration: progress.duration,
-            mode: visualMode
-        )
-    }
-}
-
-// MARK: - Interactive Dynamic Island Live Activity Banner
-struct DynamicIslandLiveBanner: View {
-    @ObservedObject var engine: MusiQEngine
-    @ObservedObject var progress: PlaybackProgressObserver
-    @State private var isExpanded: Bool = false
-
-    var body: some View {
-        if let track = engine.currentTrack {
-            VStack(spacing: 0) {
-                if isExpanded {
-                    VStack(spacing: 10) {
-                        HStack(spacing: 12) {
-                            ContinuousSpinView(isSpinning: engine.isPlaying, rpm: 18) {
-                                if let art = ArtworkCache.shared.artwork(for: track.fileName) {
-                                    Image(uiImage: art)
-                                        .resizable()
-                                        .scaledToFill()
-                                        .frame(width: 44, height: 44)
-                                        .clipShape(Circle())
-                                } else {
-                                    Circle()
-                                        .fill(Color.purple)
-                                        .frame(width: 44, height: 44)
-                                }
-                            }
-
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(track.title)
-                                    .font(.system(size: 14, weight: .bold))
-                                    .foregroundColor(.white)
-                                    .lineLimit(1)
-                                Text(track.artist)
-                                    .font(.system(size: 11, weight: .medium))
-                                    .foregroundColor(.white.opacity(0.65))
-                                    .lineLimit(1)
-                            }
-
-                            Spacer()
-
-                            HStack(spacing: 14) {
-                                Button { engine.previousTrack() } label: {
-                                    Image(systemName: "backward.fill").foregroundColor(.white)
-                                }
-                                Button { engine.togglePlayPause() } label: {
-                                    Image(systemName: engine.isPlaying ? "pause.fill" : "play.fill")
-                                        .font(.title3.bold())
-                                        .foregroundColor(.white)
-                                }
-                                Button { engine.nextTrack() } label: {
-                                    Image(systemName: "forward.fill").foregroundColor(.white)
-                                }
-                            }
-                        }
-
-                        ProgressView(value: min(progress.currentTime, max(progress.duration, 1)), total: max(progress.duration, 1))
-                            .tint(.purple)
-                    }
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 12)
-                    .background(Color.black.opacity(0.92))
-                    .clipShape(RoundedRectangle(cornerRadius: 28))
-                    .overlay(RoundedRectangle(cornerRadius: 28).stroke(Color.white.opacity(0.16), lineWidth: 1))
-                    .shadow(color: .black.opacity(0.6), radius: 12, x: 0, y: 6)
-                    .padding(.horizontal, 20)
-                } else {
-                    HStack(spacing: 10) {
-                        ContinuousSpinView(isSpinning: engine.isPlaying, rpm: 18) {
-                            if let art = ArtworkCache.shared.artwork(for: track.fileName) {
-                                Image(uiImage: art)
-                                    .resizable()
-                                    .scaledToFill()
-                                    .frame(width: 22, height: 22)
-                                    .clipShape(Circle())
-                            } else {
-                                Circle()
-                                    .fill(Color.purple)
-                                    .frame(width: 22, height: 22)
-                            }
-                        }
-
-                        Text(track.title)
-                            .font(.system(size: 12, weight: .bold, design: .rounded))
-                            .foregroundColor(.white)
-                            .lineLimit(1)
-                            .frame(maxWidth: 130)
-
-                        HStack(spacing: 2.5) {
-                            ForEach(0..<3, id: \.self) { bar in
-                                Capsule()
-                                    .fill(Color.purple)
-                                    .frame(width: 3, height: engine.isPlaying ? CGFloat([8, 14, 10][bar]) : 4)
-                                    .animation(
-                                        engine.isPlaying
-                                            ? .easeInOut(duration: 0.35 + Double(bar) * 0.1).repeatForever(autoreverses: true)
-                                            : .default,
-                                        value: engine.isPlaying
-                                    )
-                            }
-                        }
-                    }
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 7)
-                    .background(Color.black.opacity(0.88))
-                    .clipShape(Capsule())
-                    .overlay(Capsule().stroke(Color.white.opacity(0.18), lineWidth: 0.8))
-                    .shadow(color: .black.opacity(0.45), radius: 8, x: 0, y: 4)
-                }
-            }
-            .onTapGesture {
-                withAnimation(.spring(response: 0.34, dampingFraction: 0.8)) {
-                    isExpanded.toggle()
-                }
-            }
-        }
     }
 }
 
@@ -1973,7 +1802,6 @@ struct FullScreenIPodClassicModeView: View {
             let wheelDiameter = min(w - 84, 268)
 
             ZStack {
-                // Full-Screen Brushed Anodized Aluminum / Classic iPod Shell
                 LinearGradient(
                     colors: [
                         Color(white: 0.88),
@@ -2029,7 +1857,6 @@ struct FullScreenIPodClassicModeView: View {
                             .shadow(color: .black.opacity(0.35), radius: 10, x: 0, y: 4)
 
                         VStack(spacing: 0) {
-                            // iPod Top Status Bar
                             HStack {
                                 Text(statusBarTitle)
                                     .font(.system(size: 12, weight: .bold))
@@ -2060,7 +1887,6 @@ struct FullScreenIPodClassicModeView: View {
                             )
                             .overlay(Rectangle().fill(Color.gray.opacity(0.5)).frame(height: 1), alignment: .bottom)
 
-                            // LCD Content Area
                             Group {
                                 switch currentScreen {
                                 case .rootMenu:
@@ -2094,7 +1920,6 @@ struct FullScreenIPodClassicModeView: View {
                         .frame(width: lcdWidth, height: lcdHeight)
                         .clipShape(RoundedRectangle(cornerRadius: 10))
 
-                        // Subtle Glass Glare Overlay
                         LinearGradient(
                             colors: [Color.white.opacity(0.20), Color.clear, Color.black.opacity(0.04)],
                             startPoint: .topLeading,
@@ -2107,9 +1932,8 @@ struct FullScreenIPodClassicModeView: View {
 
                     Spacer()
 
-                    // High-Precision Trigonometric Click Wheel (Fixed Local Coordinate Space & 9-Degree Smooth Steps)
+                    // High-Precision Trigonometric Click Wheel
                     ZStack {
-                        // Wheel Touch Surface
                         Circle()
                             .fill(
                                 LinearGradient(
@@ -2130,7 +1954,6 @@ struct FullScreenIPodClassicModeView: View {
                                         let dy = value.location.y - radius
                                         let dist = hypot(dx, dy)
 
-                                        // Ignore drags right inside the center Select button
                                         guard dist > (wheelDiameter * 0.16) else { return }
 
                                         let angle = atan2(dy, dx) * 180.0 / .pi
@@ -2139,10 +1962,9 @@ struct FullScreenIPodClassicModeView: View {
                                             if delta > 180 { delta -= 360 }
                                             if delta < -180 { delta += 360 }
 
-                                            // Ignore sudden jumps if finger lifted and tapped opposite side
                                             if abs(delta) < 75 {
                                                 accumulatedDeltaAngle += delta
-                                                let stepDegrees = 9.5 // Ultra-responsive 9.5° per item!
+                                                let stepDegrees = 9.5
                                                 if abs(accumulatedDeltaAngle) >= stepDegrees {
                                                     let steps = Int(accumulatedDeltaAngle / stepDegrees)
                                                     accumulatedDeltaAngle -= Double(steps) * stepDegrees
@@ -2158,7 +1980,6 @@ struct FullScreenIPodClassicModeView: View {
                                     }
                             )
 
-                        // Top & Bottom Wheel Buttons (MENU & PLAY/PAUSE)
                         VStack {
                             Button {
                                 triggerClickHaptic()
@@ -2192,7 +2013,6 @@ struct FullScreenIPodClassicModeView: View {
                         }
                         .frame(width: wheelDiameter, height: wheelDiameter)
 
-                        // Left & Right Wheel Buttons (PREV & NEXT)
                         HStack {
                             Button {
                                 triggerClickHaptic()
@@ -2222,7 +2042,6 @@ struct FullScreenIPodClassicModeView: View {
                         }
                         .frame(width: wheelDiameter, height: wheelDiameter)
 
-                        // Center Tactile Select Button
                         Button {
                             triggerClickHaptic(heavy: true)
                             handleCenterSelect()
@@ -2356,7 +2175,6 @@ struct FullScreenIPodClassicModeView: View {
                 Spacer(minLength: 0)
             }
 
-            // Classic iPod Right-Edge Scrollbar Track
             if items.count > visibleRows {
                 GeometryReader { sbGeo in
                     let thumbRatio = CGFloat(visibleRows) / CGFloat(items.count)
@@ -2649,7 +2467,7 @@ struct LoopingMarqueeText: View {
     }
 }
 
-// MARK: - 2-Line Capable Word-by-Word Karaoke Inline Lyric View (Kept Right Below Artist Name!)
+// MARK: - 2-Line Capable Word-by-Word Karaoke Inline Lyric View
 struct WordByWordInlineLyricView: View {
     @ObservedObject var progress: PlaybackProgressObserver
     let lines: [LyricLine]
@@ -2730,7 +2548,7 @@ struct WordByWordInlineLyricView: View {
     }
 }
 
-// MARK: - Scroll-Down Spotify-Inspired Lyrics Card (Peeks at Bottom, Expands when Scrolled, Opens Full Sheet on Tap)
+// MARK: - Scroll-Down Spotify-Inspired Lyrics Card
 struct ScrollDownLyricsPreviewCard: View {
     @ObservedObject var progress: PlaybackProgressObserver
     let lines: [LyricLine]
@@ -2751,7 +2569,6 @@ struct ScrollDownLyricsPreviewCard: View {
     var body: some View {
         Button(action: onOpenFullLyrics) {
             VStack(alignment: .leading, spacing: 18) {
-                // Card Top Header ("Lyrics" + Expand Icon, No Share Button!)
                 HStack {
                     Text("Lyrics")
                         .font(.system(size: 20, weight: .bold, design: .rounded))
@@ -2769,7 +2586,6 @@ struct ScrollDownLyricsPreviewCard: View {
                     }
                 }
 
-                // Multi-Line Synced Lyrics Preview Window inside the Card
                 if !lines.isEmpty, let currentIdx = activeIndex {
                     let startIdx = max(0, min(currentIdx - 1, max(0, lines.count - 5)))
                     let endIdx = min(lines.count, startIdx + 5)
@@ -3199,7 +3015,7 @@ struct PlaylistArtworkThumbnailView: View {
     }
 }
 
-// MARK: - Root Tab View (Supports Full-Screen Standalone iPod Mode Switch)
+// MARK: - Root Tab View (Clean Without Dynamic Island Overlay)
 struct MusiQRootView: View {
     @StateObject private var engine = MusiQEngine()
     @State private var selectedTab: Int = 0
@@ -3233,12 +3049,6 @@ struct MusiQRootView: View {
                     .tag(3)
             }
             .tint(.purple)
-
-            VStack {
-                DynamicIslandLiveBanner(engine: engine, progress: engine.progress)
-                    .padding(.top, 4)
-                Spacer()
-            }
 
             if let current = engine.currentTrack {
                 MiniPlayerBar(engine: engine, track: current) {
@@ -3954,7 +3764,7 @@ struct MiniPlayerBar: View {
     }
 }
 
-// MARK: - Full-Screen Player (Scroll-Down Spotify Lyrics Card + Sticky Pinned 4-Column Bottom Bar)
+// MARK: - Full-Screen Player (Clean Top Bar + Scroll-Down Lyrics Card + Sticky Pinned 4-Column Bottom Bar)
 struct FullPlayerDeckView: View {
     @ObservedObject var engine: MusiQEngine
     @Binding var isPresented: Bool
@@ -3988,7 +3798,7 @@ struct FullPlayerDeckView: View {
                 .animation(.easeInOut(duration: 0.65), value: engine.currentTrack?.fileName)
 
                 VStack(spacing: 0) {
-                    // Fixed Top Bar
+                    // Clean Top Bar (Grabber Capsule Restored)
                     HStack {
                         Button {
                             isPresented = false
@@ -3999,7 +3809,9 @@ struct FullPlayerDeckView: View {
                                 .padding(8)
                         }
                         Spacer()
-                        DynamicIslandLiveBanner(engine: engine, progress: engine.progress)
+                        Capsule()
+                            .fill(Color.white.opacity(0.3))
+                            .frame(width: 42, height: 5)
                         Spacer()
                         if let track = engine.currentTrack {
                             Text(engine.formattedListenTime(for: track.fileName))
@@ -4017,7 +3829,7 @@ struct FullPlayerDeckView: View {
                     // Scrollable Main Player Stage + Scroll-Down Lyrics Card
                     ScrollView(showsIndicators: false) {
                         VStack(spacing: 8) {
-                            // 3-Way Display Mode Switcher (Sleeve, Cassette, Side Vinyl)
+                            // 3-Way Display Mode Switcher
                             HStack(spacing: 10) {
                                 ForEach(VisualMode.allCases, id: \.self) { mode in
                                     Button {
@@ -4098,7 +3910,7 @@ struct FullPlayerDeckView: View {
                             }
                             .padding(.horizontal, 24)
 
-                            // Inline Synced Lyrics right under the Artist Name (Preserved!)
+                            // Inline Synced Lyrics right under the Artist Name
                             WordByWordInlineLyricView(
                                 progress: engine.progress,
                                 lines: engine.currentTrackLyrics,
@@ -4178,7 +3990,7 @@ struct FullPlayerDeckView: View {
                             }
                             .padding(.bottom, 16)
 
-                            // Scroll-Down Spotify-Style Lyrics Card (Tap to Open Full Apple Music Lyrics Sheet!)
+                            // Scroll-Down Spotify-Style Lyrics Card
                             ScrollDownLyricsPreviewCard(
                                 progress: engine.progress,
                                 lines: engine.currentTrackLyrics,
@@ -4262,7 +4074,6 @@ struct FullPlayerDeckView: View {
             .gesture(
                 DragGesture()
                     .onChanged { value in
-                        // Only swipe-right from edge to dismiss so vertical scrolling into lyrics is effortless
                         if value.translation.width > abs(value.translation.height) && value.translation.width > 0 {
                             dragOffset = value.translation
                         }
