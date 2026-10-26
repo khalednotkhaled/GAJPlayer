@@ -1,8 +1,10 @@
 import SwiftUI
 import AVFoundation
+import AVKit
 import MediaPlayer
 import UniformTypeIdentifiers
 import PhotosUI
+import CoreMotion
 
 // MARK: - App Entry
 @main
@@ -13,6 +15,45 @@ struct MusiQApp: App {
                 .preferredColorScheme(.dark)
         }
     }
+}
+
+// MARK: - Subtle Gyroscope Parallax Manager
+final class MotionTiltManager: ObservableObject {
+    @Published var pitch: Double = 0
+    @Published var roll: Double = 0
+    private let manager = CMMotionManager()
+
+    init() {
+        guard manager.isDeviceMotionAvailable else { return }
+        manager.deviceMotionUpdateInterval = 1.0 / 30.0
+        manager.startDeviceMotionUpdates(to: .main) { [weak self] data, _ in
+            guard let self = self, let attitude = data?.attitude else { return }
+            // Clamped & smoothed for a subtle, premium floating feel (max ~5.5 degrees)
+            let targetPitch = max(-5.5, min(5.5, attitude.pitch * 6.5))
+            let targetRoll = max(-5.5, min(5.5, attitude.roll * 6.5))
+            withAnimation(.interactiveSpring(response: 0.28, dampingFraction: 0.85)) {
+                self.pitch = targetPitch
+                self.roll = targetRoll
+            }
+        }
+    }
+
+    deinit {
+        manager.stopDeviceMotionUpdates()
+    }
+}
+
+// MARK: - Native iOS Audio Output Route Picker ("Source" Button)
+struct AudioSourcePickerButton: UIViewRepresentable {
+    func makeUIView(context: Context) -> AVRoutePickerView {
+        let picker = AVRoutePickerView()
+        picker.tintColor = UIColor.white.withAlphaComponent(0.85)
+        picker.activeTintColor = UIColor.systemPurple
+        picker.prioritizesVideoDevices = false
+        return picker
+    }
+
+    func updateUIView(_ uiView: AVRoutePickerView, context: Context) {}
 }
 
 // MARK: - Models
@@ -51,18 +92,20 @@ struct LyricLine: Identifiable, Equatable {
     let id = UUID()
     let index: Int
     let time: TimeInterval?
+    let endTime: TimeInterval?
     let text: String
+    let words: [String]
 }
 
 enum VisualMode: String, CaseIterable {
     case sleeve = "Sleeve"
-    case cdPlayer = "Walkman CD"
+    case cassette = "Cassette"
     case sideVinyl = "Side Vinyl"
 
     var icon: String {
         switch self {
         case .sleeve: return "square.fill"
-        case .cdPlayer: return "opticaldisc"
+        case .cassette: return "recordingtape"
         case .sideVinyl: return "record.circle"
         }
     }
@@ -292,11 +335,10 @@ final class ArtworkCache {
     }
 }
 
-// MARK: - Synced Lyrics Storage, Per-Track Intro Offset & Auto-Fetcher
+// MARK: - Smart Version-Aware Lyrics Manager & Acoustic Intro Detector
 final class LyricsManager {
     static let shared = LyricsManager()
-    private let storageKey = "MusiQ_Saved_Lyrics_v3"
-    private let offsetStorageKey = "MusiQ_Lyrics_Offsets_v1"
+    private let storageKey = "MusiQ_Saved_Lyrics_v4"
 
     func getLyrics(for track: Track) -> String {
         if let dict = UserDefaults.standard.dictionary(forKey: storageKey) as? [String: String],
@@ -316,26 +358,14 @@ final class LyricsManager {
         UserDefaults.standard.set(dict, forKey: storageKey)
     }
 
-    /// Returns per-song lyric timing offset in seconds (e.g., +12.5s if the track has a video intro)
-    func getOffset(for fileName: String) -> Double {
-        let dict = (UserDefaults.standard.dictionary(forKey: offsetStorageKey) as? [String: Double]) ?? [:]
-        return dict[fileName] ?? 0.0
-    }
-
-    func saveOffset(_ offset: Double, for fileName: String) {
-        var dict = (UserDefaults.standard.dictionary(forKey: offsetStorageKey) as? [String: Double]) ?? [:]
-        dict[fileName] = offset
-        UserDefaults.standard.set(dict, forKey: offsetStorageKey)
-    }
-
-    func parseLyrics(_ raw: String) -> [LyricLine] {
+    /// Parses LRC lines and calculates each line's endTime & words array for word-by-word karaoke highlighting
+    func parseLyrics(_ raw: String, trackDuration: Double) -> [LyricLine] {
         let rawLines = raw.components(separatedBy: .newlines)
-        var parsed: [LyricLine] = []
+        var temp: [(time: TimeInterval?, text: String)] = []
 
         let pattern = #"\[(\d{1,2}):(\d{2})(?:[\.:](\d{1,3}))?\](.*)"#
         let regex = try? NSRegularExpression(pattern: pattern)
 
-        var idx = 0
         for line in rawLines {
             let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { continue }
@@ -358,28 +388,91 @@ final class LyricsManager {
                 let timestamp = (mins * 60.0) + secs + frac
                 let lyricText = String(trimmed[textRange]).trimmingCharacters(in: .whitespacesAndNewlines)
                 if !lyricText.isEmpty {
-                    parsed.append(LyricLine(index: idx, time: timestamp, text: lyricText))
-                    idx += 1
+                    temp.append((time: timestamp, text: lyricText))
                 }
             } else if !trimmed.hasPrefix("[ti:") && !trimmed.hasPrefix("[ar:") && !trimmed.hasPrefix("[al:") && !trimmed.hasPrefix("[by:") && !trimmed.hasPrefix("[length:") {
-                parsed.append(LyricLine(index: idx, time: nil, text: trimmed))
-                idx += 1
+                temp.append((time: nil, text: trimmed))
             }
         }
 
-        return parsed
+        var finalLines: [LyricLine] = []
+        for i in 0..<temp.count {
+            let current = temp[i]
+            let nextTime: TimeInterval? = (i + 1 < temp.count) ? temp[i + 1].time : max(trackDuration, (current.time ?? 0) + 4.0)
+            let words = current.text.components(separatedBy: .whitespaces).filter { !$0.isEmpty }
+            finalLines.append(
+                LyricLine(
+                    index: i,
+                    time: current.time,
+                    endTime: nextTime,
+                    text: current.text,
+                    words: words.isEmpty ? [current.text] : words
+                )
+            )
+        }
+        return finalLines
     }
 
-    /// Evaluates active lyric index taking the user's custom Intro Offset into account
-    static func activeLineIndex(in lines: [LyricLine], currentTime: Double, duration: Double, offsetSeconds: Double) -> Int? {
+    /// Automatically detects version difference (e.g. Music Video intro vs Album version) by comparing track duration and acoustic onset
+    func computeAutoVersionOffset(for track: Track, parsedLines: [LyricLine], lrcSourceDuration: Double?) -> Double {
+        guard let firstLineTime = parsedLines.first?.time else { return 0.0 }
+
+        // 1. If LRCLIB reported the exact duration of the LRC's source track and our audio file is longer (e.g. video intro added at start)
+        if let srcDur = lrcSourceDuration, srcDur > 30, track.duration > 30 {
+            let diff = track.duration - srcDur
+            // If our file is between 3s and 65s longer than the standard studio version, shift by the intro difference
+            if diff >= 3.0 && diff <= 65.0 {
+                return diff
+            }
+        }
+
+        // 2. Acoustic Energy Onset Detection: scan the first 45s of the audio file to find when loud vocals/beat actually start
+        if let file = try? AVAudioFile(forReading: track.fileURL) {
+            let sr = file.processingFormat.sampleRate
+            let maxScanFrames = AVAudioFrameCount(min(Double(file.length), sr * 45.0))
+            if maxScanFrames > 4096,
+               let buf = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: maxScanFrames) {
+                try? file.read(into: buf, frameCount: maxScanFrames)
+                if let channelData = buf.floatChannelData?[0] {
+                    let windowSize = Int(sr * 0.25) // 250ms windows
+                    var rmsWindows: [Float] = []
+                    var pos = 0
+                    let total = Int(buf.frameLength)
+                    while pos + windowSize < total {
+                        var sum: Float = 0
+                        for i in 0..<windowSize {
+                            let sample = channelData[pos + i]
+                            sum += sample * sample
+                        }
+                        rmsWindows.append(sqrt(sum / Float(windowSize)))
+                        pos += windowSize
+                    }
+                    if let peakRMS = rmsWindows.max(), peakRMS > 0.02 {
+                        // Find first sustained high-energy window (beat/vocal drop)
+                        let threshold = peakRMS * 0.42
+                        if let onsetWindow = rmsWindows.firstIndex(where: { $0 >= threshold }) {
+                            let acousticStartSec = Double(onsetWindow) * 0.25
+                            // If acoustic drop happens significantly later than LRC's first line
+                            if acousticStartSec - firstLineTime >= 3.5 && acousticStartSec - firstLineTime <= 40.0 {
+                                return acousticStartSec - firstLineTime
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return 0.0
+    }
+
+    static func activeLineIndex(in lines: [LyricLine], currentTime: Double, duration: Double, autoOffset: Double) -> Int? {
         guard !lines.isEmpty else { return nil }
-        // Positive offset means the song has a longer intro than the lyrics (delays lyrics by offsetSeconds)
-        let adjustedTime = max(0, currentTime - offsetSeconds)
+        let adjustedTime = max(0, currentTime - autoOffset)
 
         if lines.contains(where: { $0.time != nil }) {
             var lastMatch: Int? = nil
             for (i, line) in lines.enumerated() {
-                if let t = line.time, t <= adjustedTime + 0.15 {
+                if let t = line.time, t <= adjustedTime + 0.12 {
                     lastMatch = i
                 }
             }
@@ -391,7 +484,22 @@ final class LyricsManager {
         }
     }
 
-    func fetchOnlineLyrics(title: String, artist: String) async -> String? {
+    /// Calculates which word (0..<words.count) is currently being sung inside the active line
+    static func activeWordProgress(in line: LyricLine, currentTime: Double, autoOffset: Double) -> Int {
+        guard !line.words.isEmpty else { return 0 }
+        let adjusted = max(0, currentTime - autoOffset)
+        guard let start = line.time, let end = line.endTime, end > start else {
+            return line.words.count
+        }
+        // Estimate vocal duration as 85% of the interval to the next line so the last word finishes cleanly
+        let vocalSpan = max(0.4, (end - start) * 0.85)
+        let elapsed = max(0, adjusted - start)
+        let progress = min(1.0, elapsed / vocalSpan)
+        return min(line.words.count - 1, Int(progress * Double(line.words.count)))
+    }
+
+    /// Queries LRCLIB and picks the exact version whose duration is closest to your local audio file!
+    func fetchVersionMatchedLyrics(title: String, artist: String, targetDuration: Double) async -> (lyrics: String, matchedDuration: Double?)? {
         let cleanTitle = title
             .replacingOccurrences(of: "(highest quality)", with: "", options: .caseInsensitive)
             .replacingOccurrences(of: "(Official Audio)", with: "", options: .caseInsensitive)
@@ -412,16 +520,28 @@ final class LyricsManager {
 
         do {
             var req = URLRequest(url: url)
-            req.setValue("MusiQ iOS Player v2.5", forHTTPHeaderField: "User-Agent")
+            req.setValue("MusiQ iOS Player v3.0", forHTTPHeaderField: "User-Agent")
             let (data, _) = try await URLSession.shared.data(for: req)
             if let results = try JSONSerialization.jsonObject(with: data) as? [[String: Any]],
                !results.isEmpty {
-                if let syncedMatch = results.first(where: { ($0["syncedLyrics"] as? String)?.isEmpty == false }),
-                   let synced = syncedMatch["syncedLyrics"] as? String {
-                    return synced
+
+                // Filter to candidates with syncedLyrics first, then sort by closest duration to our audio file!
+                let syncedCandidates = results.filter { ($0["syncedLyrics"] as? String)?.isEmpty == false }
+                if !syncedCandidates.isEmpty {
+                    let bestMatch = syncedCandidates.min { a, b in
+                        let durA = (a["duration"] as? Double) ?? 0
+                        let durB = (b["duration"] as? Double) ?? 0
+                        return abs(durA - targetDuration) < abs(durB - targetDuration)
+                    }
+                    if let match = bestMatch, let synced = match["syncedLyrics"] as? String {
+                        let mDur = match["duration"] as? Double
+                        return (synced, mDur)
+                    }
                 }
+
                 if let plain = results.first?["plainLyrics"] as? String, !plain.isEmpty {
-                    return plain
+                    let mDur = results.first?["duration"] as? Double
+                    return (plain, mDur)
                 }
             }
         } catch {
@@ -438,7 +558,7 @@ final class PlaybackProgressObserver: ObservableObject {
     var isScrubbing: Bool = false
 }
 
-// MARK: - High-Performance Audio Engine (Sample-Rate Safe & Interruption Proof)
+// MARK: - Crash-Proof, Sample-Rate Resampling Audio Engine
 final class MusiQEngine: ObservableObject {
     @Published var allTracks: [Track] = []
     @Published var playlists: [Playlist] = []
@@ -455,8 +575,12 @@ final class MusiQEngine: ObservableObject {
     @Published var artworkRefreshID: UUID = UUID()
     @Published var playbackErrorMessage: String? = nil
 
+    // Controls directional slide animation when skipping Next (+1) or Previous (-1)
+    @Published var skipTransitionDirection: Int = 1
+    @Published var trackTransitionID: UUID = UUID()
+
     @Published var currentTrackLyrics: [LyricLine] = []
-    @Published var currentTrackLyricOffset: Double = 0.0
+    @Published var autoDetectedLyricOffset: Double = 0.0
     @Published var isFetchingLyricsInBackground: Bool = false
 
     @Published var listenedSecondsByFile: [String: Double] = [:]
@@ -471,7 +595,11 @@ final class MusiQEngine: ObservableObject {
     private let timePitchNode = AVAudioUnitTimePitch()
     private let eqNode = AVAudioUnitEQ(numberOfBands: 3)
 
+    // Fixed internal graph format (44.1kHz Stereo Float32) — never disconnects while running!
+    private let graphFormat = AVAudioFormat(standardFormatWithSampleRate: 44100, channels: 2)!
+
     private var activeAudioFile: AVAudioFile?
+    private var activeConvertedBuffer: AVAudioPCMBuffer?
     private var seekFrameOffset: AVAudioFramePosition = 0
     private var sampleRate: Double = 44100
     private var totalFrames: AVAudioFramePosition = 0
@@ -529,18 +657,19 @@ final class MusiQEngine: ObservableObject {
         bands[2].gain = 0
         bands[2].bypass = false
 
-        engine.connect(playerNode, to: timePitchNode, format: nil)
-        engine.connect(timePitchNode, to: eqNode, format: nil)
-        engine.connect(eqNode, to: engine.mainMixerNode, format: nil)
+        // Connect once using standard stereo format — prevents any runtime graph disconnect crashes!
+        engine.connect(playerNode, to: timePitchNode, format: graphFormat)
+        engine.connect(timePitchNode, to: eqNode, format: graphFormat)
+        engine.connect(eqNode, to: engine.mainMixerNode, format: graphFormat)
 
         do {
+            engine.prepare()
             try engine.start()
         } catch {
             print("Engine start error: \(error)")
         }
     }
 
-    // MARK: - Fix for PiP / Background App Audio Interruption Desync
     private func registerAudioInterruptionObservers() {
         NotificationCenter.default.addObserver(
             forName: AVAudioSession.interruptionNotification,
@@ -554,7 +683,6 @@ final class MusiQEngine: ObservableObject {
 
             switch type {
             case .began:
-                // External video/PiP/call took over audio: immediately sync UI to paused state!
                 self.captureCurrentPlaybackPosition()
                 self.playerNode.pause()
                 self.isPlaying = false
@@ -598,7 +726,6 @@ final class MusiQEngine: ObservableObject {
             queue: .main
         ) { [weak self] _ in
             guard let self = self else { return }
-            // If hardware sample rate or route changed while backgrounded, sync state cleanly
             if !self.engine.isRunning && self.isPlaying {
                 self.captureCurrentPlaybackPosition()
                 self.isPlaying = false
@@ -620,38 +747,54 @@ final class MusiQEngine: ObservableObject {
 
     private func resumeAfterInterruption() {
         try? AVAudioSession.sharedInstance().setActive(true)
-        seek(to: progress.currentTime)
         if !engine.isRunning {
             try? engine.start()
         }
+        seek(to: progress.currentTime)
         playerNode.play()
         isPlaying = true
         startProgressTimer()
         updateNowPlayingInfo()
     }
 
-    // MARK: - Live Synced Lyrics & Offset Loader
+    // MARK: - Automatic Version-Aware Lyrics Loader
     func reloadLyricsForCurrentTrack() {
         guard let track = currentTrack else {
             currentTrackLyrics = []
-            currentTrackLyricOffset = 0
+            autoDetectedLyricOffset = 0
             return
         }
-        currentTrackLyricOffset = LyricsManager.shared.getOffset(for: track.fileName)
         let saved = LyricsManager.shared.getLyrics(for: track)
         if !saved.isEmpty {
-            currentTrackLyrics = LyricsManager.shared.parseLyrics(saved)
+            let parsed = LyricsManager.shared.parseLyrics(saved, trackDuration: track.duration)
+            currentTrackLyrics = parsed
+            autoDetectedLyricOffset = LyricsManager.shared.computeAutoVersionOffset(
+                for: track,
+                parsedLines: parsed,
+                lrcSourceDuration: nil
+            )
         } else {
             currentTrackLyrics = []
+            autoDetectedLyricOffset = 0
             isFetchingLyricsInBackground = true
             let requestedFile = track.fileName
             Task {
-                if let fetched = await LyricsManager.shared.fetchOnlineLyrics(title: track.title, artist: track.artist) {
-                    LyricsManager.shared.saveLyrics(fetched, for: track)
-                    let parsed = LyricsManager.shared.parseLyrics(fetched)
+                if let result = await LyricsManager.shared.fetchVersionMatchedLyrics(
+                    title: track.title,
+                    artist: track.artist,
+                    targetDuration: track.duration
+                ) {
+                    LyricsManager.shared.saveLyrics(result.lyrics, for: track)
+                    let parsed = LyricsManager.shared.parseLyrics(result.lyrics, trackDuration: track.duration)
+                    let computedOffset = LyricsManager.shared.computeAutoVersionOffset(
+                        for: track,
+                        parsedLines: parsed,
+                        lrcSourceDuration: result.matchedDuration
+                    )
                     await MainActor.run {
                         if self.currentTrack?.fileName == requestedFile {
                             self.currentTrackLyrics = parsed
+                            self.autoDetectedLyricOffset = computedOffset
                         }
                         self.isFetchingLyricsInBackground = false
                     }
@@ -662,16 +805,6 @@ final class MusiQEngine: ObservableObject {
                 }
             }
         }
-    }
-
-    func adjustLyricOffset(by delta: Double) {
-        guard let track = currentTrack else { return }
-        if delta == 0 {
-            currentTrackLyricOffset = 0
-        } else {
-            currentTrackLyricOffset = (currentTrackLyricOffset + delta * 10).rounded() / 10
-        }
-        LyricsManager.shared.saveOffset(currentTrackLyricOffset, for: track.fileName)
     }
 
     private func loadListeningStats() {
@@ -771,6 +904,7 @@ final class MusiQEngine: ObservableObject {
         if currentTrack?.fileName == track.fileName {
             playerNode.stop()
             activeAudioFile = nil
+            activeConvertedBuffer = nil
             isPlaying = false
         }
         try? FileManager.default.removeItem(at: track.fileURL)
@@ -855,6 +989,7 @@ final class MusiQEngine: ObservableObject {
         }
     }
 
+    // MARK: - Crash-Free Playback & Sample-Rate Resampling
     func playTrack(_ track: Track, in queue: [Track]) {
         let validQueue = queue.isEmpty ? allTracks : queue
         currentQueue = validQueue
@@ -864,18 +999,21 @@ final class MusiQEngine: ObservableObject {
             currentQueue.insert(track, at: 0)
             currentIndex = 0
         }
+        skipTransitionDirection = 1
+        withAnimation(.spring(response: 0.42, dampingFraction: 0.82)) {
+            trackTransitionID = UUID()
+        }
         loadAndScheduleCurrentTrack(startFrame: 0, autoPlay: true)
     }
 
-    // MARK: - Sample-Rate Matched Scheduling (Fixes 48kHz / 44.1kHz Pitch & Slowdown Bug!)
     private func loadAndScheduleCurrentTrack(startFrame: AVAudioFramePosition, autoPlay: Bool) {
         guard let track = currentTrack else { return }
         scheduleGeneration += 1
         let currentGen = scheduleGeneration
 
         playerNode.stop()
-        playerNode.reset()
         activeAudioFile = nil
+        activeConvertedBuffer = nil
         isPlaying = false
         playbackErrorMessage = nil
         loopStart = nil
@@ -888,51 +1026,40 @@ final class MusiQEngine: ObservableObject {
             try AVAudioSession.sharedInstance().setActive(true)
             let file = try AVAudioFile(forReading: track.fileURL)
             activeAudioFile = file
-            let fileFormat = file.processingFormat
-            sampleRate = fileFormat.sampleRate
-            totalFrames = file.length
-            seekFrameOffset = max(0, min(startFrame, totalFrames))
 
-            let remainingFrames = AVAudioFrameCount(max(0, totalFrames - seekFrameOffset))
-            guard remainingFrames > 0 else {
-                playbackErrorMessage = "Audio file is empty or corrupted."
-                return
-            }
-
-            progress.duration = max(1, Double(totalFrames) / sampleRate)
-            progress.currentTime = Double(seekFrameOffset) / sampleRate
-
-            // Connect the entire DSP chain using the file's exact sample rate & channel layout
-            // so mainMixerNode handles 48kHz -> 44.1kHz conversion without pitching down!
-            engine.disconnectNodeOutput(playerNode)
-            engine.disconnectNodeOutput(timePitchNode)
-            engine.disconnectNodeOutput(eqNode)
-
-            engine.connect(playerNode, to: timePitchNode, format: fileFormat)
-            engine.connect(timePitchNode, to: eqNode, format: fileFormat)
-            engine.connect(eqNode, to: engine.mainMixerNode, format: fileFormat)
-
-            timePitchNode.pitch = pitchCents
-            timePitchNode.rate = playbackRate
+            let srcFormat = file.processingFormat
+            let fileDuration = Double(file.length) / max(srcFormat.sampleRate, 1)
+            progress.duration = max(1, fileDuration)
 
             if !engine.isRunning {
                 engine.prepare()
                 try engine.start()
             }
 
-            playerNode.scheduleSegment(
-                file,
-                startingFrame: seekFrameOffset,
-                frameCount: remainingFrames,
-                at: nil
-            ) { [weak self] in
-                DispatchQueue.main.async {
-                    guard let self = self, self.scheduleGeneration == currentGen else { return }
-                    if self.isPlaying {
-                        self.handleTrackCompletion()
-                    }
+            // If file sample rate or channel count differs from 44.1kHz Stereo, resample cleanly into a PCM buffer
+            // so we NEVER disconnect AVAudioEngine nodes at runtime (eliminates Search crash & 48kHz pitch bug!)
+            if abs(srcFormat.sampleRate - graphFormat.sampleRate) > 1.0 || srcFormat.channelCount != graphFormat.channelCount {
+                sampleRate = graphFormat.sampleRate
+                if let converted = resampleFileToGraphFormat(file: file) {
+                    activeConvertedBuffer = converted
+                    totalFrames = AVAudioFramePosition(converted.frameLength)
+                    seekFrameOffset = max(0, min(startFrame, totalFrames))
+                    scheduleSubBuffer(from: converted, startFrame: seekFrameOffset, generation: currentGen)
+                } else {
+                    // Fallback to direct scheduling if buffer allocation is too large
+                    sampleRate = srcFormat.sampleRate
+                    totalFrames = file.length
+                    seekFrameOffset = max(0, min(startFrame, totalFrames))
+                    scheduleFileDirect(file: file, startFrame: seekFrameOffset, generation: currentGen)
                 }
+            } else {
+                sampleRate = srcFormat.sampleRate
+                totalFrames = file.length
+                seekFrameOffset = max(0, min(startFrame, totalFrames))
+                scheduleFileDirect(file: file, startFrame: seekFrameOffset, generation: currentGen)
             }
+
+            progress.currentTime = Double(seekFrameOffset) / sampleRate
 
             if autoPlay {
                 playerNode.play()
@@ -948,13 +1075,86 @@ final class MusiQEngine: ObservableObject {
         }
     }
 
+    private func resampleFileToGraphFormat(file: AVAudioFile) -> AVAudioPCMBuffer? {
+        let srcFormat = file.processingFormat
+        guard let converter = AVAudioConverter(from: srcFormat, to: graphFormat) else { return nil }
+
+        let ratio = graphFormat.sampleRate / srcFormat.sampleRate
+        let outFrameCap = AVAudioFrameCount(Double(file.length) * ratio) + 1024
+        guard let outBuffer = AVAudioPCMBuffer(pcmFormat: graphFormat, frameCapacity: outFrameCap) else { return nil }
+
+        file.framePosition = 0
+        let inputChunk: AVAudioFrameCount = 32768
+        guard let inBuffer = AVAudioPCMBuffer(pcmFormat: srcFormat, frameCapacity: inputChunk) else { return nil }
+
+        var error: NSError?
+        converter.convert(to: outBuffer, error: &error) { _, outStatus in
+            do {
+                try file.read(into: inBuffer, frameCount: inputChunk)
+                if inBuffer.frameLength == 0 {
+                    outStatus.pointee = .endOfStream
+                    return nil
+                }
+                outStatus.pointee = .haveData
+                return inBuffer
+            } catch {
+                outStatus.pointee = .endOfStream
+                return nil
+            }
+        }
+        return outBuffer.frameLength > 0 ? outBuffer : nil
+    }
+
+    private func scheduleSubBuffer(from fullBuffer: AVAudioPCMBuffer, startFrame: AVAudioFramePosition, generation: Int) {
+        let total = AVAudioFramePosition(fullBuffer.frameLength)
+        let clampedStart = max(0, min(startFrame, total - 1))
+        let count = AVAudioFrameCount(max(0, total - clampedStart))
+        guard count > 0,
+              let sub = AVAudioPCMBuffer(pcmFormat: graphFormat, frameCapacity: count) else { return }
+        sub.frameLength = count
+
+        let channels = Int(graphFormat.channelCount)
+        for ch in 0..<channels {
+            if let srcPtr = fullBuffer.floatChannelData?[ch],
+               let dstPtr = sub.floatChannelData?[ch] {
+                dstPtr.update(from: srcPtr.advanced(by: Int(clampedStart)), count: Int(count))
+            }
+        }
+
+        playerNode.scheduleBuffer(sub, at: nil, options: []) { [weak self] in
+            DispatchQueue.main.async {
+                guard let self = self, self.scheduleGeneration == generation else { return }
+                if self.isPlaying {
+                    self.handleTrackCompletion()
+                }
+            }
+        }
+    }
+
+    private func scheduleFileDirect(file: AVAudioFile, startFrame: AVAudioFramePosition, generation: Int) {
+        let remainingFrames = AVAudioFrameCount(max(0, file.length - startFrame))
+        guard remainingFrames > 0 else { return }
+        playerNode.scheduleSegment(
+            file,
+            startingFrame: startFrame,
+            frameCount: remainingFrames,
+            at: nil
+        ) { [weak self] in
+            DispatchQueue.main.async {
+                guard let self = self, self.scheduleGeneration == generation else { return }
+                if self.isPlaying {
+                    self.handleTrackCompletion()
+                }
+            }
+        }
+    }
+
     func togglePlayPause() {
         if activeAudioFile == nil, let current = currentTrack ?? allTracks.first {
             playTrack(current, in: currentQueue.isEmpty ? allTracks : currentQueue)
             return
         }
 
-        // If engine stopped in background due to PiP/System interruption, treat as paused and resume cleanly
         if isPlaying && (!engine.isRunning || !playerNode.isPlaying) {
             isPlaying = false
         }
@@ -988,25 +1188,14 @@ final class MusiQEngine: ObservableObject {
         let currentGen = scheduleGeneration
 
         playerNode.stop()
-        let remaining = AVAudioFrameCount(max(0, totalFrames - clampedFrame))
-        guard remaining > 0 else { return }
-
         if !engine.isRunning {
             try? engine.start()
         }
 
-        playerNode.scheduleSegment(
-            file,
-            startingFrame: clampedFrame,
-            frameCount: remaining,
-            at: nil
-        ) { [weak self] in
-            DispatchQueue.main.async {
-                guard let self = self, self.scheduleGeneration == currentGen else { return }
-                if self.isPlaying {
-                    self.handleTrackCompletion()
-                }
-            }
+        if let converted = activeConvertedBuffer {
+            scheduleSubBuffer(from: converted, startFrame: clampedFrame, generation: currentGen)
+        } else {
+            scheduleFileDirect(file: file, startFrame: clampedFrame, generation: currentGen)
         }
 
         if isPlaying {
@@ -1018,10 +1207,14 @@ final class MusiQEngine: ObservableObject {
 
     func nextTrack() {
         guard !currentQueue.isEmpty else { return }
+        skipTransitionDirection = 1
         if isShuffle && currentQueue.count > 1 {
             currentIndex = Int.random(in: 0..<currentQueue.count)
         } else {
             currentIndex = (currentIndex + 1) % currentQueue.count
+        }
+        withAnimation(.spring(response: 0.44, dampingFraction: 0.82)) {
+            trackTransitionID = UUID()
         }
         loadAndScheduleCurrentTrack(startFrame: 0, autoPlay: isPlaying)
     }
@@ -1032,7 +1225,11 @@ final class MusiQEngine: ObservableObject {
             seek(to: 0)
             return
         }
+        skipTransitionDirection = -1
         currentIndex = (currentIndex - 1 + currentQueue.count) % currentQueue.count
+        withAnimation(.spring(response: 0.44, dampingFraction: 0.82)) {
+            trackTransitionID = UUID()
+        }
         loadAndScheduleCurrentTrack(startFrame: 0, autoPlay: isPlaying)
     }
 
@@ -1086,10 +1283,9 @@ final class MusiQEngine: ObservableObject {
 
     private func startProgressTimer() {
         stopProgressTimer()
-        progressTimer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: true) { [weak self] _ in
+        progressTimer = Timer.scheduledTimer(withTimeInterval: 0.12, repeats: true) { [weak self] _ in
             guard let self = self, self.isPlaying, self.activeAudioFile != nil else { return }
 
-            // Auto-detect if iOS paused the engine externally without firing an interruption
             if !self.engine.isRunning || !self.playerNode.isPlaying {
                 self.isPlaying = false
                 self.stopProgressTimer()
@@ -1098,9 +1294,9 @@ final class MusiQEngine: ObservableObject {
             }
 
             if let activeFile = self.currentTrack?.fileName {
-                self.listenedSecondsByFile[activeFile, default: 0] += 0.15
+                self.listenedSecondsByFile[activeFile, default: 0] += 0.12
                 self.tickCounter += 1
-                if self.tickCounter % 25 == 0 {
+                if self.tickCounter % 30 == 0 {
                     self.saveListeningStats()
                 }
             }
@@ -1163,7 +1359,7 @@ final class MusiQEngine: ObservableObject {
     }
 }
 
-// MARK: - Continuous 60fps Spinning Disc Modifier
+// MARK: - Continuous 60fps Spinning Disc / Reel Modifier
 struct ContinuousSpinView<Content: View>: View {
     let isSpinning: Bool
     let rpm: Double
@@ -1274,11 +1470,11 @@ struct LoopingMarqueeText: View {
     }
 }
 
-// MARK: - Polished In-Player Synced Lyric Line (Balanced Between Artist & Scrubber)
-struct PolishedInlineLyricView: View {
+// MARK: - Word-by-Word Karaoke Highlighted Inline Lyric View
+struct WordByWordInlineLyricView: View {
     @ObservedObject var progress: PlaybackProgressObserver
     let lines: [LyricLine]
-    let offsetSeconds: Double
+    let autoOffset: Double
     let isFetching: Bool
     let onTap: () -> Void
 
@@ -1287,7 +1483,7 @@ struct PolishedInlineLyricView: View {
             in: lines,
             currentTime: progress.currentTime,
             duration: progress.duration,
-            offsetSeconds: offsetSeconds
+            autoOffset: autoOffset
         )
     }
 
@@ -1295,13 +1491,18 @@ struct PolishedInlineLyricView: View {
         Button(action: onTap) {
             ZStack {
                 if let idx = activeIndex {
-                    let currentLine = lines[idx].text
-                    Text(currentLine)
-                        .font(.system(size: 16, weight: .bold, design: .rounded))
-                        .foregroundColor(.white.opacity(0.95))
-                        .shadow(color: .black.opacity(0.35), radius: 4, x: 0, y: 2)
+                    let activeLine = lines[idx]
+                    let activeWordIdx = LyricsManager.activeWordProgress(
+                        in: activeLine,
+                        currentTime: progress.currentTime,
+                        autoOffset: autoOffset
+                    )
+
+                    buildKaraokeAttributedText(line: activeLine, activeWordIndex: activeWordIdx)
+                        .font(.system(size: 17, weight: .bold, design: .rounded))
+                        .shadow(color: .white.opacity(0.28), radius: 5, x: 0, y: 0)
                         .lineLimit(1)
-                        .minimumScaleFactor(0.75)
+                        .minimumScaleFactor(0.72)
                         .multilineTextAlignment(.center)
                         .frame(maxWidth: .infinity, alignment: .center)
                         .id("inline_lyric_\(idx)")
@@ -1311,9 +1512,9 @@ struct PolishedInlineLyricView: View {
                                 removal: .move(edge: .top).combined(with: .opacity)
                             )
                         )
-                        .animation(.spring(response: 0.32, dampingFraction: 0.85), value: idx)
+                        .animation(.spring(response: 0.30, dampingFraction: 0.84), value: idx)
                 } else if isFetching {
-                    Text("Syncing lyrics...")
+                    Text("Matching song version & syncing lyrics...")
                         .font(.system(size: 13, weight: .medium, design: .rounded))
                         .foregroundColor(.white.opacity(0.45))
                 } else {
@@ -1326,14 +1527,26 @@ struct PolishedInlineLyricView: View {
                     .foregroundColor(.white.opacity(0.32))
                 }
             }
-            .frame(height: 30)
+            .frame(height: 32)
             .padding(.horizontal, 12)
         }
         .buttonStyle(.plain)
     }
+
+    private func buildKaraokeAttributedText(line: LyricLine, activeWordIndex: Int) -> Text {
+        var combined = Text("")
+        for (wIdx, word) in line.words.enumerated() {
+            let space = (wIdx == line.words.count - 1) ? "" : " "
+            let isSungOrCurrent = wIdx <= activeWordIndex
+            let piece = Text(word + space)
+                .foregroundColor(isSungOrCurrent ? .white : .white.opacity(0.38))
+            combined = combined + piece
+        }
+        return combined
+    }
 }
 
-// MARK: - Apple Music-Style Blurred Scrolling Lyrics Sheet + Intro Sync Offset Calibration
+// MARK: - Apple Music-Style Blurred Scrolling Lyrics Sheet (With Word-by-Word Active Line)
 struct AppleMusicLyricsSheetView: View {
     @ObservedObject var engine: MusiQEngine
     @ObservedObject var progress: PlaybackProgressObserver
@@ -1349,7 +1562,7 @@ struct AppleMusicLyricsSheetView: View {
             in: engine.currentTrackLyrics,
             currentTime: progress.currentTime,
             duration: progress.duration,
-            offsetSeconds: engine.currentTrackLyricOffset
+            autoOffset: engine.autoDetectedLyricOffset
         )
     }
 
@@ -1366,7 +1579,7 @@ struct AppleMusicLyricsSheetView: View {
             )
             .ignoresSafeArea()
 
-            Color.black.opacity(0.30)
+            Color.black.opacity(0.32)
                 .ignoresSafeArea()
 
             VStack(spacing: 0) {
@@ -1376,19 +1589,19 @@ struct AppleMusicLyricsSheetView: View {
                     .padding(.top, 10)
                     .padding(.bottom, 12)
 
-                // Compact Top Header
+                // Top Header
                 HStack(spacing: 14) {
                     if let art = ArtworkCache.shared.artwork(for: track.fileName) {
                         Image(uiImage: art)
                             .resizable()
                             .scaledToFill()
-                            .frame(width: 50, height: 50)
+                            .frame(width: 52, height: 52)
                             .clipShape(RoundedRectangle(cornerRadius: 10))
                             .shadow(color: .black.opacity(0.4), radius: 6, x: 0, y: 3)
                     } else {
                         RoundedRectangle(cornerRadius: 10)
                             .fill(Color.white.opacity(0.15))
-                            .frame(width: 50, height: 50)
+                            .frame(width: 52, height: 52)
                             .overlay(Image(systemName: "music.note").foregroundColor(.white))
                     }
 
@@ -1409,7 +1622,7 @@ struct AppleMusicLyricsSheetView: View {
                         Button {
                             autoFetchSynced()
                         } label: {
-                            Label("Auto-Fetch Synced Lyrics", systemImage: "sparkles")
+                            Label("Re-Match Song Version Lyrics", systemImage: "sparkles")
                         }
 
                         Button {
@@ -1436,64 +1649,7 @@ struct AppleMusicLyricsSheetView: View {
                     }
                 }
                 .padding(.horizontal, 24)
-                .padding(.bottom, 10)
-
-                // Per-Song Intro Timing Offset Calibrator (Fixes Video Intro Delays like Through The Wire!)
-                HStack(spacing: 10) {
-                    Image(systemName: "timer")
-                        .font(.caption)
-                        .foregroundColor(.white.opacity(0.7))
-
-                    Text(offsetLabel)
-                        .font(.caption.monospacedDigit().weight(.semibold))
-                        .foregroundColor(.white.opacity(0.88))
-
-                    Spacer()
-
-                    Button {
-                        engine.adjustLyricOffset(by: -0.5)
-                    } label: {
-                        Text("-0.5s")
-                            .font(.caption2.weight(.bold))
-                            .padding(.horizontal, 9)
-                            .padding(.vertical, 5)
-                            .background(Color.white.opacity(0.15))
-                            .clipShape(Capsule())
-                            .foregroundColor(.white)
-                    }
-
-                    if abs(engine.currentTrackLyricOffset) > 0.05 {
-                        Button {
-                            engine.adjustLyricOffset(by: 0)
-                        } label: {
-                            Text("Reset")
-                                .font(.caption2.weight(.semibold))
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 5)
-                                .background(Color.purple.opacity(0.55))
-                                .clipShape(Capsule())
-                                .foregroundColor(.white)
-                        }
-                    }
-
-                    Button {
-                        engine.adjustLyricOffset(by: 0.5)
-                    } label: {
-                        Text("+0.5s")
-                            .font(.caption2.weight(.bold))
-                            .padding(.horizontal, 9)
-                            .padding(.vertical, 5)
-                            .background(Color.white.opacity(0.15))
-                            .clipShape(Capsule())
-                            .foregroundColor(.white)
-                    }
-                }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 7)
-                .background(Color.black.opacity(0.24))
-                .clipShape(RoundedRectangle(cornerRadius: 12))
-                .padding(.horizontal, 24)
-                .padding(.bottom, 8)
+                .padding(.bottom, 12)
 
                 if showRawEditor {
                     VStack(spacing: 12) {
@@ -1533,7 +1689,7 @@ struct AppleMusicLyricsSheetView: View {
                             if isFetchingOnline || engine.isFetchingLyricsInBackground {
                                 ProgressView()
                                     .tint(.white)
-                                Text("Searching synced lyrics...")
+                                Text("Detecting track version & syncing lyrics...")
                                     .font(.subheadline)
                                     .foregroundColor(.white.opacity(0.7))
                             } else {
@@ -1547,7 +1703,7 @@ struct AppleMusicLyricsSheetView: View {
                                     Button {
                                         autoFetchSynced()
                                     } label: {
-                                        Label("Retry Auto-Fetch", systemImage: "sparkles")
+                                        Label("Auto-Match Version", systemImage: "sparkles")
                                             .font(.subheadline.weight(.semibold))
                                             .padding(.horizontal, 16)
                                             .padding(.vertical, 10)
@@ -1585,21 +1741,34 @@ struct AppleMusicLyricsSheetView: View {
 
                                         Button {
                                             if let t = line.time {
-                                                let seekTarget = max(0, t + engine.currentTrackLyricOffset)
+                                                let seekTarget = max(0, t + engine.autoDetectedLyricOffset)
                                                 engine.seek(to: seekTarget)
                                             }
                                         } label: {
-                                            Text(line.text)
-                                                .font(.system(size: isCurrent ? 29 : 25, weight: .bold, design: .rounded))
-                                                .foregroundColor(.white.opacity(isCurrent ? 1.0 : max(0.22, 0.50 - Double(distance) * 0.08)))
-                                                .blur(radius: isCurrent ? 0 : min(CGFloat(distance) * 1.35, 4.8))
-                                                .scaleEffect(isCurrent ? 1.0 : 0.96, anchor: .leading)
-                                                .multilineTextAlignment(.leading)
-                                                .frame(maxWidth: .infinity, alignment: .leading)
-                                                .animation(.spring(response: 0.36, dampingFraction: 0.84), value: currentIdx)
+                                            if isCurrent {
+                                                let activeWordIdx = LyricsManager.activeWordProgress(
+                                                    in: line,
+                                                    currentTime: progress.currentTime,
+                                                    autoOffset: engine.autoDetectedLyricOffset
+                                                )
+                                                buildKaraokeSheetLine(line: line, activeWordIndex: activeWordIdx)
+                                                    .font(.system(size: 29, weight: .bold, design: .rounded))
+                                                    .shadow(color: .white.opacity(0.25), radius: 8, x: 0, y: 0)
+                                                    .multilineTextAlignment(.leading)
+                                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                            } else {
+                                                Text(line.text)
+                                                    .font(.system(size: 25, weight: .bold, design: .rounded))
+                                                    .foregroundColor(.white.opacity(max(0.22, 0.48 - Double(distance) * 0.08)))
+                                                    .blur(radius: min(CGFloat(distance) * 1.35, 4.8))
+                                                    .scaleEffect(0.96, anchor: .leading)
+                                                    .multilineTextAlignment(.leading)
+                                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                            }
                                         }
                                         .buttonStyle(.plain)
                                         .id(line.index)
+                                        .animation(.spring(response: 0.36, dampingFraction: 0.84), value: currentIdx)
                                     }
 
                                     Spacer().frame(height: 150)
@@ -1672,23 +1841,27 @@ struct AppleMusicLyricsSheetView: View {
         }
     }
 
-    private var offsetLabel: String {
-        let val = engine.currentTrackLyricOffset
-        if abs(val) < 0.05 {
-            return "Intro Sync: 0.0s"
-        } else if val > 0 {
-            return String(format: "Intro Delay: +%.1fs", val)
-        } else {
-            return String(format: "Intro Early: %.1fs", val)
+    private func buildKaraokeSheetLine(line: LyricLine, activeWordIndex: Int) -> Text {
+        var combined = Text("")
+        for (wIdx, word) in line.words.enumerated() {
+            let space = (wIdx == line.words.count - 1) ? "" : " "
+            let isSung = wIdx <= activeWordIndex
+            combined = combined + Text(word + space)
+                .foregroundColor(isSung ? .white : .white.opacity(0.45))
         }
+        return combined
     }
 
     private func autoFetchSynced() {
         isFetchingOnline = true
         Task {
-            if let found = await LyricsManager.shared.fetchOnlineLyrics(title: track.title, artist: track.artist) {
+            if let res = await LyricsManager.shared.fetchVersionMatchedLyrics(
+                title: track.title,
+                artist: track.artist,
+                targetDuration: track.duration
+            ) {
                 await MainActor.run {
-                    LyricsManager.shared.saveLyrics(found, for: track)
+                    LyricsManager.shared.saveLyrics(res.lyrics, for: track)
                     engine.reloadLyricsForCurrentTrack()
                     isFetchingOnline = false
                 }
@@ -1701,7 +1874,7 @@ struct AppleMusicLyricsSheetView: View {
     }
 }
 
-// MARK: - Playlist Cover View (Supports Custom Photo OR 2x2 Album Art Collage!)
+// MARK: - Playlist Cover View (Supports Custom Photo OR 2x2 Album Art Collage)
 struct PlaylistArtworkThumbnailView: View {
     let playlist: Playlist
     let tracks: [Track]
@@ -1718,7 +1891,6 @@ struct PlaylistArtworkThumbnailView: View {
         } else {
             let covers = tracks.compactMap { ArtworkCache.shared.artwork(for: $0.fileName) }
             if covers.count >= 4 {
-                // Spotify-Style 2x2 Album Art Grid Collage
                 let half = size / 2.0
                 VStack(spacing: 0) {
                     HStack(spacing: 0) {
@@ -1845,25 +2017,25 @@ struct PlaylistsHomeView: View {
                         ForEach(engine.playlists) { playlist in
                             let pTracks = engine.tracks(for: playlist)
                             NavigationLink(destination: PlaylistDetailView(engine: engine, playlistID: playlist.id, showFullPlayer: $showFullPlayer)) {
-                                HStack(spacing: 14) {
+                                HStack(spacing: 16) {
                                     PlaylistArtworkThumbnailView(
                                         playlist: playlist,
                                         tracks: pTracks,
-                                        size: 56,
-                                        cornerRadius: 10
+                                        size: 64,
+                                        cornerRadius: 12
                                     )
                                     .shadow(color: .black.opacity(0.35), radius: 4, x: 0, y: 2)
 
-                                    VStack(alignment: .leading, spacing: 4) {
+                                    VStack(alignment: .leading, spacing: 5) {
                                         Text(playlist.name)
-                                            .font(.headline)
+                                            .font(.system(size: 18, weight: .bold))
                                             .foregroundColor(.white)
                                         Text("\(pTracks.count) songs")
-                                            .font(.caption)
+                                            .font(.subheadline)
                                             .foregroundColor(.secondary)
                                     }
                                 }
-                                .padding(.vertical, 4)
+                                .padding(.vertical, 6)
                             }
                             .listRowBackground(Color.white.opacity(0.05))
                         }
@@ -1905,7 +2077,7 @@ struct PlaylistsHomeView: View {
     }
 }
 
-// MARK: - Spotify-Inspired Playlist Detail View (Custom Art Header, Duration, Play/Shuffle & Search)
+// MARK: - Fixed & Polished Playlist Detail View (No Wrapped Button Text!)
 struct PlaylistDetailView: View {
     @ObservedObject var engine: MusiQEngine
     let playlistID: UUID
@@ -1941,30 +2113,31 @@ struct PlaylistDetailView: View {
             Color(red: 0.06, green: 0.06, blue: 0.08).ignoresSafeArea()
 
             List {
-                // Hero Header Section (Spotify-Inspired Cover + Metadata + Action Row)
+                // Fixed Hero Header Card
                 Section {
-                    VStack(alignment: .leading, spacing: 16) {
-                        HStack(alignment: .bottom, spacing: 18) {
+                    VStack(alignment: .leading, spacing: 18) {
+                        HStack(alignment: .center, spacing: 16) {
                             if let p = playlist {
                                 PlaylistArtworkThumbnailView(
                                     playlist: p,
                                     tracks: allPlaylistTracks,
-                                    size: 118,
-                                    cornerRadius: 12
+                                    size: 108,
+                                    cornerRadius: 14
                                 )
-                                .shadow(color: .black.opacity(0.55), radius: 12, x: 0, y: 6)
+                                .shadow(color: .black.opacity(0.55), radius: 10, x: 0, y: 5)
                                 .onTapGesture {
                                     showEditPlaylistSheet = true
                                 }
                             }
 
                             VStack(alignment: .leading, spacing: 6) {
-                                Text("CUSTOM PLAYLIST")
+                                Text("PLAYLIST")
                                     .font(.system(size: 10, weight: .bold))
+                                    .tracking(1.2)
                                     .foregroundColor(.white.opacity(0.65))
 
                                 Text(playlist?.name ?? "Playlist")
-                                    .font(.system(size: 26, weight: .heavy, design: .rounded))
+                                    .font(.system(size: 24, weight: .heavy, design: .rounded))
                                     .foregroundColor(.white)
                                     .lineLimit(2)
 
@@ -1972,34 +2145,46 @@ struct PlaylistDetailView: View {
                                     .font(.caption.weight(.medium))
                                     .foregroundColor(.white.opacity(0.75))
                             }
-                            Spacer()
+                            Spacer(minLength: 0)
                         }
 
-                        // Action Buttons Row (Add Songs, Edit Cover & Name, Shuffle, Big Play Button)
-                        HStack(spacing: 12) {
+                        // Fixed Non-Wrapping Action Bar
+                        HStack(spacing: 10) {
                             Button {
                                 showSongPicker = true
                             } label: {
-                                Label("Add", systemImage: "plus")
-                                    .font(.caption.weight(.bold))
-                                    .padding(.horizontal, 14)
-                                    .padding(.vertical, 8)
-                                    .background(Color.white.opacity(0.14))
-                                    .foregroundColor(.white)
-                                    .clipShape(Capsule())
+                                HStack(spacing: 6) {
+                                    Image(systemName: "plus")
+                                        .font(.system(size: 13, weight: .bold))
+                                    Text("Add Songs")
+                                        .font(.system(size: 13, weight: .bold))
+                                        .lineLimit(1)
+                                }
+                                .fixedSize(horizontal: true, vertical: false)
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 10)
+                                .background(Color.white.opacity(0.15))
+                                .foregroundColor(.white)
+                                .clipShape(Capsule())
                             }
                             .buttonStyle(.plain)
 
                             Button {
                                 showEditPlaylistSheet = true
                             } label: {
-                                Label("Cover & Name", systemImage: "pencil")
-                                    .font(.caption.weight(.bold))
-                                    .padding(.horizontal, 14)
-                                    .padding(.vertical, 8)
-                                    .background(Color.white.opacity(0.14))
-                                    .foregroundColor(.white)
-                                    .clipShape(Capsule())
+                                HStack(spacing: 6) {
+                                    Image(systemName: "photo.on.rectangle")
+                                        .font(.system(size: 13, weight: .bold))
+                                    Text("Edit Cover")
+                                        .font(.system(size: 13, weight: .bold))
+                                        .lineLimit(1)
+                                }
+                                .fixedSize(horizontal: true, vertical: false)
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 10)
+                                .background(Color.white.opacity(0.15))
+                                .foregroundColor(.white)
+                                .clipShape(Capsule())
                             }
                             .buttonStyle(.plain)
 
@@ -2013,10 +2198,14 @@ struct PlaylistDetailView: View {
                                     showFullPlayer = true
                                 }
                             } label: {
-                                Image(systemName: "shuffle")
-                                    .font(.title3.weight(.semibold))
-                                    .foregroundColor(engine.isShuffle ? .purple : .white.opacity(0.8))
-                                    .frame(width: 40, height: 40)
+                                ZStack {
+                                    Circle()
+                                        .fill(Color.white.opacity(0.12))
+                                        .frame(width: 42, height: 42)
+                                    Image(systemName: "shuffle")
+                                        .font(.system(size: 16, weight: .bold))
+                                        .foregroundColor(engine.isShuffle ? .purple : .white)
+                                }
                             }
                             .buttonStyle(.plain)
 
@@ -2028,10 +2217,10 @@ struct PlaylistDetailView: View {
                                 ZStack {
                                     Circle()
                                         .fill(Color.purple)
-                                        .frame(width: 50, height: 50)
+                                        .frame(width: 48, height: 48)
                                         .shadow(color: .purple.opacity(0.45), radius: 8, x: 0, y: 4)
                                     Image(systemName: "play.fill")
-                                        .font(.title3.weight(.bold))
+                                        .font(.system(size: 19, weight: .bold))
                                         .foregroundColor(.white)
                                 }
                             }
@@ -2055,14 +2244,14 @@ struct PlaylistDetailView: View {
                             Text("No songs in this playlist yet.")
                                 .font(.subheadline)
                                 .foregroundColor(.secondary)
-                            Button("Tap '+ Add' above to pick songs") {
+                            Button("Tap '+ Add Songs' above to pick tracks") {
                                 showSongPicker = true
                             }
                             .font(.caption.weight(.bold))
                             .foregroundColor(.purple)
                         }
                         .frame(maxWidth: .infinity)
-                        .padding(.vertical, 20)
+                        .padding(.vertical, 24)
                         .listRowBackground(Color.clear)
                     } else {
                         ForEach(Array(tracks.enumerated()), id: \.element.id) { idx, track in
@@ -2216,19 +2405,13 @@ struct PlaylistEditorSheet: View {
     }
 }
 
-// MARK: - Tab 2: Global Searchable Songs & Artists Library
+// MARK: - Tab 2: Global Searchable Songs Library (Artist Filter Removed, Bigger Rows, Crash-Proof Search Play)
 struct AllSongsSearchView: View {
     @ObservedObject var engine: MusiQEngine
     @Binding var showFullPlayer: Bool
     @State private var searchText: String = ""
-    @State private var browseMode: BrowseMode = .songs
     @State private var showFileImporter: Bool = false
     @State private var trackToTag: Track? = nil
-
-    enum BrowseMode: String, CaseIterable {
-        case songs = "Songs"
-        case artists = "Artists"
-    }
 
     var filteredTracks: [Track] {
         if searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -2241,12 +2424,6 @@ struct AllSongsSearchView: View {
         }
     }
 
-    var groupedArtists: [(artist: String, tracks: [Track])] {
-        let grouped = Dictionary(grouping: filteredTracks) { $0.artist }
-        return grouped.map { (artist: $0.key, tracks: $0.value) }
-            .sorted { $0.artist.localizedCaseInsensitiveCompare($1.artist) == .orderedAscending }
-    }
-
     var body: some View {
         NavigationStack {
             ZStack {
@@ -2255,7 +2432,7 @@ struct AllSongsSearchView: View {
                 if engine.allTracks.isEmpty {
                     VStack(spacing: 14) {
                         Image(systemName: "waveform.circle")
-                            .font(.system(size: 52))
+                            .font(.system(size: 54))
                             .foregroundColor(.purple)
                         Text("No Songs Found")
                             .font(.headline)
@@ -2286,95 +2463,51 @@ struct AllSongsSearchView: View {
                         .padding(.top, 4)
                     }
                 } else {
-                    VStack(spacing: 0) {
-                        Picker("Browse Mode", selection: $browseMode) {
-                            ForEach(BrowseMode.allCases, id: \.self) { mode in
-                                Text(mode.rawValue).tag(mode)
+                    List {
+                        ForEach(filteredTracks) { track in
+                            TrackRowView(indexNumber: nil, track: track) {
+                                // Dismiss keyboard cleanly & play without mutating AVAudioEngine graph
+                                let snapshotQueue = filteredTracks
+                                engine.playTrack(track, in: snapshotQueue)
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                                    showFullPlayer = true
+                                }
                             }
+                            .contextMenu {
+                                Button {
+                                    trackToTag = track
+                                } label: {
+                                    Label("Edit Tags & Cover Art", systemImage: "tag.fill")
+                                }
+
+                                if !engine.playlists.isEmpty {
+                                    Menu("Add to Playlist") {
+                                        ForEach(engine.playlists) { playlist in
+                                            Button(playlist.name) {
+                                                engine.addTrack(track, to: playlist.id)
+                                            }
+                                        }
+                                    }
+                                }
+
+                                Button(role: .destructive) {
+                                    engine.deleteTrackFromDisk(track)
+                                } label: {
+                                    Label("Delete Song", systemImage: "trash")
+                                }
+                            }
+                            .listRowBackground(Color.white.opacity(0.04))
                         }
-                        .pickerStyle(.segmented)
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 8)
-
-                        if browseMode == .songs {
-                            List {
-                                ForEach(filteredTracks) { track in
-                                    TrackRowView(indexNumber: nil, track: track) {
-                                        engine.playTrack(track, in: filteredTracks)
-                                        showFullPlayer = true
-                                    }
-                                    .contextMenu {
-                                        Button {
-                                            trackToTag = track
-                                        } label: {
-                                            Label("Edit Tags & Cover Art", systemImage: "tag.fill")
-                                        }
-
-                                        if !engine.playlists.isEmpty {
-                                            Menu("Add to Playlist") {
-                                                ForEach(engine.playlists) { playlist in
-                                                    Button(playlist.name) {
-                                                        engine.addTrack(track, to: playlist.id)
-                                                    }
-                                                }
-                                            }
-                                        }
-
-                                        Button(role: .destructive) {
-                                            engine.deleteTrackFromDisk(track)
-                                        } label: {
-                                            Label("Delete Song", systemImage: "trash")
-                                        }
-                                    }
-                                    .listRowBackground(Color.white.opacity(0.04))
-                                }
-                                .onDelete { offsets in
-                                    offsets.map { filteredTracks[$0] }.forEach(engine.deleteTrackFromDisk)
-                                }
-                            }
-                            .scrollContentBackground(.hidden)
-                        } else {
-                            // Browse By Artist View
-                            List {
-                                ForEach(groupedArtists, id: \.artist) { group in
-                                    NavigationLink(destination: ArtistDetailSongsView(engine: engine, artistName: group.artist, tracks: group.tracks, showFullPlayer: $showFullPlayer)) {
-                                        HStack(spacing: 14) {
-                                            if let firstTrack = group.tracks.first,
-                                               let art = ArtworkCache.shared.artwork(for: firstTrack.fileName) {
-                                                Image(uiImage: art)
-                                                    .resizable()
-                                                    .scaledToFill()
-                                                    .frame(width: 50, height: 50)
-                                                    .clipShape(Circle())
-                                            } else {
-                                                Circle()
-                                                    .fill(Color.purple.opacity(0.3))
-                                                    .frame(width: 50, height: 50)
-                                                    .overlay(Image(systemName: "person.fill").foregroundColor(.white))
-                                            }
-
-                                            VStack(alignment: .leading, spacing: 3) {
-                                                Text(group.artist)
-                                                    .font(.headline)
-                                                    .foregroundColor(.white)
-                                                Text("\(group.tracks.count) songs")
-                                                    .font(.caption)
-                                                    .foregroundColor(.secondary)
-                                            }
-                                        }
-                                        .padding(.vertical, 3)
-                                    }
-                                    .listRowBackground(Color.white.opacity(0.04))
-                                }
-                            }
-                            .scrollContentBackground(.hidden)
+                        .onDelete { offsets in
+                            offsets.map { filteredTracks[$0] }.forEach(engine.deleteTrackFromDisk)
                         }
                     }
+                    .scrollContentBackground(.hidden)
                     .searchable(text: $searchText, placement: .navigationBarDrawer(displayMode: .always), prompt: "Search songs or artists...")
                     .padding(.bottom, engine.currentTrack != nil ? 70 : 0)
                 }
             }
-            .navigationTitle("Library (\(engine.allTracks.count))")
+            .navigationTitle("All Songs (\(engine.allTracks.count))")
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     Button {
@@ -2418,30 +2551,7 @@ struct AllSongsSearchView: View {
     }
 }
 
-struct ArtistDetailSongsView: View {
-    @ObservedObject var engine: MusiQEngine
-    let artistName: String
-    let tracks: [Track]
-    @Binding var showFullPlayer: Bool
-
-    var body: some View {
-        ZStack {
-            Color(red: 0.06, green: 0.06, blue: 0.08).ignoresSafeArea()
-            List(Array(tracks.enumerated()), id: \.element.id) { idx, track in
-                TrackRowView(indexNumber: idx + 1, track: track) {
-                    engine.playTrack(track, in: tracks)
-                    showFullPlayer = true
-                }
-                .listRowBackground(Color.white.opacity(0.04))
-            }
-            .scrollContentBackground(.hidden)
-            .padding(.bottom, engine.currentTrack != nil ? 70 : 0)
-        }
-        .navigationTitle(artistName)
-    }
-}
-
-// MARK: - Track Row View (Displays Artist + Song Duration Instead of Listen Time!)
+// MARK: - Enlarged Track Row View (60x60 Art + Larger Title + Duration)
 struct TrackRowView: View {
     let indexNumber: Int?
     let track: Track
@@ -2449,50 +2559,52 @@ struct TrackRowView: View {
 
     var body: some View {
         Button(action: onTap) {
-            HStack(spacing: 12) {
+            HStack(spacing: 14) {
                 if let num = indexNumber {
                     Text("\(num)")
-                        .font(.caption.monospacedDigit().weight(.semibold))
+                        .font(.subheadline.monospacedDigit().weight(.semibold))
                         .foregroundColor(.secondary)
-                        .frame(width: 20, alignment: .center)
+                        .frame(width: 22, alignment: .center)
                 }
 
                 if let uiImage = ArtworkCache.shared.artwork(for: track.fileName) {
                     Image(uiImage: uiImage)
                         .resizable()
                         .scaledToFill()
-                        .frame(width: 48, height: 48)
-                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                        .frame(width: 60, height: 60)
+                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                        .shadow(color: .black.opacity(0.3), radius: 4, x: 0, y: 2)
                 } else {
-                    RoundedRectangle(cornerRadius: 8)
+                    RoundedRectangle(cornerRadius: 10)
                         .fill(Color.white.opacity(0.1))
-                        .frame(width: 48, height: 48)
-                        .overlay(Image(systemName: "music.note").foregroundColor(.gray))
+                        .frame(width: 60, height: 60)
+                        .overlay(Image(systemName: "music.note").font(.title3).foregroundColor(.gray))
                 }
 
-                VStack(alignment: .leading, spacing: 3) {
+                VStack(alignment: .leading, spacing: 5) {
                     Text(track.title)
-                        .font(.body.weight(.medium))
+                        .font(.system(size: 17, weight: .semibold))
                         .foregroundColor(.white)
                         .lineLimit(1)
                     HStack(spacing: 6) {
                         Text(track.artist)
-                            .font(.caption)
+                            .font(.subheadline)
                             .foregroundColor(.secondary)
                             .lineLimit(1)
                         Text("•")
-                            .font(.caption2)
+                            .font(.caption)
                             .foregroundColor(.secondary)
                         Text(track.formattedDuration)
-                            .font(.caption.monospacedDigit())
+                            .font(.subheadline.monospacedDigit())
                             .foregroundColor(.secondary)
                     }
                 }
                 Spacer()
                 Image(systemName: "play.fill")
-                    .font(.caption)
+                    .font(.subheadline)
                     .foregroundColor(.secondary)
             }
+            .padding(.vertical, 4)
         }
     }
 }
@@ -2509,12 +2621,12 @@ struct MiniPlayerBar: View {
                 Image(uiImage: art)
                     .resizable()
                     .scaledToFill()
-                    .frame(width: 42, height: 42)
+                    .frame(width: 44, height: 44)
                     .clipShape(RoundedRectangle(cornerRadius: 8))
             } else {
                 RoundedRectangle(cornerRadius: 8)
                     .fill(Color.purple.opacity(0.3))
-                    .frame(width: 42, height: 42)
+                    .frame(width: 44, height: 44)
                     .overlay(Image(systemName: "music.note").foregroundColor(.white))
             }
 
@@ -2558,11 +2670,12 @@ struct MiniPlayerBar: View {
     }
 }
 
-// MARK: - Full-Screen Player
+// MARK: - Full-Screen Player (Larger Stage, Clear Tinted Cassette, Gyro Tilt, Skip Transitions & Source Picker)
 struct FullPlayerDeckView: View {
     @ObservedObject var engine: MusiQEngine
     @Binding var isPresented: Bool
 
+    @StateObject private var motion = MotionTiltManager()
     @State private var activeBottomSheet: BottomPanel? = nil
     @State private var dragOffset: CGSize = .zero
 
@@ -2579,7 +2692,8 @@ struct FullPlayerDeckView: View {
     var body: some View {
         GeometryReader { geo in
             let safeWidth = geo.size.width
-            let artBoxSize = min(safeWidth - 100, 236)
+            // Enlarged Cover / Cassette / Side Vinyl stage!
+            let artBoxSize = min(safeWidth - 52, 298)
 
             ZStack {
                 LinearGradient(
@@ -2590,7 +2704,7 @@ struct FullPlayerDeckView: View {
                 .ignoresSafeArea()
                 .animation(.easeInOut(duration: 0.65), value: engine.currentTrack?.fileName)
 
-                VStack(spacing: 10) {
+                VStack(spacing: 8) {
                     // Top Bar
                     HStack {
                         Button {
@@ -2618,7 +2732,7 @@ struct FullPlayerDeckView: View {
                     }
                     .padding(.horizontal, 16)
 
-                    // 3-Way Display Mode Switcher
+                    // 3-Way Display Mode Switcher (Sleeve, Cassette, Side Vinyl)
                     HStack(spacing: 10) {
                         ForEach(VisualMode.allCases, id: \.self) { mode in
                             Button {
@@ -2643,16 +2757,41 @@ struct FullPlayerDeckView: View {
 
                     Spacer(minLength: 2)
 
-                    // Visualizer Stage
-                    PlayerVisualizerStage(
-                        mode: engine.visualMode,
-                        track: engine.currentTrack,
-                        isPlaying: engine.isPlaying,
-                        boxSize: artBoxSize,
-                        refreshID: engine.artworkRefreshID
+                    // Enlarged Visualizer Stage with Smooth Skip Slide Animation & Subtle Gyro Tilt
+                    ZStack {
+                        PlayerVisualizerStage(
+                            mode: engine.visualMode,
+                            track: engine.currentTrack,
+                            isPlaying: engine.isPlaying,
+                            boxSize: artBoxSize,
+                            refreshID: engine.artworkRefreshID,
+                            tintColor: dynamicAlbumGradient.first ?? .purple
+                        )
+                        .id(engine.trackTransitionID)
+                        .transition(
+                            .asymmetric(
+                                insertion: .offset(x: engine.skipTransitionDirection >= 0 ? 110 : -110)
+                                    .combined(with: .scale(scale: 0.88))
+                                    .combined(with: .opacity),
+                                removal: .offset(x: engine.skipTransitionDirection >= 0 ? -110 : 110)
+                                    .combined(with: .scale(scale: 0.88))
+                                    .combined(with: .opacity)
+                            )
+                        )
+                    }
+                    // Subtle 3D Gyroscope Tilt Parallax when tilting the phone
+                    .rotation3DEffect(
+                        .degrees(motion.pitch),
+                        axis: (x: 1, y: 0, z: 0),
+                        perspective: 0.4
                     )
-                    .frame(width: safeWidth - 24, height: artBoxSize + 18)
-                    .clipped()
+                    .rotation3DEffect(
+                        .degrees(motion.roll),
+                        axis: (x: 0, y: 1, z: 0),
+                        perspective: 0.4
+                    )
+                    .offset(x: CGFloat(motion.roll * 1.4), y: CGFloat(motion.pitch * 1.4))
+                    .frame(width: safeWidth - 16, height: artBoxSize + 14)
 
                     if let err = engine.playbackErrorMessage {
                         Text(err)
@@ -2662,7 +2801,7 @@ struct FullPlayerDeckView: View {
                             .padding(.horizontal, 20)
                     }
 
-                    // Song Title + Artist
+                    // Song Title + Artist (Animated on skip)
                     VStack(spacing: 3) {
                         LoopingMarqueeText(
                             text: engine.currentTrack?.title ?? "No Track Selected",
@@ -2678,11 +2817,11 @@ struct FullPlayerDeckView: View {
                     }
                     .padding(.horizontal, 24)
 
-                    // Polished Single-Line Synced Lyric Display (Between Artist & Scrubber)
-                    PolishedInlineLyricView(
+                    // Word-by-Word Karaoke Highlighted Inline Lyric Line
+                    WordByWordInlineLyricView(
                         progress: engine.progress,
                         lines: engine.currentTrackLyrics,
-                        offsetSeconds: engine.currentTrackLyricOffset,
+                        autoOffset: engine.autoDetectedLyricOffset,
                         isFetching: engine.isFetchingLyricsInBackground
                     ) {
                         activeBottomSheet = .lyrics
@@ -2756,14 +2895,14 @@ struct FullPlayerDeckView: View {
                         }
                     }
 
-                    // Bottom Action Bar
-                    HStack(spacing: 28) {
+                    // Bottom Action Bar (DSP, Lyrics, Tag Editor, Queue + Native Audio Source Button!)
+                    HStack(spacing: 22) {
                         Button {
                             activeBottomSheet = .dsp
                         } label: {
                             VStack(spacing: 4) {
                                 Image(systemName: "dial.high.fill")
-                                Text("DSP / Pitch")
+                                Text("DSP")
                                     .font(.caption2)
                             }
                             .foregroundColor(.white.opacity(0.85))
@@ -2785,7 +2924,7 @@ struct FullPlayerDeckView: View {
                         } label: {
                             VStack(spacing: 4) {
                                 Image(systemName: "tag.fill")
-                                Text("Tag Editor")
+                                Text("Tags")
                                     .font(.caption2)
                             }
                             .foregroundColor(.white.opacity(0.85))
@@ -2800,6 +2939,15 @@ struct FullPlayerDeckView: View {
                                     .font(.caption2)
                             }
                             .foregroundColor(.white.opacity(0.85))
+                        }
+
+                        // Native Audio Device Route Switcher ("Source")
+                        VStack(spacing: 2) {
+                            AudioSourcePickerButton()
+                                .frame(width: 26, height: 22)
+                            Text("Source")
+                                .font(.caption2)
+                                .foregroundColor(.white.opacity(0.85))
                         }
                     }
                     .padding(.top, 4)
@@ -2902,13 +3050,14 @@ struct IsolatedScrubberView: View {
     }
 }
 
-// MARK: - 3-Way Visualizer Stage
+// MARK: - Enlarged 3-Way Visualizer Stage (Sleeve, Clear Tinted Cassette, Side Vinyl)
 struct PlayerVisualizerStage: View {
     let mode: VisualMode
     let track: Track?
     let isPlaying: Bool
     let boxSize: CGFloat
     let refreshID: UUID
+    let tintColor: Color
 
     var artworkImage: UIImage? {
         let _ = refreshID
@@ -2922,13 +3071,13 @@ struct PlayerVisualizerStage: View {
             case .sleeve:
                 sleeveCover(size: boxSize)
 
-            case .cdPlayer:
-                walkmanCDUnit(size: boxSize)
+            case .cassette:
+                clearTintedCassetteView(width: boxSize * 1.05, height: boxSize * 0.68)
 
             case .sideVinyl:
-                let sleeveDim = boxSize * 0.80
-                let vinylDim = boxSize * 0.78
-                HStack(spacing: -vinylDim * 0.45) {
+                let sleeveDim = boxSize * 0.82
+                let vinylDim = boxSize * 0.80
+                HStack(spacing: -vinylDim * 0.44) {
                     sleeveCover(size: sleeveDim)
                         .zIndex(2)
 
@@ -2944,6 +3093,7 @@ struct PlayerVisualizerStage: View {
                                     )
                                 )
                                 .frame(width: vinylDim, height: vinylDim)
+                                .shadow(color: .black.opacity(0.5), radius: 10, x: 4, y: 6)
 
                             Circle()
                                 .stroke(Color.white.opacity(0.08), lineWidth: 1)
@@ -2961,7 +3111,7 @@ struct PlayerVisualizerStage: View {
                                     .clipShape(Circle())
                             } else {
                                 Circle()
-                                    .fill(Color.purple)
+                                    .fill(tintColor)
                                     .frame(width: vinylDim * 0.38, height: vinylDim * 0.38)
                             }
 
@@ -2976,129 +3126,162 @@ struct PlayerVisualizerStage: View {
         }
     }
 
+    // Translucent Clear Cassette Tinted with Album Cover Colors + Cover Sticker + Spinning Dual Reels
     @ViewBuilder
-    private func walkmanCDUnit(size: CGFloat) -> some View {
-        let discSize = size * 0.78
+    private func clearTintedCassetteView(width: CGFloat, height: CGFloat) -> some View {
+        let reelSize = height * 0.36
         ZStack {
-            RoundedRectangle(cornerRadius: 34)
-                .fill(
-                    LinearGradient(
-                        colors: [Color(white: 0.28), Color(white: 0.16), Color(white: 0.22), Color(white: 0.11)],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
+            // 1. Translucent Frosted Acrylic Shell Tinted by Album Cover
+            RoundedRectangle(cornerRadius: 18)
+                .fill(tintColor.opacity(0.32))
+                .background(
+                    RoundedRectangle(cornerRadius: 18)
+                        .fill(.ultraThinMaterial)
                 )
-                .frame(width: size * 1.06, height: size * 1.02)
+                .frame(width: width, height: height)
                 .overlay(
-                    RoundedRectangle(cornerRadius: 34)
-                        .stroke(Color.white.opacity(0.25), lineWidth: 1.5)
+                    RoundedRectangle(cornerRadius: 18)
+                        .stroke(
+                            LinearGradient(
+                                colors: [.white.opacity(0.45), tintColor.opacity(0.6), .white.opacity(0.18)],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            ),
+                            lineWidth: 2
+                        )
                 )
-                .shadow(color: .black.opacity(0.6), radius: 14, x: 0, y: 8)
+                .shadow(color: .black.opacity(0.55), radius: 16, x: 0, y: 10)
 
+            // 2. Internal Clear Plastic Ribs & Corner Screw Details
             VStack {
                 HStack {
-                    HStack(spacing: 4) {
-                        Circle()
-                            .fill(isPlaying ? Color.green : Color.orange)
-                            .frame(width: 6, height: 6)
-                        Text("WALKMAN ESP")
-                            .font(.system(size: 8, weight: .black, design: .monospaced))
-                            .foregroundColor(.white.opacity(0.7))
-                    }
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 3)
-                    .background(Color.black.opacity(0.45))
-                    .clipShape(Capsule())
-
+                    cassetteScrew()
                     Spacer()
-
-                    Text("DISC")
-                        .font(.system(size: 8, weight: .bold, design: .monospaced))
-                        .foregroundColor(.purple.opacity(0.9))
-                        .padding(.horizontal, 7)
-                        .padding(.vertical, 3)
-                        .background(Color.black.opacity(0.45))
-                        .clipShape(Capsule())
+                    cassetteScrew()
                 }
-                .padding(.horizontal, 16)
-                .padding(.top, 12)
-
                 Spacer()
-            }
-            .frame(width: size * 1.06, height: size * 1.02)
-
-            Circle()
-                .fill(Color(red: 0.05, green: 0.05, blue: 0.07))
-                .frame(width: discSize + 12, height: discSize + 12)
-                .overlay(
-                    Circle()
-                        .stroke(Color.white.opacity(0.15), lineWidth: 2)
-                )
-
-            RoundedRectangle(cornerRadius: 6)
-                .fill(Color.black.opacity(0.8))
-                .frame(width: discSize * 0.36, height: 18)
-                .offset(x: discSize * 0.22, y: discSize * 0.22)
-
-            ContinuousSpinView(isSpinning: isPlaying, rpm: 22.0) {
-                ZStack {
-                    Circle()
-                        .fill(
-                            AngularGradient(
-                                gradient: Gradient(colors: [
-                                    .gray.opacity(0.45),
-                                    .white.opacity(0.9),
-                                    .purple.opacity(0.4),
-                                    .cyan.opacity(0.35),
-                                    .gray.opacity(0.45)
-                                ]),
-                                center: .center
-                            )
-                        )
-                        .frame(width: discSize, height: discSize)
-
-                    if let img = artworkImage {
-                        Image(uiImage: img)
-                            .resizable()
-                            .scaledToFill()
-                            .frame(width: discSize * 0.94, height: discSize * 0.94)
-                            .clipShape(Circle())
-                    }
-
-                    Circle()
-                        .stroke(
-                            AngularGradient(
-                                gradient: Gradient(colors: [.clear, .white.opacity(0.28), .clear, .purple.opacity(0.25), .clear]),
-                                center: .center
-                            ),
-                            lineWidth: discSize * 0.45
-                        )
-                        .frame(width: discSize * 0.5, height: discSize * 0.5)
-                        .clipShape(Circle())
-
-                    Circle()
-                        .fill(Color(white: 0.85).opacity(0.3))
-                        .frame(width: discSize * 0.28, height: discSize * 0.28)
-                    Circle()
-                        .stroke(Color.black.opacity(0.55), lineWidth: 4)
-                        .frame(width: discSize * 0.24, height: discSize * 0.24)
-                    Circle()
-                        .fill(Color(red: 0.08, green: 0.08, blue: 0.1))
-                        .frame(width: discSize * 0.14, height: discSize * 0.14)
+                HStack {
+                    cassetteScrew()
+                    Spacer()
+                    cassetteScrew()
                 }
             }
+            .padding(12)
+            .frame(width: width, height: height)
+
+            // 3. Album Artwork Faceplate Label Sticker (With Center Cutout for the Spinning Reels)
+            ZStack {
+                if let img = artworkImage {
+                    Image(uiImage: img)
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: width * 0.88, height: height * 0.62)
+                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                        .opacity(0.78)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 10)
+                                .stroke(Color.white.opacity(0.28), lineWidth: 1)
+                        )
+                } else {
+                    RoundedRectangle(cornerRadius: 10)
+                        .fill(LinearGradient(colors: [tintColor.opacity(0.7), .black.opacity(0.6)], startPoint: .top, endPoint: .bottom))
+                        .frame(width: width * 0.88, height: height * 0.62)
+                }
+
+                // Center Transparent Tape Window & Dual Spinning Reels
+                ZStack {
+                    Capsule()
+                        .fill(Color.black.opacity(0.72))
+                        .frame(width: width * 0.68, height: reelSize + 14)
+                        .overlay(
+                            Capsule()
+                                .stroke(Color.white.opacity(0.25), lineWidth: 1.2)
+                        )
+
+                    // Magnetic Tape Spools Behind Reels
+                    HStack(spacing: width * 0.14) {
+                        Circle()
+                            .fill(Color(red: 0.14, green: 0.09, blue: 0.08).opacity(0.9))
+                            .frame(width: reelSize * 1.25, height: reelSize * 1.25)
+                        Circle()
+                            .fill(Color(red: 0.14, green: 0.09, blue: 0.08).opacity(0.9))
+                            .frame(width: reelSize * 1.05, height: reelSize * 1.05)
+                    }
+                    .clipShape(Capsule().scale(0.95))
+
+                    // Left & Right Synchronized Spinning Cassette Reels
+                    HStack(spacing: width * 0.16) {
+                        ContinuousSpinView(isSpinning: isPlaying, rpm: 20.0) {
+                            cassetteSpindleWheel(size: reelSize)
+                        }
+                        ContinuousSpinView(isSpinning: isPlaying, rpm: 20.0) {
+                            cassetteSpindleWheel(size: reelSize)
+                        }
+                    }
+                }
+            }
+            .offset(y: -height * 0.08)
+
+            // 4. Bottom Trapezoid Head Shield (With Track Title Etched)
+            VStack {
+                Spacer()
+                ZStack {
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(Color.black.opacity(0.42))
+                        .frame(width: width * 0.64, height: height * 0.20)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8)
+                                .stroke(Color.white.opacity(0.20), lineWidth: 1)
+                        )
+
+                    HStack(spacing: 18) {
+                        Circle().fill(Color.black.opacity(0.7)).frame(width: 9, height: 9)
+                        Text(track?.title.uppercased() ?? "CHROME TYPE II")
+                            .font(.system(size: 8, weight: .black, design: .monospaced))
+                            .foregroundColor(.white.opacity(0.75))
+                            .lineLimit(1)
+                            .frame(maxWidth: width * 0.36)
+                        Circle().fill(Color.black.opacity(0.7)).frame(width: 9, height: 9)
+                    }
+                }
+                .padding(.bottom, 6)
+            }
+            .frame(width: width, height: height)
+        }
+    }
+
+    @ViewBuilder
+    private func cassetteSpindleWheel(size: CGFloat) -> some View {
+        ZStack {
+            Circle()
+                .stroke(Color.white.opacity(0.9), lineWidth: 3.5)
+                .frame(width: size, height: size)
+
+            ForEach(0..<6, id: \.self) { idx in
+                Rectangle()
+                    .fill(Color.white.opacity(0.9))
+                    .frame(width: 3, height: size * 0.32)
+                    .offset(y: -size * 0.30)
+                    .rotationEffect(.degrees(Double(idx) * 60.0))
+            }
 
             Circle()
-                .fill(
-                    LinearGradient(
-                        colors: [Color.white.opacity(0.16), Color.clear, Color.white.opacity(0.04)],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                )
-                .frame(width: discSize + 8, height: discSize + 8)
-                .allowsHitTesting(false)
+                .fill(Color.black.opacity(0.6))
+                .frame(width: size * 0.42, height: size * 0.42)
         }
+    }
+
+    @ViewBuilder
+    private func cassetteScrew() -> some View {
+        Circle()
+            .fill(Color.white.opacity(0.35))
+            .frame(width: 7, height: 7)
+            .overlay(
+                Rectangle()
+                    .fill(Color.black.opacity(0.5))
+                    .frame(width: 5, height: 1)
+                    .rotationEffect(.degrees(45))
+            )
     }
 
     @ViewBuilder
@@ -3108,14 +3291,14 @@ struct PlayerVisualizerStage: View {
                 .resizable()
                 .scaledToFill()
                 .frame(width: size, height: size)
-                .clipShape(RoundedRectangle(cornerRadius: 18))
+                .clipShape(RoundedRectangle(cornerRadius: 20))
                 .overlay(
-                    RoundedRectangle(cornerRadius: 18)
-                        .stroke(Color.white.opacity(0.16), lineWidth: 1)
+                    RoundedRectangle(cornerRadius: 20)
+                        .stroke(Color.white.opacity(0.18), lineWidth: 1)
                 )
-                .shadow(color: .black.opacity(0.55), radius: 14, x: 0, y: 8)
+                .shadow(color: .black.opacity(0.55), radius: 16, x: 0, y: 10)
         } else {
-            RoundedRectangle(cornerRadius: 18)
+            RoundedRectangle(cornerRadius: 20)
                 .fill(LinearGradient(colors: [.purple.opacity(0.6), .indigo.opacity(0.3)], startPoint: .topLeading, endPoint: .bottomTrailing))
                 .frame(width: size, height: size)
                 .overlay(
@@ -3123,7 +3306,7 @@ struct PlayerVisualizerStage: View {
                         .font(.system(size: size * 0.28))
                         .foregroundColor(.white.opacity(0.75))
                 )
-                .shadow(color: .black.opacity(0.55), radius: 14, x: 0, y: 8)
+                .shadow(color: .black.opacity(0.55), radius: 16, x: 0, y: 10)
         }
     }
 }
@@ -3367,14 +3550,12 @@ struct DirectAudioImporterView: View {
 
     private func normalizeCloudAudioURL(_ raw: String) -> URL? {
         var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        // Automatically convert Dropbox share links to direct download streams
         if s.contains("dropbox.com") {
             s = s.replacingOccurrences(of: "?dl=0", with: "?dl=1")
             if !s.contains("dl=1") {
                 s += (s.contains("?") ? "&dl=1" : "?dl=1")
             }
         }
-        // Automatically convert Google Drive file links to direct download streams
         if s.contains("drive.google.com/file/d/") {
             let parts = s.components(separatedBy: "/file/d/")
             if parts.count > 1, let fileID = parts[1].components(separatedBy: "/").first {
@@ -3431,18 +3612,23 @@ struct DirectAudioImporterView: View {
                 }
                 try FileManager.default.moveItem(at: tempURL, to: destinationURL)
 
-                guard (try? AVAudioFile(forReading: destinationURL)) != nil else {
+                guard let verifyFile = try? AVAudioFile(forReading: destinationURL) else {
                     try? FileManager.default.removeItem(at: destinationURL)
                     throw NSError(domain: "MusiQ", code: -1, userInfo: [
                         NSLocalizedDescriptionKey: "URL did not point to a valid direct audio file. Use the Files importer in the Songs tab for local files."
                     ])
                 }
 
+                let exactDuration = Double(verifyFile.length) / max(verifyFile.processingFormat.sampleRate, 1)
                 ArtworkCache.shared.saveCustomMetadata(title: resolvedTitle, artist: resolvedArtist, for: safeFileName)
 
-                if let lyrics = await LyricsManager.shared.fetchOnlineLyrics(title: resolvedTitle, artist: resolvedArtist) {
-                    let tempTrack = Track(id: UUID(), title: resolvedTitle, artist: resolvedArtist, fileName: safeFileName, duration: 0)
-                    LyricsManager.shared.saveLyrics(lyrics, for: tempTrack)
+                if let res = await LyricsManager.shared.fetchVersionMatchedLyrics(
+                    title: resolvedTitle,
+                    artist: resolvedArtist,
+                    targetDuration: exactDuration
+                ) {
+                    let tempTrack = Track(id: UUID(), title: resolvedTitle, artist: resolvedArtist, fileName: safeFileName, duration: exactDuration)
+                    LyricsManager.shared.saveLyrics(res.lyrics, for: tempTrack)
                 }
 
                 await MainActor.run {
@@ -3510,12 +3696,12 @@ struct ListeningStatsView: View {
                                         Image(uiImage: img)
                                             .resizable()
                                             .scaledToFill()
-                                            .frame(width: 40, height: 40)
+                                            .frame(width: 44, height: 44)
                                             .clipShape(RoundedRectangle(cornerRadius: 8))
                                     } else {
                                         RoundedRectangle(cornerRadius: 8)
                                             .fill(Color.white.opacity(0.1))
-                                            .frame(width: 40, height: 40)
+                                            .frame(width: 44, height: 44)
                                             .overlay(Image(systemName: "music.note").foregroundColor(.gray))
                                     }
 
