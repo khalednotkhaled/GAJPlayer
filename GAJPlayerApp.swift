@@ -149,15 +149,13 @@ struct LyricLine: Identifiable, Equatable {
 enum VisualMode: String, CaseIterable {
     case sleeve = "Sleeve"
     case cassette = "Cassette"
-    case sideVinyl = "Vinyl"
-    case ipod = "iPod"
+    case sideVinyl = "Side Vinyl"
 
     var icon: String {
         switch self {
         case .sleeve: return "square.fill"
         case .cassette: return "recordingtape"
         case .sideVinyl: return "record.circle"
-        case .ipod: return "ipod"
         }
     }
 }
@@ -240,7 +238,6 @@ final class WiFiUploadServer: ObservableObject {
                     accumulated.append(d)
                 }
 
-                // Check if HTTP headers have arrived and if Content-Length is satisfied
                 if let headerEndRange = accumulated.range(of: Data("\r\n\r\n".utf8)) {
                     let headerData = accumulated.subdata(in: 0..<headerEndRange.lowerBound)
                     let headerStr = String(data: headerData, encoding: .utf8) ?? ""
@@ -1028,6 +1025,7 @@ final class MusiQEngine: ObservableObject {
     @Published var isRepeat: Bool = false
 
     @Published var visualMode: VisualMode = .sideVinyl
+    @Published var isIPodModeActive: Bool = false
     @Published var pitchCents: Float = 0
     @Published var playbackRate: Float = 1.0
     @Published var eqPreset: EQPreset = .flat
@@ -1834,7 +1832,6 @@ struct DynamicIslandLiveBanner: View {
         if let track = engine.currentTrack {
             VStack(spacing: 0) {
                 if isExpanded {
-                    // Expanded Dynamic Island Deck
                     VStack(spacing: 10) {
                         HStack(spacing: 12) {
                             ContinuousSpinView(isSpinning: engine.isPlaying, rpm: 18) {
@@ -1890,7 +1887,6 @@ struct DynamicIslandLiveBanner: View {
                     .shadow(color: .black.opacity(0.6), radius: 12, x: 0, y: 6)
                     .padding(.horizontal, 20)
                 } else {
-                    // Compact Dynamic Island Pill
                     HStack(spacing: 10) {
                         ContinuousSpinView(isSpinning: engine.isPlaying, rpm: 18) {
                             if let art = ArtworkCache.shared.artwork(for: track.fileName) {
@@ -1912,7 +1908,6 @@ struct DynamicIslandLiveBanner: View {
                             .lineLimit(1)
                             .frame(maxWidth: 130)
 
-                        // Animated 3-Bar Waveform
                         HStack(spacing: 2.5) {
                             ForEach(0..<3, id: \.self) { bar in
                                 Capsule()
@@ -1944,10 +1939,11 @@ struct DynamicIslandLiveBanner: View {
     }
 }
 
-// MARK: - Realistic iPod Classic 5th/6th Gen Mode (Split-Screen LCD + Trigonometric Click Wheel + Haptics)
-struct IPodClassicInteractiveView: View {
+// MARK: - Full-Screen Standalone iPod Classic Mode (With Top-Left Quit Button & High-Precision Click Wheel)
+struct FullScreenIPodClassicModeView: View {
     @ObservedObject var engine: MusiQEngine
     @ObservedObject var progress: PlaybackProgressObserver
+    let onQuit: () -> Void
 
     enum IPodScreenState: Equatable {
         case rootMenu
@@ -1970,225 +1966,292 @@ struct IPodClassicInteractiveView: View {
     }
 
     var body: some View {
-        VStack(spacing: 20) {
-            // 1. 4:3 Retro iPod Color LCD Screen with Bezel & Glare
+        GeometryReader { geo in
+            let w = geo.size.width
+            let lcdWidth = min(w - 44, 336)
+            let lcdHeight = lcdWidth * 0.75
+            let wheelDiameter = min(w - 84, 268)
+
             ZStack {
-                RoundedRectangle(cornerRadius: 12)
-                    .fill(backlightOn ? Color(white: 0.96) : Color(red: 0.68, green: 0.72, blue: 0.66))
-                    .frame(width: 286, height: 210)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 12)
-                            .stroke(Color.black.opacity(0.85), lineWidth: 4)
-                    )
-
-                VStack(spacing: 0) {
-                    // iPod Top Status Bar
-                    HStack {
-                        Text(statusBarTitle)
-                            .font(.system(size: 11, weight: .bold))
-                            .foregroundColor(.black.opacity(0.85))
-                            .lineLimit(1)
-                        Spacer()
-                        Image(systemName: engine.isPlaying ? "play.fill" : "pause.fill")
-                            .font(.system(size: 9, weight: .bold))
-                            .foregroundColor(.blue)
-                        // Retro Green Battery Icon
-                        ZStack(alignment: .leading) {
-                            RoundedRectangle(cornerRadius: 2)
-                                .stroke(Color.black.opacity(0.75), lineWidth: 1)
-                                .frame(width: 20, height: 9)
-                            RoundedRectangle(cornerRadius: 1)
-                                .fill(Color.green.opacity(0.85))
-                                .frame(width: 16, height: 7)
-                                .padding(.leading, 1)
-                        }
-                    }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 5)
-                    .background(
-                        LinearGradient(
-                            colors: [Color(white: 0.94), Color(white: 0.80)],
-                            startPoint: .top,
-                            endPoint: .bottom
-                        )
-                    )
-                    .overlay(Rectangle().fill(Color.gray.opacity(0.5)).frame(height: 1), alignment: .bottom)
-
-                    // LCD Content Area
-                    Group {
-                        switch currentScreen {
-                        case .rootMenu:
-                            ipodSplitScreenRootMenu()
-                        case .songsList:
-                            ipodSingleListScreen(items: engine.allTracks.map { $0.title })
-                        case .playlistsList:
-                            ipodSingleListScreen(items: engine.playlists.isEmpty ? ["No Playlists"] : engine.playlists.map { $0.name })
-                        case .playlistTracks(let pid):
-                            let pTracks = engine.playlists.first(where: { $0.id == pid }).map { engine.tracks(for: $0) } ?? []
-                            ipodSingleListScreen(items: pTracks.isEmpty ? ["Empty Playlist"] : pTracks.map { $0.title })
-                        case .nowPlaying:
-                            ipodNowPlayingScreen()
-                        }
-                    }
-                    .frame(width: 278, height: 180)
-                    .clipped()
-                }
-                .frame(width: 278, height: 202)
-                .clipShape(RoundedRectangle(cornerRadius: 9))
-
-                // Subtle Diagonal Glass Glare Reflection
+                // Full-Screen Brushed Anodized Aluminum / Classic iPod Shell
                 LinearGradient(
-                    colors: [Color.white.opacity(0.22), Color.clear, Color.black.opacity(0.05)],
+                    colors: [
+                        Color(white: 0.88),
+                        Color(white: 0.76),
+                        Color(white: 0.68),
+                        Color(white: 0.58)
+                    ],
                     startPoint: .topLeading,
                     endPoint: .bottomTrailing
                 )
-                .frame(width: 278, height: 202)
-                .clipShape(RoundedRectangle(cornerRadius: 9))
-                .allowsHitTesting(false)
-            }
+                .ignoresSafeArea()
 
-            // 2. Iconic Tactile Click Wheel (Trigonometric Angular Gesture + Haptic Ticks)
-            ZStack {
-                Circle()
-                    .fill(
+                VStack(spacing: 0) {
+                    // Top Bar with "Quit" Button on Top Left
+                    HStack {
+                        Button {
+                            triggerClickHaptic(heavy: true)
+                            onQuit()
+                        } label: {
+                            HStack(spacing: 5) {
+                                Image(systemName: "xmark.circle.fill")
+                                    .font(.system(size: 15, weight: .bold))
+                                Text("Quit iPod")
+                                    .font(.system(size: 13, weight: .bold, design: .rounded))
+                            }
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 8)
+                            .background(Color.black.opacity(0.68))
+                            .foregroundColor(.white)
+                            .clipShape(Capsule())
+                            .shadow(color: .black.opacity(0.25), radius: 4, x: 0, y: 2)
+                        }
+
+                        Spacer()
+
+                        Text("iPod Classic")
+                            .font(.system(size: 12, weight: .heavy, design: .rounded))
+                            .foregroundColor(.black.opacity(0.45))
+                    }
+                    .padding(.horizontal, 22)
+                    .padding(.top, 10)
+                    .padding(.bottom, 16)
+
+                    // 4:3 Retro iPod Color LCD Screen
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 14)
+                            .fill(backlightOn ? Color(white: 0.97) : Color(red: 0.68, green: 0.72, blue: 0.66))
+                            .frame(width: lcdWidth + 8, height: lcdHeight + 8)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 14)
+                                    .stroke(Color.black.opacity(0.88), lineWidth: 5)
+                            )
+                            .shadow(color: .black.opacity(0.35), radius: 10, x: 0, y: 4)
+
+                        VStack(spacing: 0) {
+                            // iPod Top Status Bar
+                            HStack {
+                                Text(statusBarTitle)
+                                    .font(.system(size: 12, weight: .bold))
+                                    .foregroundColor(.black.opacity(0.85))
+                                    .lineLimit(1)
+                                Spacer()
+                                Image(systemName: engine.isPlaying ? "play.fill" : "pause.fill")
+                                    .font(.system(size: 10, weight: .bold))
+                                    .foregroundColor(.blue)
+                                ZStack(alignment: .leading) {
+                                    RoundedRectangle(cornerRadius: 2)
+                                        .stroke(Color.black.opacity(0.75), lineWidth: 1)
+                                        .frame(width: 22, height: 10)
+                                    RoundedRectangle(cornerRadius: 1)
+                                        .fill(Color.green.opacity(0.85))
+                                        .frame(width: 18, height: 8)
+                                        .padding(.leading, 1)
+                                }
+                            }
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 6)
+                            .background(
+                                LinearGradient(
+                                    colors: [Color(white: 0.95), Color(white: 0.80)],
+                                    startPoint: .top,
+                                    endPoint: .bottom
+                                )
+                            )
+                            .overlay(Rectangle().fill(Color.gray.opacity(0.5)).frame(height: 1), alignment: .bottom)
+
+                            // LCD Content Area
+                            Group {
+                                switch currentScreen {
+                                case .rootMenu:
+                                    ipodSplitScreenRootMenu(totalWidth: lcdWidth, totalHeight: lcdHeight - 28)
+                                case .songsList:
+                                    ipodSingleListScreen(
+                                        items: engine.allTracks.isEmpty ? ["No Songs in Library"] : engine.allTracks.map { $0.title },
+                                        subtitles: engine.allTracks.map { $0.artist },
+                                        height: lcdHeight - 28
+                                    )
+                                case .playlistsList:
+                                    ipodSingleListScreen(
+                                        items: engine.playlists.isEmpty ? ["No Playlists Yet"] : engine.playlists.map { $0.name },
+                                        subtitles: engine.playlists.map { "\($0.trackFileNames.count) songs" },
+                                        height: lcdHeight - 28
+                                    )
+                                case .playlistTracks(let pid):
+                                    let pTracks = engine.playlists.first(where: { $0.id == pid }).map { engine.tracks(for: $0) } ?? []
+                                    ipodSingleListScreen(
+                                        items: pTracks.isEmpty ? ["Empty Playlist"] : pTracks.map { $0.title },
+                                        subtitles: pTracks.map { $0.artist },
+                                        height: lcdHeight - 28
+                                    )
+                                case .nowPlaying:
+                                    ipodNowPlayingScreen(width: lcdWidth, height: lcdHeight - 28)
+                                }
+                            }
+                            .frame(width: lcdWidth, height: lcdHeight - 28)
+                            .clipped()
+                        }
+                        .frame(width: lcdWidth, height: lcdHeight)
+                        .clipShape(RoundedRectangle(cornerRadius: 10))
+
+                        // Subtle Glass Glare Overlay
                         LinearGradient(
-                            colors: [Color(white: 0.92), Color(white: 0.82)],
+                            colors: [Color.white.opacity(0.20), Color.clear, Color.black.opacity(0.04)],
                             startPoint: .topLeading,
                             endPoint: .bottomTrailing
                         )
-                    )
-                    .frame(width: 216, height: 216)
-                    .overlay(Circle().stroke(Color.black.opacity(0.18), lineWidth: 1.5))
-                    .shadow(color: .black.opacity(0.45), radius: 8, x: 0, y: 5)
-                    .gesture(
-                        DragGesture(minimumDistance: 2)
-                            .onChanged { value in
-                                let center = CGPoint(x: 108, y: 108)
-                                let dx = value.location.x - center.x
-                                let dy = value.location.y - center.y
-                                let dist = hypot(dx, dy)
-                                // Only track rotation in the outer wheel ring (radius 36...112)
-                                guard dist > 34 && dist < 118 else { return }
-
-                                let angle = atan2(dy, dx) * 180.0 / .pi
-                                if let prev = lastWheelAngle {
-                                    var delta = angle - prev
-                                    if delta > 180 { delta -= 360 }
-                                    if delta < -180 { delta += 360 }
-                                    accumulatedDeltaAngle += delta
-
-                                    let stepDegrees = 15.0
-                                    if abs(accumulatedDeltaAngle) >= stepDegrees {
-                                        let steps = Int(accumulatedDeltaAngle / stepDegrees)
-                                        accumulatedDeltaAngle -= Double(steps) * stepDegrees
-                                        handleWheelScroll(steps: steps)
-                                    }
-                                }
-                                lastWheelAngle = angle
-                            }
-                            .onEnded { _ in
-                                lastWheelAngle = nil
-                                accumulatedDeltaAngle = 0
-                            }
-                    )
-
-                // Cardinal Wheel Buttons (MENU, PREV, NEXT, PLAY/PAUSE)
-                VStack {
-                    Button {
-                        triggerClickHaptic()
-                        handleMenuButton()
-                    } label: {
-                        Text("MENU")
-                            .font(.system(size: 11, weight: .black, design: .rounded))
-                            .tracking(1.1)
-                            .foregroundColor(.gray.opacity(0.9))
-                            .padding(.top, 14)
-                            .frame(width: 80, height: 42)
+                        .frame(width: lcdWidth, height: lcdHeight)
+                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                        .allowsHitTesting(false)
                     }
+
                     Spacer()
-                    Button {
-                        triggerClickHaptic()
-                        engine.togglePlayPause()
-                    } label: {
-                        HStack(spacing: 3) {
-                            Image(systemName: "play.fill")
-                            Image(systemName: "pause.fill")
-                        }
-                        .font(.system(size: 11, weight: .bold))
-                        .foregroundColor(.gray.opacity(0.9))
-                        .padding(.bottom, 14)
-                        .frame(width: 80, height: 42)
-                    }
-                }
-                .frame(width: 216, height: 216)
 
-                HStack {
-                    Button {
-                        triggerClickHaptic()
-                        engine.previousTrack()
-                    } label: {
-                        Image(systemName: "backward.end.alt.fill")
-                            .font(.system(size: 12, weight: .bold))
-                            .foregroundColor(.gray.opacity(0.9))
-                            .padding(.leading, 14)
-                            .frame(width: 48, height: 80)
-                    }
-                    Spacer()
-                    Button {
-                        triggerClickHaptic()
-                        engine.nextTrack()
-                    } label: {
-                        Image(systemName: "forward.end.alt.fill")
-                            .font(.system(size: 12, weight: .bold))
-                            .foregroundColor(.gray.opacity(0.9))
-                            .padding(.trailing, 14)
-                            .frame(width: 48, height: 80)
-                    }
-                }
-                .frame(width: 216, height: 216)
-
-                // Center Tactile Select Button
-                Button {
-                    triggerClickHaptic(heavy: true)
-                    handleCenterSelect()
-                } label: {
-                    Circle()
-                        .fill(
-                            LinearGradient(
-                                colors: [Color(white: 0.76), Color(white: 0.88)],
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
+                    // High-Precision Trigonometric Click Wheel (Fixed Local Coordinate Space & 9-Degree Smooth Steps)
+                    ZStack {
+                        // Wheel Touch Surface
+                        Circle()
+                            .fill(
+                                LinearGradient(
+                                    colors: [Color(white: 0.94), Color(white: 0.84)],
+                                    startPoint: .topLeading,
+                                    endPoint: .bottomTrailing
+                                )
                             )
-                        )
-                        .frame(width: 74, height: 74)
-                        .overlay(Circle().stroke(Color.black.opacity(0.25), lineWidth: 1))
+                            .frame(width: wheelDiameter, height: wheelDiameter)
+                            .overlay(Circle().stroke(Color.black.opacity(0.22), lineWidth: 1.5))
+                            .shadow(color: .black.opacity(0.38), radius: 12, x: 0, y: 6)
+                            .contentShape(Circle())
+                            .highPriorityGesture(
+                                DragGesture(minimumDistance: 0, coordinateSpace: .local)
+                                    .onChanged { value in
+                                        let radius = wheelDiameter / 2.0
+                                        let dx = value.location.x - radius
+                                        let dy = value.location.y - radius
+                                        let dist = hypot(dx, dy)
+
+                                        // Ignore drags right inside the center Select button
+                                        guard dist > (wheelDiameter * 0.16) else { return }
+
+                                        let angle = atan2(dy, dx) * 180.0 / .pi
+                                        if let prev = lastWheelAngle {
+                                            var delta = angle - prev
+                                            if delta > 180 { delta -= 360 }
+                                            if delta < -180 { delta += 360 }
+
+                                            // Ignore sudden jumps if finger lifted and tapped opposite side
+                                            if abs(delta) < 75 {
+                                                accumulatedDeltaAngle += delta
+                                                let stepDegrees = 9.5 // Ultra-responsive 9.5° per item!
+                                                if abs(accumulatedDeltaAngle) >= stepDegrees {
+                                                    let steps = Int(accumulatedDeltaAngle / stepDegrees)
+                                                    accumulatedDeltaAngle -= Double(steps) * stepDegrees
+                                                    handleWheelScroll(steps: steps)
+                                                }
+                                            }
+                                        }
+                                        lastWheelAngle = angle
+                                    }
+                                    .onEnded { _ in
+                                        lastWheelAngle = nil
+                                        accumulatedDeltaAngle = 0
+                                    }
+                            )
+
+                        // Top & Bottom Wheel Buttons (MENU & PLAY/PAUSE)
+                        VStack {
+                            Button {
+                                triggerClickHaptic()
+                                handleMenuButton()
+                            } label: {
+                                Text("MENU")
+                                    .font(.system(size: 13, weight: .black, design: .rounded))
+                                    .tracking(1.3)
+                                    .foregroundColor(.gray.opacity(0.95))
+                                    .padding(.top, 16)
+                                    .frame(width: 90, height: 46)
+                            }
+                            .buttonStyle(.plain)
+
+                            Spacer()
+
+                            Button {
+                                triggerClickHaptic()
+                                engine.togglePlayPause()
+                            } label: {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "play.fill")
+                                    Image(systemName: "pause.fill")
+                                }
+                                .font(.system(size: 13, weight: .bold))
+                                .foregroundColor(.gray.opacity(0.95))
+                                .padding(.bottom, 16)
+                                .frame(width: 90, height: 46)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                        .frame(width: wheelDiameter, height: wheelDiameter)
+
+                        // Left & Right Wheel Buttons (PREV & NEXT)
+                        HStack {
+                            Button {
+                                triggerClickHaptic()
+                                engine.previousTrack()
+                            } label: {
+                                Image(systemName: "backward.end.alt.fill")
+                                    .font(.system(size: 14, weight: .bold))
+                                    .foregroundColor(.gray.opacity(0.95))
+                                    .padding(.leading, 16)
+                                    .frame(width: 54, height: 90)
+                            }
+                            .buttonStyle(.plain)
+
+                            Spacer()
+
+                            Button {
+                                triggerClickHaptic()
+                                engine.nextTrack()
+                            } label: {
+                                Image(systemName: "forward.end.alt.fill")
+                                    .font(.system(size: 14, weight: .bold))
+                                    .foregroundColor(.gray.opacity(0.95))
+                                    .padding(.trailing, 16)
+                                    .frame(width: 54, height: 90)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                        .frame(width: wheelDiameter, height: wheelDiameter)
+
+                        // Center Tactile Select Button
+                        Button {
+                            triggerClickHaptic(heavy: true)
+                            handleCenterSelect()
+                        } label: {
+                            Circle()
+                                .fill(
+                                    LinearGradient(
+                                        colors: [Color(white: 0.74), Color(white: 0.88)],
+                                        startPoint: .topLeading,
+                                        endPoint: .bottomTrailing
+                                    )
+                                )
+                                .frame(width: wheelDiameter * 0.35, height: wheelDiameter * 0.35)
+                                .overlay(Circle().stroke(Color.black.opacity(0.28), lineWidth: 1.2))
+                                .shadow(color: .black.opacity(0.15), radius: 2, x: 0, y: 1)
+                        }
+                        .buttonStyle(.plain)
+                    }
+
+                    Spacer()
                 }
-                .buttonStyle(.plain)
             }
         }
-        .padding(.horizontal, 18)
-        .padding(.vertical, 20)
-        .background(
-            RoundedRectangle(cornerRadius: 36)
-                .fill(
-                    LinearGradient(
-                        colors: [Color(white: 0.86), Color(white: 0.72), Color(white: 0.64)],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 36)
-                        .stroke(Color.white.opacity(0.65), lineWidth: 2)
-                )
-                .shadow(color: .black.opacity(0.65), radius: 18, x: 0, y: 10)
-        )
     }
 
     private var statusBarTitle: String {
         switch currentScreen {
-        case .rootMenu: return "MusiQ iPod"
-        case .songsList: return "Songs"
+        case .rootMenu: return "iPod"
+        case .songsList: return "Songs (\(engine.allTracks.count))"
         case .playlistsList: return "Playlists"
         case .playlistTracks: return "Playlist"
         case .nowPlaying: return "Now Playing"
@@ -2196,15 +2259,15 @@ struct IPodClassicInteractiveView: View {
     }
 
     @ViewBuilder
-    private func ipodSplitScreenRootMenu() -> some View {
+    private func ipodSplitScreenRootMenu(totalWidth: CGFloat, totalHeight: CGFloat) -> some View {
+        let halfW = totalWidth * 0.52
         HStack(spacing: 0) {
-            // Left Half: Classic Blue-Highlighted Menu
             VStack(spacing: 0) {
                 ForEach(0..<rootMenuItems.count, id: \.self) { idx in
                     let isSel = (selectedRow == idx)
                     HStack {
                         Text(rootMenuItems[idx])
-                            .font(.system(size: 13, weight: .bold))
+                            .font(.system(size: 14, weight: .bold))
                             .foregroundColor(isSel ? .white : .black)
                             .lineLimit(1)
                         Spacer()
@@ -2212,113 +2275,154 @@ struct IPodClassicInteractiveView: View {
                             .font(.system(size: 10, weight: .bold))
                             .foregroundColor(isSel ? .white : .gray)
                     }
-                    .padding(.horizontal, 8)
-                    .frame(height: 28)
+                    .padding(.horizontal, 10)
+                    .frame(height: 32)
                     .background(
                         isSel
                             ? LinearGradient(colors: [Color(red: 0.22, green: 0.58, blue: 0.98), Color(red: 0.10, green: 0.38, blue: 0.86)], startPoint: .top, endPoint: .bottom)
                             : LinearGradient(colors: [.clear, .clear], startPoint: .top, endPoint: .bottom)
                     )
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        triggerClickHaptic()
+                        selectedRow = idx
+                        handleCenterSelect()
+                    }
                 }
                 Spacer()
             }
-            .frame(width: 142)
+            .frame(width: halfW, height: totalHeight)
             .overlay(Rectangle().fill(Color.gray.opacity(0.35)).frame(width: 1), alignment: .trailing)
 
-            // Right Half: Split-Screen Album Art Preview Pane
             ZStack {
                 if let track = engine.currentTrack ?? engine.allTracks.first,
                    let art = ArtworkCache.shared.artwork(for: track.fileName) {
                     Image(uiImage: art)
                         .resizable()
                         .scaledToFill()
-                        .frame(width: 106, height: 106)
+                        .frame(width: totalWidth * 0.36, height: totalWidth * 0.36)
                         .clipShape(RoundedRectangle(cornerRadius: 6))
-                        .shadow(color: .black.opacity(0.35), radius: 5, x: 0, y: 3)
+                        .shadow(color: .black.opacity(0.35), radius: 6, x: 0, y: 3)
                 } else {
                     Image(systemName: "music.quarternote.3")
-                        .font(.system(size: 44))
+                        .font(.system(size: 46))
                         .foregroundColor(.gray.opacity(0.5))
                 }
             }
-            .frame(width: 136)
+            .frame(width: totalWidth - halfW, height: totalHeight)
         }
     }
 
     @ViewBuilder
-    private func ipodSingleListScreen(items: [String]) -> some View {
-        let visibleWindow = 6
-        let startIdx = max(0, min(selectedRow - 2, max(0, items.count - visibleWindow)))
-        let endIdx = min(items.count, startIdx + visibleWindow)
+    private func ipodSingleListScreen(items: [String], subtitles: [String], height: CGFloat) -> some View {
+        let rowHeight: CGFloat = 32
+        let visibleRows = max(1, Int(height / rowHeight))
+        let clampedSel = max(0, min(max(0, items.count - 1), selectedRow))
+        let startIdx = max(0, min(clampedSel - (visibleRows / 2), max(0, items.count - visibleRows)))
+        let endIdx = min(items.count, startIdx + visibleRows)
 
-        VStack(spacing: 0) {
-            ForEach(startIdx..<endIdx, id: \.self) { idx in
-                let isSel = (selectedRow == idx)
-                HStack {
-                    Text(items[idx])
-                        .font(.system(size: 13, weight: .bold))
-                        .foregroundColor(isSel ? .white : .black)
-                        .lineLimit(1)
-                    Spacer()
+        HStack(spacing: 0) {
+            VStack(spacing: 0) {
+                ForEach(startIdx..<endIdx, id: \.self) { idx in
+                    let isSel = (clampedSel == idx)
+                    HStack {
+                        Text(items[idx])
+                            .font(.system(size: 13.5, weight: .bold))
+                            .foregroundColor(isSel ? .white : .black)
+                            .lineLimit(1)
+                        Spacer()
+                        if subtitles.indices.contains(idx) {
+                            Text(subtitles[idx])
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundColor(isSel ? .white.opacity(0.85) : .gray)
+                                .lineLimit(1)
+                                .frame(maxWidth: 90, alignment: .trailing)
+                        }
+                    }
+                    .padding(.horizontal, 10)
+                    .frame(height: rowHeight)
+                    .background(
+                        isSel
+                            ? LinearGradient(colors: [Color(red: 0.22, green: 0.58, blue: 0.98), Color(red: 0.10, green: 0.38, blue: 0.86)], startPoint: .top, endPoint: .bottom)
+                            : LinearGradient(colors: [.clear, .clear], startPoint: .top, endPoint: .bottom)
+                    )
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        triggerClickHaptic(heavy: true)
+                        selectedRow = idx
+                        handleCenterSelect()
+                    }
                 }
-                .padding(.horizontal, 10)
-                .frame(height: 29)
-                .background(
-                    isSel
-                        ? LinearGradient(colors: [Color(red: 0.22, green: 0.58, blue: 0.98), Color(red: 0.10, green: 0.38, blue: 0.86)], startPoint: .top, endPoint: .bottom)
-                        : LinearGradient(colors: [.clear, .clear], startPoint: .top, endPoint: .bottom)
-                )
+                Spacer(minLength: 0)
             }
-            Spacer()
+
+            // Classic iPod Right-Edge Scrollbar Track
+            if items.count > visibleRows {
+                GeometryReader { sbGeo in
+                    let thumbRatio = CGFloat(visibleRows) / CGFloat(items.count)
+                    let thumbH = max(18, sbGeo.size.height * thumbRatio)
+                    let maxOffset = max(1, sbGeo.size.height - thumbH)
+                    let progressRatio = CGFloat(clampedSel) / CGFloat(max(1, items.count - 1))
+
+                    ZStack(alignment: .top) {
+                        Rectangle()
+                            .fill(Color.gray.opacity(0.22))
+                        RoundedRectangle(cornerRadius: 3)
+                            .fill(Color(red: 0.16, green: 0.48, blue: 0.92))
+                            .frame(width: 5, height: thumbH)
+                            .offset(y: maxOffset * progressRatio)
+                    }
+                }
+                .frame(width: 7)
+            }
         }
     }
 
     @ViewBuilder
-    private func ipodNowPlayingScreen() -> some View {
+    private func ipodNowPlayingScreen(width: CGFloat, height: CGFloat) -> some View {
         let track = engine.currentTrack
-        VStack(spacing: 10) {
-            HStack(spacing: 12) {
+        VStack(spacing: 12) {
+            HStack(spacing: 14) {
                 if let t = track, let art = ArtworkCache.shared.artwork(for: t.fileName) {
                     Image(uiImage: art)
                         .resizable()
                         .scaledToFill()
-                        .frame(width: 88, height: 88)
-                        .clipShape(RoundedRectangle(cornerRadius: 4))
+                        .frame(width: height * 0.54, height: height * 0.54)
+                        .clipShape(RoundedRectangle(cornerRadius: 5))
                         .shadow(color: .black.opacity(0.35), radius: 4, x: 2, y: 2)
                 } else {
-                    RoundedRectangle(cornerRadius: 4)
+                    RoundedRectangle(cornerRadius: 5)
                         .fill(Color.gray.opacity(0.3))
-                        .frame(width: 88, height: 88)
+                        .frame(width: height * 0.54, height: height * 0.54)
                         .overlay(Image(systemName: "music.note").foregroundColor(.gray))
                 }
 
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(track?.title ?? "No Track")
-                        .font(.system(size: 14, weight: .bold))
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(track?.title ?? "No Track Playing")
+                        .font(.system(size: 15, weight: .bold))
                         .foregroundColor(.black)
                         .lineLimit(2)
                     Text(track?.artist ?? "Unknown Artist")
-                        .font(.system(size: 12, weight: .semibold))
+                        .font(.system(size: 12.5, weight: .semibold))
                         .foregroundColor(.gray)
                         .lineLimit(1)
                     Text("\(engine.currentIndex + 1) of \(max(1, engine.currentQueue.count))")
-                        .font(.system(size: 10, weight: .bold))
-                        .foregroundColor(.gray.opacity(0.8))
+                        .font(.system(size: 10.5, weight: .bold))
+                        .foregroundColor(.gray.opacity(0.85))
                 }
                 Spacer()
             }
-            .padding(.horizontal, 12)
-            .padding(.top, 10)
+            .padding(.horizontal, 14)
+            .padding(.top, 12)
 
-            // Classic Glossy Blue iPod Progress Bar
-            VStack(spacing: 4) {
+            VStack(spacing: 5) {
                 GeometryReader { geo in
                     let ratio = CGFloat(min(max(progress.currentTime / max(progress.duration, 1), 0), 1))
                     ZStack(alignment: .leading) {
-                        RoundedRectangle(cornerRadius: 4)
+                        RoundedRectangle(cornerRadius: 5)
                             .fill(Color.gray.opacity(0.28))
-                            .frame(height: 10)
-                        RoundedRectangle(cornerRadius: 4)
+                            .frame(height: 11)
+                        RoundedRectangle(cornerRadius: 5)
                             .fill(
                                 LinearGradient(
                                     colors: [Color(red: 0.30, green: 0.68, blue: 1.0), Color(red: 0.12, green: 0.42, blue: 0.90)],
@@ -2326,22 +2430,22 @@ struct IPodClassicInteractiveView: View {
                                     endPoint: .bottom
                                 )
                             )
-                            .frame(width: geo.size.width * ratio, height: 10)
+                            .frame(width: geo.size.width * ratio, height: 11)
                     }
                 }
-                .frame(height: 10)
+                .frame(height: 11)
 
                 HStack {
                     Text(formatIPodTime(progress.currentTime))
-                        .font(.system(size: 10, weight: .bold, design: .monospaced))
+                        .font(.system(size: 10.5, weight: .bold, design: .monospaced))
                         .foregroundColor(.black.opacity(0.75))
                     Spacer()
                     Text("-" + formatIPodTime(max(0, progress.duration - progress.currentTime)))
-                        .font(.system(size: 10, weight: .bold, design: .monospaced))
+                        .font(.system(size: 10.5, weight: .bold, design: .monospaced))
                         .foregroundColor(.black.opacity(0.75))
                 }
             }
-            .padding(.horizontal, 14)
+            .padding(.horizontal, 16)
 
             Spacer()
         }
@@ -2375,8 +2479,7 @@ struct IPodClassicInteractiveView: View {
             guard !pTracks.isEmpty else { return }
             selectedRow = max(0, min(pTracks.count - 1, selectedRow + steps))
         case .nowPlaying:
-            // Scrub 3 seconds per click step when on Now Playing screen!
-            let target = max(0, min(progress.duration, progress.currentTime + Double(steps) * 3.0))
+            let target = max(0, min(progress.duration, progress.currentTime + Double(steps) * 2.5))
             engine.seek(to: target)
         }
     }
@@ -2546,7 +2649,7 @@ struct LoopingMarqueeText: View {
     }
 }
 
-// MARK: - 2-Line Capable Word-by-Word Karaoke Inline Lyric View
+// MARK: - 2-Line Capable Word-by-Word Karaoke Inline Lyric View (Kept Right Below Artist Name!)
 struct WordByWordInlineLyricView: View {
     @ObservedObject var progress: PlaybackProgressObserver
     let lines: [LyricLine]
@@ -2600,9 +2703,9 @@ struct WordByWordInlineLyricView: View {
                     }
                 } else {
                     HStack(spacing: 5) {
-                        Image(systemName: "quote.bubble")
-                            .font(.system(size: 11))
-                        Text("Tap to fetch or paste lyrics")
+                        Image(systemName: "arrow.down")
+                            .font(.system(size: 11, weight: .bold))
+                        Text("Scroll down or tap for lyrics")
                             .font(.system(size: 12, weight: .medium, design: .rounded))
                     }
                     .foregroundColor(.white.opacity(0.38))
@@ -2624,6 +2727,107 @@ struct WordByWordInlineLyricView: View {
             combined = combined + piece
         }
         return combined
+    }
+}
+
+// MARK: - Scroll-Down Spotify-Inspired Lyrics Card (Peeks at Bottom, Expands when Scrolled, Opens Full Sheet on Tap)
+struct ScrollDownLyricsPreviewCard: View {
+    @ObservedObject var progress: PlaybackProgressObserver
+    let lines: [LyricLine]
+    let autoOffset: Double
+    let isFetching: Bool
+    let cardTint: Color
+    let onOpenFullLyrics: () -> Void
+
+    private var activeIndex: Int? {
+        LyricsManager.activeLineIndex(
+            in: lines,
+            currentTime: progress.currentTime,
+            duration: progress.duration,
+            autoOffset: autoOffset
+        )
+    }
+
+    var body: some View {
+        Button(action: onOpenFullLyrics) {
+            VStack(alignment: .leading, spacing: 18) {
+                // Card Top Header ("Lyrics" + Expand Icon, No Share Button!)
+                HStack {
+                    Text("Lyrics")
+                        .font(.system(size: 20, weight: .bold, design: .rounded))
+                        .foregroundColor(.white)
+
+                    Spacer()
+
+                    ZStack {
+                        Circle()
+                            .fill(Color.black.opacity(0.28))
+                            .frame(width: 34, height: 34)
+                        Image(systemName: "arrow.up.left.and.arrow.down.right")
+                            .font(.system(size: 13, weight: .bold))
+                            .foregroundColor(.white)
+                    }
+                }
+
+                // Multi-Line Synced Lyrics Preview Window inside the Card
+                if !lines.isEmpty, let currentIdx = activeIndex {
+                    let startIdx = max(0, min(currentIdx - 1, max(0, lines.count - 5)))
+                    let endIdx = min(lines.count, startIdx + 5)
+
+                    VStack(alignment: .leading, spacing: 12) {
+                        ForEach(startIdx..<endIdx, id: \.self) { idx in
+                            let isCurrent = (idx == currentIdx)
+                            Text(lines[idx].text)
+                                .font(.system(size: isCurrent ? 22 : 19, weight: .bold, design: .rounded))
+                                .foregroundColor(isCurrent ? .white : .black.opacity(0.48))
+                                .lineLimit(2)
+                                .multilineTextAlignment(.leading)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .animation(.spring(response: 0.34, dampingFraction: 0.84), value: currentIdx)
+                        }
+                    }
+                    .padding(.vertical, 4)
+                } else if isFetching {
+                    HStack(spacing: 10) {
+                        ProgressView().tint(.white)
+                        Text("Syncing live lyrics...")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundColor(.white.opacity(0.8))
+                    }
+                    .padding(.vertical, 24)
+                } else {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("No verified synced lyrics yet.")
+                            .font(.system(size: 18, weight: .bold, design: .rounded))
+                            .foregroundColor(.white.opacity(0.9))
+                        Text("Tap this card to auto-fetch or paste custom lyrics.")
+                            .font(.subheadline.weight(.medium))
+                            .foregroundColor(.white.opacity(0.65))
+                    }
+                    .padding(.vertical, 18)
+                }
+            }
+            .padding(22)
+            .background(
+                RoundedRectangle(cornerRadius: 24)
+                    .fill(
+                        LinearGradient(
+                            colors: [
+                                cardTint.opacity(0.92),
+                                cardTint.opacity(0.75)
+                            ],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 24)
+                            .stroke(Color.white.opacity(0.18), lineWidth: 1)
+                    )
+            )
+            .shadow(color: .black.opacity(0.45), radius: 14, x: 0, y: 8)
+        }
+        .buttonStyle(.plain)
     }
 }
 
@@ -2995,7 +3199,7 @@ struct PlaylistArtworkThumbnailView: View {
     }
 }
 
-// MARK: - Root Tab View (With Dynamic Island Live Pill & iPod Mode Tab)
+// MARK: - Root Tab View (Supports Full-Screen Standalone iPod Mode Switch)
 struct MusiQRootView: View {
     @StateObject private var engine = MusiQEngine()
     @State private var selectedTab: Int = 0
@@ -3030,7 +3234,6 @@ struct MusiQRootView: View {
             }
             .tint(.purple)
 
-            // Top Dynamic Island Live Activity Overlay when browsing tabs
             VStack {
                 DynamicIslandLiveBanner(engine: engine, progress: engine.progress)
                     .padding(.top, 4)
@@ -3048,6 +3251,11 @@ struct MusiQRootView: View {
         }
         .fullScreenCover(isPresented: $showFullPlayer) {
             FullPlayerDeckView(engine: engine, isPresented: $showFullPlayer)
+        }
+        .fullScreenCover(isPresented: $engine.isIPodModeActive) {
+            FullScreenIPodClassicModeView(engine: engine, progress: engine.progress) {
+                engine.isIPodModeActive = false
+            }
         }
     }
 }
@@ -3746,7 +3954,7 @@ struct MiniPlayerBar: View {
     }
 }
 
-// MARK: - Full-Screen Player (With iPod Mode + Symmetrically Centered 5-Column Bottom Action Bar)
+// MARK: - Full-Screen Player (Scroll-Down Spotify Lyrics Card + Sticky Pinned 4-Column Bottom Bar)
 struct FullPlayerDeckView: View {
     @ObservedObject var engine: MusiQEngine
     @Binding var isPresented: Bool
@@ -3768,7 +3976,7 @@ struct FullPlayerDeckView: View {
     var body: some View {
         GeometryReader { geo in
             let safeWidth = geo.size.width
-            let artBoxSize = min(safeWidth - 76, 268)
+            let artBoxSize = min(safeWidth - 76, 264)
 
             ZStack {
                 LinearGradient(
@@ -3779,8 +3987,8 @@ struct FullPlayerDeckView: View {
                 .ignoresSafeArea()
                 .animation(.easeInOut(duration: 0.65), value: engine.currentTrack?.fileName)
 
-                VStack(spacing: 6) {
-                    // Top Bar + Dynamic Island Live Pill
+                VStack(spacing: 0) {
+                    // Fixed Top Bar
                     HStack {
                         Button {
                             isPresented = false
@@ -3804,177 +4012,188 @@ struct FullPlayerDeckView: View {
                         }
                     }
                     .padding(.horizontal, 16)
+                    .padding(.bottom, 6)
 
-                    // 4-Way Display Mode Switcher (Sleeve, Cassette, Vinyl, iPod)
-                    HStack(spacing: 8) {
-                        ForEach(VisualMode.allCases, id: \.self) { mode in
-                            Button {
-                                withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
-                                    engine.visualMode = mode
+                    // Scrollable Main Player Stage + Scroll-Down Lyrics Card
+                    ScrollView(showsIndicators: false) {
+                        VStack(spacing: 8) {
+                            // 3-Way Display Mode Switcher (Sleeve, Cassette, Side Vinyl)
+                            HStack(spacing: 10) {
+                                ForEach(VisualMode.allCases, id: \.self) { mode in
+                                    Button {
+                                        withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                                            engine.visualMode = mode
+                                        }
+                                    } label: {
+                                        HStack(spacing: 6) {
+                                            Image(systemName: mode.icon)
+                                                .font(.caption)
+                                            Text(mode.rawValue)
+                                                .font(.caption.weight(.semibold))
+                                        }
+                                        .padding(.horizontal, 12)
+                                        .padding(.vertical, 7)
+                                        .background(engine.visualMode == mode ? Color.white.opacity(0.24) : Color.black.opacity(0.22))
+                                        .foregroundColor(.white)
+                                        .clipShape(Capsule())
+                                    }
                                 }
-                            } label: {
-                                HStack(spacing: 5) {
-                                    Image(systemName: mode.icon)
-                                        .font(.caption)
-                                    Text(mode.rawValue)
-                                        .font(.caption.weight(.semibold))
-                                }
-                                .padding(.horizontal, 11)
-                                .padding(.vertical, 7)
-                                .background(engine.visualMode == mode ? Color.white.opacity(0.24) : Color.black.opacity(0.22))
-                                .foregroundColor(.white)
-                                .clipShape(Capsule())
                             }
-                        }
-                    }
+                            .padding(.top, 2)
 
-                    Spacer(minLength: 4)
+                            Spacer(minLength: 6)
 
-                    if engine.visualMode == .ipod {
-                        // Full Realistic iPod Classic Interactive Mode!
-                        IPodClassicInteractiveView(engine: engine, progress: engine.progress)
-                            .rotation3DEffect(.degrees(motion.pitch * 0.6), axis: (x: 1, y: 0, z: 0), perspective: 0.4)
-                            .rotation3DEffect(.degrees(motion.roll * 0.6), axis: (x: 0, y: 1, z: 0), perspective: 0.4)
-                            .transition(.scale(scale: 0.92).combined(with: .opacity))
-                    } else {
-                        // Standard Visualizer Stage (Sleeve, Cassette, Side Vinyl)
-                        ZStack {
-                            if let activeTrack = engine.currentTrack {
-                                let capturedPalette = ArtworkCache.shared.cassettePalette(for: activeTrack.fileName)
-                                PlayerVisualizerStage(
-                                    mode: engine.visualMode,
-                                    track: activeTrack,
-                                    isPlaying: engine.isPlaying,
-                                    boxSize: artBoxSize,
-                                    refreshID: engine.artworkRefreshID,
-                                    zonePalette: capturedPalette
-                                )
-                                .id(activeTrack.fileName)
-                                .transition(
-                                    .asymmetric(
-                                        insertion: .offset(x: engine.skipTransitionDirection >= 0 ? 140 : -140)
-                                            .combined(with: .scale(scale: 0.86))
-                                            .combined(with: .opacity),
-                                        removal: .offset(x: engine.skipTransitionDirection >= 0 ? -140 : 140)
-                                            .combined(with: .scale(scale: 0.86))
-                                            .combined(with: .opacity)
+                            // Value-Captured Visualizer Stage
+                            ZStack {
+                                if let activeTrack = engine.currentTrack {
+                                    let capturedPalette = ArtworkCache.shared.cassettePalette(for: activeTrack.fileName)
+                                    PlayerVisualizerStage(
+                                        mode: engine.visualMode,
+                                        track: activeTrack,
+                                        isPlaying: engine.isPlaying,
+                                        boxSize: artBoxSize,
+                                        refreshID: engine.artworkRefreshID,
+                                        zonePalette: capturedPalette
                                     )
+                                    .id(activeTrack.fileName)
+                                    .transition(
+                                        .asymmetric(
+                                            insertion: .offset(x: engine.skipTransitionDirection >= 0 ? 140 : -140)
+                                                .combined(with: .scale(scale: 0.86))
+                                                .combined(with: .opacity),
+                                            removal: .offset(x: engine.skipTransitionDirection >= 0 ? -140 : 140)
+                                                .combined(with: .scale(scale: 0.86))
+                                                .combined(with: .opacity)
+                                        )
+                                    )
+                                }
+                            }
+                            .rotation3DEffect(.degrees(motion.pitch), axis: (x: 1, y: 0, z: 0), perspective: 0.4)
+                            .rotation3DEffect(.degrees(motion.roll), axis: (x: 0, y: 1, z: 0), perspective: 0.4)
+                            .offset(x: CGFloat(motion.roll * 1.3), y: CGFloat(motion.pitch * 1.3))
+                            .frame(width: safeWidth - 16, height: artBoxSize + 10)
+                            .padding(.bottom, 20)
+
+                            if let err = engine.playbackErrorMessage {
+                                Text(err)
+                                    .font(.caption2)
+                                    .foregroundColor(.red)
+                                    .multilineTextAlignment(.center)
+                                    .padding(.horizontal, 20)
+                            }
+
+                            // Song Title + Artist
+                            VStack(spacing: 4) {
+                                LoopingMarqueeText(
+                                    text: engine.currentTrack?.title ?? "No Track Selected",
+                                    font: .system(size: 22, weight: .bold),
+                                    textColor: .white
                                 )
+                                .frame(width: safeWidth - 48)
+
+                                Text(engine.currentTrack?.artist ?? "MusiQ Local Library")
+                                    .font(.subheadline.weight(.medium))
+                                    .foregroundColor(.white.opacity(0.72))
+                                    .lineLimit(1)
                             }
-                        }
-                        .rotation3DEffect(.degrees(motion.pitch), axis: (x: 1, y: 0, z: 0), perspective: 0.4)
-                        .rotation3DEffect(.degrees(motion.roll), axis: (x: 0, y: 1, z: 0), perspective: 0.4)
-                        .offset(x: CGFloat(motion.roll * 1.3), y: CGFloat(motion.pitch * 1.3))
-                        .frame(width: safeWidth - 16, height: artBoxSize + 10)
-                        .padding(.bottom, 22)
+                            .padding(.horizontal, 24)
 
-                        if let err = engine.playbackErrorMessage {
-                            Text(err)
-                                .font(.caption2)
-                                .foregroundColor(.red)
-                                .multilineTextAlignment(.center)
-                                .padding(.horizontal, 20)
-                        }
-
-                        // Song Title + Artist
-                        VStack(spacing: 4) {
-                            LoopingMarqueeText(
-                                text: engine.currentTrack?.title ?? "No Track Selected",
-                                font: .system(size: 22, weight: .bold),
-                                textColor: .white
-                            )
-                            .frame(width: safeWidth - 48)
-
-                            Text(engine.currentTrack?.artist ?? "MusiQ Local Library")
-                                .font(.subheadline.weight(.medium))
-                                .foregroundColor(.white.opacity(0.72))
-                                .lineLimit(1)
-                        }
-                        .padding(.horizontal, 24)
-
-                        // Word-by-Word Karaoke Inline Lyric Display
-                        WordByWordInlineLyricView(
-                            progress: engine.progress,
-                            lines: engine.currentTrackLyrics,
-                            autoOffset: engine.autoDetectedLyricOffset,
-                            isFetching: engine.isFetchingLyricsInBackground
-                        ) {
-                            activeBottomSheet = .lyrics
-                        }
-                        .padding(.horizontal, 20)
-                        .padding(.top, 2)
-
-                        // Isolated Scrubber + Timers
-                        IsolatedScrubberView(progress: engine.progress) { newSeconds in
-                            engine.seek(to: newSeconds)
-                        }
-                        .padding(.horizontal, 24)
-
-                        // A-B Loop Pill
-                        Button {
-                            engine.toggleABLoop()
-                        } label: {
-                            Text(abLoopLabel)
-                                .font(.caption2.weight(.semibold))
-                                .padding(.horizontal, 14)
-                                .padding(.vertical, 5)
-                                .background(engine.loopStart != nil ? Color.purple : Color.black.opacity(0.26))
-                                .foregroundColor(.white)
-                                .clipShape(Capsule())
-                        }
-
-                        // Transport Controls
-                        HStack(spacing: 34) {
-                            Button {
-                                engine.isShuffle.toggle()
-                            } label: {
-                                Image(systemName: "shuffle")
-                                    .font(.title3)
-                                    .foregroundColor(engine.isShuffle ? .white : .white.opacity(0.45))
+                            // Inline Synced Lyrics right under the Artist Name (Preserved!)
+                            WordByWordInlineLyricView(
+                                progress: engine.progress,
+                                lines: engine.currentTrackLyrics,
+                                autoOffset: engine.autoDetectedLyricOffset,
+                                isFetching: engine.isFetchingLyricsInBackground
+                            ) {
+                                activeBottomSheet = .lyrics
                             }
+                            .padding(.horizontal, 20)
+                            .padding(.top, 2)
 
+                            // Isolated Scrubber + Timers
+                            IsolatedScrubberView(progress: engine.progress) { newSeconds in
+                                engine.seek(to: newSeconds)
+                            }
+                            .padding(.horizontal, 24)
+
+                            // A-B Loop Pill
                             Button {
-                                engine.previousTrack()
+                                engine.toggleABLoop()
                             } label: {
-                                Image(systemName: "backward.fill")
-                                    .font(.title)
+                                Text(abLoopLabel)
+                                    .font(.caption2.weight(.semibold))
+                                    .padding(.horizontal, 14)
+                                    .padding(.vertical, 5)
+                                    .background(engine.loopStart != nil ? Color.purple : Color.black.opacity(0.26))
                                     .foregroundColor(.white)
+                                    .clipShape(Capsule())
                             }
 
-                            Button {
-                                engine.togglePlayPause()
-                            } label: {
-                                ZStack {
-                                    Circle()
-                                        .fill(Color.white.opacity(0.22))
-                                        .frame(width: 68, height: 68)
-                                    Image(systemName: engine.isPlaying ? "pause.fill" : "play.fill")
-                                        .font(.system(size: 27, weight: .bold))
+                            // Transport Controls
+                            HStack(spacing: 34) {
+                                Button {
+                                    engine.isShuffle.toggle()
+                                } label: {
+                                    Image(systemName: "shuffle")
+                                        .font(.title3)
+                                        .foregroundColor(engine.isShuffle ? .white : .white.opacity(0.45))
+                                }
+
+                                Button {
+                                    engine.previousTrack()
+                                } label: {
+                                    Image(systemName: "backward.fill")
+                                        .font(.title)
                                         .foregroundColor(.white)
                                 }
-                            }
 
-                            Button {
-                                engine.nextTrack()
-                            } label: {
-                                Image(systemName: "forward.fill")
-                                    .font(.title)
-                                    .foregroundColor(.white)
-                            }
+                                Button {
+                                    engine.togglePlayPause()
+                                } label: {
+                                    ZStack {
+                                        Circle()
+                                            .fill(Color.white.opacity(0.22))
+                                            .frame(width: 68, height: 68)
+                                        Image(systemName: engine.isPlaying ? "pause.fill" : "play.fill")
+                                            .font(.system(size: 27, weight: .bold))
+                                            .foregroundColor(.white)
+                                    }
+                                }
 
-                            Button {
-                                engine.isRepeat.toggle()
-                            } label: {
-                                Image(systemName: "repeat")
-                                    .font(.title3)
-                                    .foregroundColor(engine.isRepeat ? .white : .white.opacity(0.45))
+                                Button {
+                                    engine.nextTrack()
+                                } label: {
+                                    Image(systemName: "forward.fill")
+                                        .font(.title)
+                                        .foregroundColor(.white)
+                                }
+
+                                Button {
+                                    engine.isRepeat.toggle()
+                                } label: {
+                                    Image(systemName: "repeat")
+                                        .font(.title3)
+                                        .foregroundColor(engine.isRepeat ? .white : .white.opacity(0.45))
+                                }
                             }
+                            .padding(.bottom, 16)
+
+                            // Scroll-Down Spotify-Style Lyrics Card (Tap to Open Full Apple Music Lyrics Sheet!)
+                            ScrollDownLyricsPreviewCard(
+                                progress: engine.progress,
+                                lines: engine.currentTrackLyrics,
+                                autoOffset: engine.autoDetectedLyricOffset,
+                                isFetching: engine.isFetchingLyricsInBackground,
+                                cardTint: dynamicAlbumGradient.first ?? .purple
+                            ) {
+                                activeBottomSheet = .lyrics
+                            }
+                            .padding(.horizontal, 20)
+                            .padding(.bottom, 24)
                         }
                     }
 
-                    Spacer(minLength: 4)
-
-                    // Symmetrically Centered 5-Column Bottom Action Bar (DSP, Lyrics, Tags, Queue, Source)
+                    // Pinned, Non-Scrolling Symmetrically Centered 4-Column Bottom Bar (DSP, Tags, Queue, Source)
                     HStack(spacing: 0) {
                         Button {
                             activeBottomSheet = .dsp
@@ -3984,20 +4203,6 @@ struct FullPlayerDeckView: View {
                                     .font(.system(size: 18, weight: .semibold))
                                     .frame(width: 24, height: 24)
                                 Text("DSP")
-                                    .font(.caption2.weight(.medium))
-                            }
-                            .frame(maxWidth: .infinity)
-                            .foregroundColor(.white.opacity(0.88))
-                        }
-
-                        Button {
-                            activeBottomSheet = .lyrics
-                        } label: {
-                            VStack(spacing: 5) {
-                                Image(systemName: "quote.bubble.fill")
-                                    .font(.system(size: 18, weight: .semibold))
-                                    .frame(width: 24, height: 24)
-                                Text("Lyrics")
                                     .font(.caption2.weight(.medium))
                             }
                             .frame(maxWidth: .infinity)
@@ -4032,7 +4237,6 @@ struct FullPlayerDeckView: View {
                             .foregroundColor(.white.opacity(0.88))
                         }
 
-                        // Centered 5th Column: Native Audio Route Picker ("Source")
                         VStack(spacing: 5) {
                             ZStack {
                                 AudioSourcePickerButton()
@@ -4046,23 +4250,25 @@ struct FullPlayerDeckView: View {
                         .frame(maxWidth: .infinity)
                     }
                     .padding(.horizontal, 16)
-                    .padding(.top, 4)
-                    .padding(.bottom, 12)
+                    .padding(.vertical, 10)
+                    .background(
+                        Color.black.opacity(0.28)
+                            .background(.ultraThinMaterial.opacity(0.5))
+                            .ignoresSafeArea(edges: .bottom)
+                    )
                 }
             }
-            .offset(x: max(0, dragOffset.width), y: max(0, dragOffset.height * 0.3))
+            .offset(x: max(0, dragOffset.width), y: 0)
             .gesture(
                 DragGesture()
                     .onChanged { value in
-                        // Don't hijack circular Click Wheel drags when in iPod mode
-                        guard engine.visualMode != .ipod else { return }
-                        if value.translation.width > 0 || value.translation.height > 0 {
+                        // Only swipe-right from edge to dismiss so vertical scrolling into lyrics is effortless
+                        if value.translation.width > abs(value.translation.height) && value.translation.width > 0 {
                             dragOffset = value.translation
                         }
                     }
                     .onEnded { value in
-                        guard engine.visualMode != .ipod else { return }
-                        if value.translation.width > 95 || value.translation.height > 140 {
+                        if value.translation.width > 95 && value.translation.width > abs(value.translation.height) {
                             isPresented = false
                         }
                         withAnimation(.spring()) {
@@ -4166,7 +4372,7 @@ struct PlayerVisualizerStage: View {
     var body: some View {
         ZStack {
             switch mode {
-            case .sleeve, .ipod:
+            case .sleeve:
                 sleeveCover(size: boxSize)
 
             case .cassette:
@@ -4668,7 +4874,7 @@ struct QueueSheetView: View {
     }
 }
 
-// MARK: - Tab 3: Wi-Fi Browser Upload Bridge + Direct Cloud Audio URL Importer
+// MARK: - Tab 3: iPod Mode Switch + Wi-Fi Browser Upload Bridge + Direct Cloud Audio URL Importer
 struct DirectAudioImporterView: View {
     @ObservedObject var engine: MusiQEngine
     @StateObject private var wifiServer = WiFiUploadServer()
@@ -4682,7 +4888,20 @@ struct DirectAudioImporterView: View {
     var body: some View {
         NavigationStack {
             Form {
-                // 1. Local Wi-Fi Browser Drag & Drop Server Section
+                // 1. Full-Screen Standalone iPod Classic Mode Switch
+                Section("Classic Hardware Mode") {
+                    Toggle(isOn: $engine.isIPodModeActive) {
+                        Label("iPod Mode", systemImage: "ipod")
+                            .font(.headline)
+                    }
+                    .tint(.purple)
+
+                    Text("Transforms MusiQ into a full-screen 5th Gen iPod Classic with a tactile Click Wheel. Tap 'Quit iPod' in the top-left corner to return.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+
+                // 2. Local Wi-Fi Browser Drag & Drop Server Section
                 Section("Wi-Fi Browser Drag & Drop Bridge") {
                     Toggle(isOn: Binding(
                         get: { wifiServer.isRunning },
@@ -4727,7 +4946,7 @@ struct DirectAudioImporterView: View {
                     }
                 }
 
-                // 2. Direct & Cloud Audio URL Importer
+                // 3. Direct & Cloud Audio URL Importer
                 Section("Direct Audio File or Cloud Share Link") {
                     HStack {
                         TextField("https://example.com/song.mp3", text: $urlInput)
@@ -4775,7 +4994,7 @@ struct DirectAudioImporterView: View {
                         .foregroundColor(.secondary)
                 }
             }
-            .navigationTitle("Wi-Fi & URL Import")
+            .navigationTitle("Wi-Fi & Modes")
         }
     }
 
