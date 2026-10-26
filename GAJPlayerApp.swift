@@ -5,6 +5,11 @@ import MediaPlayer
 import UniformTypeIdentifiers
 import PhotosUI
 import CoreMotion
+import Network
+import AudioToolbox
+#if canImport(ActivityKit)
+import ActivityKit
+#endif
 
 // MARK: - App Entry
 @main
@@ -14,6 +19,285 @@ struct MusiQApp: App {
             MusiQRootView()
                 .preferredColorScheme(.dark)
         }
+    }
+}
+
+// MARK: - ActivityKit Live Activity Attributes (For Supported Provisioning Profiles)
+#if canImport(ActivityKit)
+@available(iOS 16.2, *)
+struct MusiQNowPlayingAttributes: ActivityAttributes {
+    public struct ContentState: Codable, Hashable {
+        var title: String
+        var artist: String
+        var isPlaying: Bool
+        var currentTime: Double
+        var duration: Double
+    }
+    var sessionName: String
+}
+#endif
+
+// MARK: - Local Wi-Fi Browser Drag-and-Drop Upload Server (Apple Network Framework)
+final class WiFiTransferServer: ObservableObject {
+    @Published var isRunning: Bool = false
+    @Published var serverURLString: String = ""
+    @Published var uploadedFilesCount: Int = 0
+    @Published var lastUploadedName: String = ""
+
+    private var listener: NWListener?
+    private let port: UInt16 = 8080
+    var onFileSaved: (() -> Void)?
+
+    func toggleServer() {
+        if isRunning {
+            stop()
+        } else {
+            start()
+        }
+    }
+
+    func start() {
+        stop()
+        do {
+            let params = NWParameters.tcp
+            params.allowLocalEndpointReuse = true
+            guard let nwPort = NWEndpoint.Port(rawValue: port) else { return }
+            let newListener = try NWListener(using: params, on: nwPort)
+
+            newListener.stateUpdateHandler = { [weak self] state in
+                DispatchQueue.main.async {
+                    guard let self = self else { return }
+                    switch state {
+                    case .ready:
+                        self.isRunning = true
+                        let ip = Self.localWiFiIPAddress() ?? "localhost"
+                        self.serverURLString = "http://\(ip):\(self.port)"
+                    case .failed, .cancelled:
+                        self.isRunning = false
+                        self.serverURLString = ""
+                    default:
+                        break
+                    }
+                }
+            }
+
+            newListener.newConnectionHandler = { [weak self] connection in
+                self?.handleConnection(connection)
+            }
+
+            newListener.start(queue: .global(qos: .userInitiated))
+            listener = newListener
+        } catch {
+            print("WiFi Server start error: \(error)")
+        }
+    }
+
+    func stop() {
+        listener?.cancel()
+        listener = nil
+        isRunning = false
+        serverURLString = ""
+    }
+
+    private func handleConnection(_ connection: NWConnection) {
+        connection.start(queue: .global(qos: .userInitiated))
+        var accumulated = Data()
+
+        func readNextChunk() {
+            connection.receive(minimumIncompleteLength: 1, maximumLength: 262_144) { [weak self] data, _, isComplete, error in
+                guard let self = self else {
+                    connection.cancel()
+                    return
+                }
+                if let chunk = data, !chunk.isEmpty {
+                    accumulated.append(chunk)
+                }
+
+                // Check if full HTTP request has arrived via Content-Length header
+                if let headerEndRange = accumulated.range(of: Data("\r\n\r\n".utf8)) {
+                    let headerData = accumulated.subdata(in: 0..<headerEndRange.lowerBound)
+                    let headerStr = String(data: headerData, encoding: .utf8) ?? ""
+                    let firstLine = headerStr.components(separatedBy: "\r\n").first ?? ""
+
+                    if firstLine.hasPrefix("GET ") {
+                        self.sendHTMLResponse(on: connection)
+                        return
+                    } else if firstLine.hasPrefix("POST ") {
+                        let contentLength = Self.parseContentLength(from: headerStr)
+                        let bodyStart = headerEndRange.upperBound
+                        let currentBodyBytes = accumulated.count - bodyStart
+                        if currentBodyBytes >= contentLength {
+                            let bodyData = accumulated.subdata(in: bodyStart..<(bodyStart + contentLength))
+                            let rawFileName = Self.parseHeaderValue(key: "X-File-Name", from: headerStr) ?? "Track_\(Int(Date().timeIntervalSince1970)).mp3"
+                            let decodedName = rawFileName.removingPercentEncoding ?? rawFileName
+                            self.saveUploadedFile(name: decodedName, data: bodyData)
+                            self.sendJSONSuccess(on: connection, fileName: decodedName)
+                            return
+                        }
+                    }
+                }
+
+                if isComplete || error != nil {
+                    connection.cancel()
+                } else {
+                    readNextChunk()
+                }
+            }
+        }
+
+        readNextChunk()
+    }
+
+    private func saveUploadedFile(name: String, data: Data) {
+        guard data.count > 4096 else { return }
+        let safeName = name
+            .replacingOccurrences(of: "/", with: "-")
+            .replacingOccurrences(of: ":", with: "-")
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let dest = docs.appendingPathComponent(safeName)
+        try? FileManager.default.removeItem(at: dest)
+        try? data.write(to: dest)
+
+        DispatchQueue.main.async {
+            self.uploadedFilesCount += 1
+            self.lastUploadedName = safeName
+            self.onFileSaved?()
+        }
+    }
+
+    private func sendHTMLResponse(on connection: NWConnection) {
+        let html = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>MusiQ Wi-Fi Transfer</title>
+        <style>
+            body { background: #0d0d12; color: #fff; font-family: -apple-system, BlinkMacSystemFont, sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 92vh; margin: 0; }
+            .card { background: #181822; border: 2px dashed #9b59b6; border-radius: 22px; padding: 48px 36px; text-align: center; max-width: 460px; width: 85%; transition: 0.2s; cursor: pointer; }
+            .card.dragover { background: #261b36; border-color: #d28eff; transform: scale(1.02); }
+            h1 { margin: 0 0 8px 0; font-size: 26px; }
+            p { color: #9a9aa6; font-size: 14px; margin-bottom: 24px; }
+            .btn { background: #9b59b6; color: #fff; padding: 12px 26px; border-radius: 99px; font-weight: 700; display: inline-block; }
+            #list { margin-top: 24px; text-align: left; font-size: 13px; color: #b8b8c4; max-height: 200px; overflow-y: auto; }
+            .ok { color: #2ecc71; font-weight: 600; }
+        </style>
+        </head>
+        <body>
+            <div class="card" id="dropzone" onclick="document.getElementById('fileInput').click()">
+                <h1>🎵 MusiQ Wi-Fi Drop</h1>
+                <p>Drag & drop .mp3, .m4a, .wav, or .flac files here, or click to browse.</p>
+                <div class="btn">Select Audio Files</div>
+                <input type="file" id="fileInput" multiple accept=".mp3,.m4a,.wav,.flac,.aac" style="display:none">
+                <div id="list"></div>
+            </div>
+            <script>
+                const zone = document.getElementById('dropzone');
+                const input = document.getElementById('fileInput');
+                const list = document.getElementById('list');
+                zone.addEventListener('dragover', e => { e.preventDefault(); zone.classList.add('dragover'); });
+                zone.addEventListener('dragleave', () => zone.classList.remove('dragover'));
+                zone.addEventListener('drop', e => {
+                    e.preventDefault();
+                    zone.classList.remove('dragover');
+                    handleFiles(e.dataTransfer.files);
+                });
+                input.addEventListener('change', e => handleFiles(e.target.files));
+                async function handleFiles(files) {
+                    for (const file of files) {
+                        const row = document.createElement('div');
+                        row.textContent = '⏳ Uploading ' + file.name + '...';
+                        list.prepend(row);
+                        try {
+                            const buf = await file.arrayBuffer();
+                            const res = await fetch('/upload', {
+                                method: 'POST',
+                                headers: { 'X-File-Name': encodeURIComponent(file.name), 'Content-Type': 'application/octet-stream' },
+                                body: buf
+                            });
+                            if (res.ok) {
+                                row.innerHTML = '<span class="ok">✅ Saved to MusiQ:</span> ' + file.name;
+                            } else {
+                                row.textContent = '❌ Failed: ' + file.name;
+                            }
+                        } catch (err) {
+                            row.textContent = '❌ Error: ' + file.name;
+                        }
+                    }
+                }
+            </script>
+        </body>
+        </html>
+        """
+        let body = Data(html.utf8)
+        let header = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n"
+        var payload = Data(header.utf8)
+        payload.append(body)
+        connection.send(content: payload, completion: .contentProcessed { _ in
+            connection.cancel()
+        })
+    }
+
+    private func sendJSONSuccess(on connection: NWConnection, fileName: String) {
+        let json = "{\"status\":\"ok\",\"file\":\"\(fileName)\"}"
+        let body = Data(json.utf8)
+        let header = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n"
+        var payload = Data(header.utf8)
+        payload.append(body)
+        connection.send(content: payload, completion: .contentProcessed { _ in
+            connection.cancel()
+        })
+    }
+
+    private static func parseContentLength(from headers: String) -> Int {
+        for line in headers.components(separatedBy: "\r\n") {
+            if line.lowercased().hasPrefix("content-length:") {
+                let val = line.dropFirst("content-length:".count).trimmingCharacters(in: .whitespaces)
+                return Int(val) ?? 0
+            }
+        }
+        return 0
+    }
+
+    private static func parseHeaderValue(key: String, from headers: String) -> String? {
+        let prefix = key.lowercased() + ":"
+        for line in headers.components(separatedBy: "\r\n") {
+            if line.lowercased().hasPrefix(prefix) {
+                return line.dropFirst(prefix.count).trimmingCharacters(in: .whitespaces)
+            }
+        }
+        return nil
+    }
+
+    static func localWiFiIPAddress() -> String? {
+        var address: String?
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0, let firstAddr = ifaddr else { return nil }
+        defer { freeifaddrs(ifaddr) }
+
+        for ptr in sequence(first: firstAddr, next: { $0.pointee.ifa_next }) {
+            let interface = ptr.pointee
+            let addrFamily = interface.ifa_addr.pointee.sa_family
+            if addrFamily == UInt8(AF_INET) {
+                let name = String(cString: interface.ifa_name)
+                if name == "en0" || name == "en1" || name.hasPrefix("bridge") {
+                    var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                    getnameinfo(
+                        interface.ifa_addr,
+                        socklen_t(interface.ifa_addr.pointee.sa_len),
+                        &hostname,
+                        socklen_t(hostname.count),
+                        nil,
+                        socklen_t(0),
+                        NI_NUMERICHOST
+                    )
+                    address = String(cString: hostname)
+                    if name == "en0" { break }
+                }
+            }
+        }
+        return address
     }
 }
 
@@ -428,10 +712,9 @@ final class ArtworkCache {
     }
 }
 
-// MARK: - Strict Version-Aware Lyrics Engine (Never Assigns Random Lyrics to Unreleased/Yedits Tracks!)
+// MARK: - Strict Version-Aware Lyrics Engine
 final class LyricsManager {
     static let shared = LyricsManager()
-    // Bumped to v6 so any previously cached wrong lyrics on fanmade/Yedits tracks are cleared immediately
     private let storageKey = "MusiQ_Saved_Lyrics_v6"
     private let matchedDurationKey = "MusiQ_Lyrics_MatchedDur_v6"
 
@@ -610,7 +893,7 @@ final class LyricsManager {
         do {
             var req = URLRequest(url: url)
             req.timeoutInterval = 10
-            req.setValue("MusiQ iOS Player v4.0", forHTTPHeaderField: "User-Agent")
+            req.setValue("MusiQ iOS Player v4.5", forHTTPHeaderField: "User-Agent")
             let (data, _) = try await URLSession.shared.data(for: req)
             guard let results = try JSONSerialization.jsonObject(with: data) as? [[String: Any]],
                   !results.isEmpty else {
@@ -621,7 +904,6 @@ final class LyricsManager {
             let targetNormArtist = Self.normalizeAlphanumeric(primaryArtist)
             let rawNormArtist = Self.normalizeAlphanumeric(rawArtist)
 
-            // STRICT VERIFICATION GATE: Rejects random unrelated songs for Yedits / fanmade tracks!
             let scored: [(item: [String: Any], score: Double)] = results.compactMap { item in
                 let synced = (item["syncedLyrics"] as? String) ?? ""
                 let plain = (item["plainLyrics"] as? String) ?? ""
@@ -632,7 +914,6 @@ final class LyricsManager {
                 let itemNormTitle = Self.normalizeAlphanumeric(itemCleanTitle)
                 let itemNormArtist = Self.normalizeAlphanumeric((item["artistName"] as? String) ?? "")
 
-                // 1. Strict Title Verification: The normalized title MUST match or share all core words
                 guard !itemNormTitle.isEmpty, !targetNormTitle.isEmpty else { return nil }
                 let isExactTitle = (itemNormTitle == targetNormTitle)
                 let isContainedTitle = (itemNormTitle.count >= 4 && targetNormTitle.count >= 4) &&
@@ -642,8 +923,6 @@ final class LyricsManager {
                     return nil
                 }
 
-                // 2. Strict Artist / Duration Verification:
-                // Never accept a song by a completely random artist unless the duration is an exact match (< 2.5s) AND the title is exact
                 let artistMatches = !targetNormArtist.isEmpty && (
                     itemNormArtist.contains(targetNormArtist) ||
                     targetNormArtist.contains(itemNormArtist) ||
@@ -654,13 +933,10 @@ final class LyricsManager {
                 let durDiff = targetDuration > 15 && itemDur > 15 ? abs(itemDur - targetDuration) : 999.0
 
                 if !artistMatches {
-                    // If the user's track has a known artist (e.g. Kanye West) and the result is a totally different artist,
-                    // only allow it if it's a collab alias (like The WRLDFMS Tony Williams) where the title is exact AND duration is within 3.5 seconds!
                     if !isExactTitle || durDiff > 3.5 {
                         return nil
                     }
                 } else {
-                    // Even if the artist matches, reject completely different songs or 10-minute stems if duration is off by more than 65s
                     if durDiff > 65.0 {
                         return nil
                     }
@@ -676,7 +952,6 @@ final class LyricsManager {
                 return (item, score)
             }
 
-            // Require a minimum confidence score of 115 so weak/unrelated hits are never accepted
             guard let bestEntry = scored.max(by: { $0.score < $1.score }),
                   bestEntry.score >= 115 else {
                 return nil
@@ -736,7 +1011,7 @@ final class PlaybackProgressObserver: ObservableObject {
     var isScrubbing: Bool = false
 }
 
-// MARK: - Crash-Proof, Sample-Rate Resampling Audio Engine
+// MARK: - Crash-Proof, Sample-Rate Resampling Audio Engine + Live Activity Sync
 final class MusiQEngine: ObservableObject {
     @Published var allTracks: [Track] = []
     @Published var playlists: [Playlist] = []
@@ -1166,7 +1441,6 @@ final class MusiQEngine: ObservableObject {
         }
     }
 
-    // MARK: - True Old-to-New Cover Transition on Skip & Play
     func playTrack(_ track: Track, in queue: [Track]) {
         let validQueue = queue.isEmpty ? allTracks : queue
         skipTransitionDirection = 1
@@ -1240,6 +1514,7 @@ final class MusiQEngine: ObservableObject {
                 startProgressTimer()
             }
             updateNowPlayingInfo()
+            syncLiveActivity()
         } catch {
             isPlaying = false
             stopProgressTimer()
@@ -1349,6 +1624,7 @@ final class MusiQEngine: ObservableObject {
             startProgressTimer()
         }
         updateNowPlayingInfo()
+        syncLiveActivity()
     }
 
     func seek(to seconds: Double) {
@@ -1376,6 +1652,7 @@ final class MusiQEngine: ObservableObject {
         }
         progress.currentTime = seconds
         updateNowPlayingInfo()
+        syncLiveActivity()
     }
 
     func nextTrack() {
@@ -1391,8 +1668,6 @@ final class MusiQEngine: ObservableObject {
         } else {
             nextIdx = (currentIndex + 1) % currentQueue.count
         }
-        // Mutating currentIndex INSIDE withAnimation ensures the outgoing view keeps the OLD song's cover
-        // while the incoming view slides in with the NEW song's cover!
         withAnimation(.spring(response: 0.44, dampingFraction: 0.84)) {
             currentIndex = nextIdx
         }
@@ -1537,6 +1812,817 @@ final class MusiQEngine: ObservableObject {
         }
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
     }
+
+    // Updates iOS 16.2+ ActivityKit Live Activity if enabled in Entitlements
+    private func syncLiveActivity() {
+        #if canImport(ActivityKit)
+        if #available(iOS 16.2, *) {
+            guard ActivityAuthorizationInfo().areActivitiesEnabled,
+                  let track = currentTrack else { return }
+            let state = MusiQNowPlayingAttributes.ContentState(
+                title: track.title,
+                artist: track.artist,
+                isPlaying: isPlaying,
+                currentTime: progress.currentTime,
+                duration: progress.duration
+            )
+            Task {
+                let activities = Activity<MusiQNowPlayingAttributes>.activities
+                if let existing = activities.first {
+                    await existing.update(ActivityContent(state: state, staleDate: nil))
+                } else {
+                    let attrs = MusiQNowPlayingAttributes(sessionName: "MusiQ")
+                    _ = try? Activity.request(
+                        attributes: attrs,
+                        content: ActivityContent(state: state, staleDate: nil),
+                        pushType: nil
+                    )
+                }
+            }
+        }
+        #endif
+    }
+}
+
+// MARK: - Dynamic Island Interactive Capsule HUD (Works Immediately Without Extra Widget Target)
+struct DynamicIslandCapsuleHUD: View {
+    @ObservedObject var engine: MusiQEngine
+    let track: Track
+    let onOpenFullPlayer: () -> Void
+    let onOpenIPodMode: () -> Void
+
+    @State private var isExpanded: Bool = false
+
+    var body: some View {
+        VStack {
+            if isExpanded {
+                // Expanded Dynamic Island Deck
+                VStack(spacing: 12) {
+                    HStack(spacing: 12) {
+                        ContinuousSpinView(isSpinning: engine.isPlaying, rpm: 16.0) {
+                            if let art = ArtworkCache.shared.artwork(for: track.fileName) {
+                                Image(uiImage: art)
+                                    .resizable()
+                                    .scaledToFill()
+                                    .frame(width: 44, height: 44)
+                                    .clipShape(Circle())
+                            } else {
+                                Circle()
+                                    .fill(Color.purple)
+                                    .frame(width: 44, height: 44)
+                                    .overlay(Image(systemName: "opticaldisc").foregroundColor(.white))
+                            }
+                        }
+
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(track.title)
+                                .font(.system(size: 15, weight: .bold))
+                                .foregroundColor(.white)
+                                .lineLimit(1)
+                            Text(track.artist)
+                                .font(.system(size: 12, weight: .medium))
+                                .foregroundColor(.white.opacity(0.65))
+                                .lineLimit(1)
+                        }
+
+                        Spacer()
+
+                        Button {
+                            onOpenIPodMode()
+                            withAnimation(.spring()) { isExpanded = false }
+                        } label: {
+                            Image(systemName: "ipod")
+                                .font(.system(size: 15, weight: .bold))
+                                .padding(8)
+                                .background(Color.white.opacity(0.15))
+                                .clipShape(Circle())
+                                .foregroundColor(.white)
+                        }
+
+                        Button {
+                            withAnimation(.spring(response: 0.32, dampingFraction: 0.8)) {
+                                isExpanded = false
+                            }
+                        } label: {
+                            Image(systemName: "chevron.up")
+                                .font(.caption.bold())
+                                .padding(8)
+                                .background(Color.white.opacity(0.12))
+                                .clipShape(Circle())
+                                .foregroundColor(.white.opacity(0.8))
+                        }
+                    }
+
+                    HStack(spacing: 36) {
+                        Button { engine.previousTrack() } label: {
+                            Image(systemName: "backward.fill").font(.title3).foregroundColor(.white)
+                        }
+                        Button { engine.togglePlayPause() } label: {
+                            Image(systemName: engine.isPlaying ? "pause.circle.fill" : "play.circle.fill")
+                                .font(.system(size: 34))
+                                .foregroundColor(.white)
+                        }
+                        Button { engine.nextTrack() } label: {
+                            Image(systemName: "forward.fill").font(.title3).foregroundColor(.white)
+                        }
+                        Button {
+                            withAnimation(.spring()) { isExpanded = false }
+                            onOpenFullPlayer()
+                        } label: {
+                            Image(systemName: "arrow.up.left.and.arrow.down.right")
+                                .font(.caption.bold())
+                                .foregroundColor(.purple)
+                        }
+                    }
+                }
+                .padding(.horizontal, 18)
+                .padding(.vertical, 14)
+                .background(Color.black.opacity(0.95))
+                .clipShape(RoundedRectangle(cornerRadius: 28))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 28)
+                        .stroke(Color.white.opacity(0.18), lineWidth: 1)
+                )
+                .shadow(color: .black.opacity(0.6), radius: 14, x: 0, y: 6)
+                .padding(.horizontal, 16)
+            } else {
+                // Compact Dynamic Island Pill
+                HStack(spacing: 10) {
+                    ContinuousSpinView(isSpinning: engine.isPlaying, rpm: 18.0) {
+                        if let art = ArtworkCache.shared.artwork(for: track.fileName) {
+                            Image(uiImage: art)
+                                .resizable()
+                                .scaledToFill()
+                                .frame(width: 22, height: 22)
+                                .clipShape(Circle())
+                        } else {
+                            Circle()
+                                .fill(Color.purple)
+                                .frame(width: 22, height: 22)
+                        }
+                    }
+
+                    Text(track.title)
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundColor(.white)
+                        .lineLimit(1)
+                        .frame(maxWidth: 120)
+
+                    // Animated 3-Bar Equalizer Waveform
+                    HStack(spacing: 2.5) {
+                        ForEach(0..<3, id: \.self) { bar in
+                            Capsule()
+                                .fill(Color.purple)
+                                .frame(width: 2.5, height: engine.isPlaying ? CGFloat([8, 14, 10][bar]) : 4)
+                                .animation(
+                                    engine.isPlaying
+                                        ? .easeInOut(duration: 0.35 + Double(bar) * 0.12).repeatForever(autoreverses: true)
+                                        : .default,
+                                    value: engine.isPlaying
+                                )
+                        }
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .background(Color.black.opacity(0.92))
+                .clipShape(Capsule())
+                .overlay(
+                    Capsule()
+                        .stroke(Color.white.opacity(0.18), lineWidth: 0.8)
+                )
+                .shadow(color: .black.opacity(0.45), radius: 8, x: 0, y: 4)
+                .onTapGesture {
+                    withAnimation(.spring(response: 0.34, dampingFraction: 0.8)) {
+                        isExpanded = true
+                    }
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Realistic iPod Classic 5th/6th Gen Mode (Split-Screen LCD + Trigonometric Haptic Click Wheel!)
+struct iPodModeFullScreenView: View {
+    @ObservedObject var engine: MusiQEngine
+    @ObservedObject var progress: PlaybackProgressObserver
+    @Binding var isPresented: Bool
+
+    enum iPodScreen {
+        case rootMenu
+        case playlistsMenu
+        case songsMenu
+        case nowPlaying
+    }
+
+    @State private var screenStack: [iPodScreen] = [.rootMenu]
+    @State private var selectedRow: Int = 0
+    @State private var backlightOn: Bool = true
+    @State private var lastWheelAngle: Double? = nil
+    @State private var accumulatedDeltaAngle: Double = 0
+
+    private let rootMenuItems = ["Now Playing", "Songs", "Playlists", "Shuffle Songs", "Backlight", "Exit iPod Mode"]
+
+    private var currentScreen: iPodScreen {
+        screenStack.last ?? .rootMenu
+    }
+
+    private var currentRowCount: Int {
+        switch currentScreen {
+        case .rootMenu: return rootMenuItems.count
+        case .playlistsMenu: return max(1, engine.playlists.count)
+        case .songsMenu: return max(1, engine.allTracks.count)
+        case .nowPlaying: return 1
+        }
+    }
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack {
+                // Brushed Anodized Aluminum / Classic Silver-Gray iPod Shell
+                LinearGradient(
+                    colors: [
+                        Color(red: 0.84, green: 0.85, blue: 0.88),
+                        Color(red: 0.72, green: 0.74, blue: 0.77),
+                        Color(red: 0.62, green: 0.64, blue: 0.68)
+                    ],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+                .ignoresSafeArea()
+
+                // Metallic Inner Bevel Border
+                RoundedRectangle(cornerRadius: 42)
+                    .stroke(
+                        LinearGradient(
+                            colors: [.white.opacity(0.8), .black.opacity(0.35)],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        ),
+                        lineWidth: 4
+                    )
+                    .padding(6)
+                    .ignoresSafeArea()
+
+                VStack(spacing: 28) {
+                    // 1. Classic 4:3 Recessed Color LCD Display
+                    iPodLCDDisplay(width: min(geo.size.width - 44, 342), height: 256)
+                        .padding(.top, 16)
+
+                    Spacer(minLength: 4)
+
+                    // 2. Iconic Tactile Click Wheel (With Rotational Drag Gesture & Haptics)
+                    iPodClickWheel(diameter: min(geo.size.width - 76, 286))
+
+                    Spacer(minLength: 16)
+                }
+            }
+        }
+    }
+
+    // MARK: - iPod 4:3 Split-Pane & Now Playing LCD Screen
+    @ViewBuilder
+    private func iPodLCDDisplay(width: CGFloat, height: CGFloat) -> some View {
+        ZStack {
+            // Outer Black Glass Bezel
+            RoundedRectangle(cornerRadius: 14)
+                .fill(Color.black)
+                .frame(width: width + 12, height: height + 12)
+                .shadow(color: .black.opacity(0.45), radius: 8, x: 0, y: 4)
+
+            // Inner Backlit LCD Panel
+            ZStack {
+                Color(white: backlightOn ? 0.97 : 0.75)
+
+                VStack(spacing: 0) {
+                    // Top Classic iPod Status Bar
+                    HStack {
+                        Text(headerTitle)
+                            .font(.system(size: 13, weight: .bold, design: .default))
+                            .foregroundColor(Color(white: 0.15))
+                            .lineLimit(1)
+
+                        Spacer()
+
+                        Image(systemName: engine.isPlaying ? "play.fill" : "pause.fill")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundColor(Color.blue)
+
+                        // Classic Green Battery Icon
+                        ZStack(alignment: .leading) {
+                            RoundedRectangle(cornerRadius: 2)
+                                .stroke(Color.black.opacity(0.6), lineWidth: 1)
+                                .frame(width: 22, height: 10)
+                            RoundedRectangle(cornerRadius: 1)
+                                .fill(Color.green.opacity(0.85))
+                                .frame(width: 18, height: 6)
+                                .padding(.leading, 2)
+                        }
+                    }
+                    .padding(.horizontal, 10)
+                    .frame(height: 24)
+                    .background(
+                        LinearGradient(
+                            colors: [Color(white: 0.95), Color(white: 0.80)],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
+                    )
+                    .overlay(Rectangle().fill(Color.gray.opacity(0.5)).frame(height: 1), alignment: .bottom)
+
+                    // Main LCD Content
+                    if currentScreen == .nowPlaying {
+                        iPodClassicNowPlayingPane(width: width, height: height - 24)
+                    } else {
+                        // Iconic 6th Gen Split-Screen View (Left Menu + Right Artwork Preview)
+                        HStack(spacing: 0) {
+                            // Left Menu Pane
+                            VStack(spacing: 0) {
+                                switch currentScreen {
+                                case .rootMenu:
+                                    ForEach(0..<rootMenuItems.count, id: \.self) { idx in
+                                        iPodMenuRow(title: rootMenuItems[idx], isSelected: idx == selectedRow)
+                                    }
+                                    Spacer(minLength: 0)
+
+                                case .playlistsMenu:
+                                    if engine.playlists.isEmpty {
+                                        Text("No Playlists")
+                                            .font(.caption.bold())
+                                            .foregroundColor(.gray)
+                                            .padding(.top, 20)
+                                        Spacer()
+                                    } else {
+                                        let visibleRange = visibleMenuWindow(total: engine.playlists.count, selected: selectedRow, maxRows: 7)
+                                        ForEach(visibleRange, id: \.self) { idx in
+                                            iPodMenuRow(title: engine.playlists[idx].name, isSelected: idx == selectedRow)
+                                        }
+                                        Spacer(minLength: 0)
+                                    }
+
+                                case .songsMenu:
+                                    if engine.allTracks.isEmpty {
+                                        Text("No Songs")
+                                            .font(.caption.bold())
+                                            .foregroundColor(.gray)
+                                            .padding(.top, 20)
+                                        Spacer()
+                                    } else {
+                                        let visibleRange = visibleMenuWindow(total: engine.allTracks.count, selected: selectedRow, maxRows: 7)
+                                        ForEach(visibleRange, id: \.self) { idx in
+                                            iPodMenuRow(title: engine.allTracks[idx].title, isSelected: idx == selectedRow)
+                                        }
+                                        Spacer(minLength: 0)
+                                    }
+
+                                case .nowPlaying:
+                                    EmptyView()
+                                }
+                            }
+                            .frame(width: width * 0.54, height: height - 24)
+                            .overlay(Rectangle().fill(Color.gray.opacity(0.35)).frame(width: 1), alignment: .trailing)
+
+                            // Right Preview Pane (Shows Highlighted Track/Album Cover)
+                            ZStack {
+                                LinearGradient(
+                                    colors: [Color(white: 0.92), Color(white: 0.82)],
+                                    startPoint: .top,
+                                    endPoint: .bottom
+                                )
+
+                                VStack(spacing: 8) {
+                                    if let previewArt = previewArtworkForCurrentSelection() {
+                                        Image(uiImage: previewArt)
+                                            .resizable()
+                                            .scaledToFill()
+                                            .frame(width: width * 0.34, height: width * 0.34)
+                                            .clipShape(RoundedRectangle(cornerRadius: 6))
+                                            .shadow(color: .black.opacity(0.35), radius: 5, x: 0, y: 3)
+                                    } else {
+                                        ZStack {
+                                            RoundedRectangle(cornerRadius: 8)
+                                                .fill(LinearGradient(colors: [.blue.opacity(0.7), .indigo], startPoint: .topLeading, endPoint: .bottomTrailing))
+                                                .frame(width: width * 0.32, height: width * 0.32)
+                                            Image(systemName: "music.note")
+                                                .font(.system(size: 36, weight: .bold))
+                                                .foregroundColor(.white)
+                                        }
+                                        .shadow(color: .black.opacity(0.25), radius: 4, x: 0, y: 2)
+                                    }
+
+                                    Text("\(engine.allTracks.count) Songs")
+                                        .font(.system(size: 11, weight: .bold))
+                                        .foregroundColor(.black.opacity(0.6))
+                                }
+                            }
+                            .frame(width: width * 0.46, height: height - 24)
+                        }
+                    }
+                }
+
+                // Subtle Diagonal Glass Screen Glare
+                LinearGradient(
+                    colors: [Color.white.opacity(0.18), Color.clear, Color.black.opacity(backlightOn ? 0.02 : 0.25)],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+                .allowsHitTesting(false)
+            }
+            .frame(width: width, height: height)
+            .clipShape(RoundedRectangle(cornerRadius: 9))
+        }
+    }
+
+    @ViewBuilder
+    private func iPodMenuRow(title: String, isSelected: Bool) -> some View {
+        HStack {
+            Text(title)
+                .font(.system(size: 13, weight: .bold))
+                .foregroundColor(isSelected ? .white : .black.opacity(0.85))
+                .lineLimit(1)
+            Spacer()
+            Image(systemName: "chevron.right")
+                .font(.system(size: 10, weight: .bold))
+                .foregroundColor(isSelected ? .white : .gray)
+        }
+        .padding(.horizontal, 10)
+        .frame(height: 31)
+        .background(
+            Group {
+                if isSelected {
+                    LinearGradient(
+                        colors: [Color(red: 0.22, green: 0.58, blue: 0.96), Color(red: 0.10, green: 0.38, blue: 0.82)],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                } else {
+                    Color.clear
+                }
+            }
+        )
+    }
+
+    @ViewBuilder
+    private func iPodClassicNowPlayingPane(width: CGFloat, height: CGFloat) -> some View {
+        let track = engine.currentTrack
+        VStack(spacing: 12) {
+            HStack(alignment: .center, spacing: 14) {
+                if let fileName = track?.fileName,
+                   let art = ArtworkCache.shared.artwork(for: fileName) {
+                    Image(uiImage: art)
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: 112, height: 112)
+                        .border(Color.gray.opacity(0.4), width: 1)
+                        .shadow(color: .black.opacity(0.35), radius: 5, x: 2, y: 4)
+                } else {
+                    Rectangle()
+                        .fill(Color.gray.opacity(0.25))
+                        .frame(width: 112, height: 112)
+                        .overlay(Image(systemName: "music.note").font(.largeTitle).foregroundColor(.gray))
+                }
+
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(track?.title ?? "No Track")
+                        .font(.system(size: 15, weight: .bold))
+                        .foregroundColor(.black)
+                        .lineLimit(2)
+
+                    Text(track?.artist ?? "Unknown Artist")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(.black.opacity(0.65))
+                        .lineLimit(1)
+
+                    Text("MusiQ iPod Edition")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(.gray)
+
+                    if let firstLyric = activeLyricString {
+                        Text(firstLyric)
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundColor(Color(red: 0.10, green: 0.38, blue: 0.82))
+                            .lineLimit(2)
+                            .padding(.top, 2)
+                    }
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 14)
+            .padding(.top, 14)
+
+            Spacer(minLength: 0)
+
+            // Classic Glossy Blue iPod Progress Bar
+            VStack(spacing: 4) {
+                GeometryReader { barGeo in
+                    let ratio = min(1.0, max(0.0, progress.currentTime / max(progress.duration, 1)))
+                    ZStack(alignment: .leading) {
+                        Capsule()
+                            .fill(
+                                LinearGradient(
+                                    colors: [Color(white: 0.78), Color(white: 0.90)],
+                                    startPoint: .top,
+                                    endPoint: .bottom
+                                )
+                            )
+                            .frame(height: 10)
+                            .overlay(Capsule().stroke(Color.gray.opacity(0.6), lineWidth: 0.8))
+
+                        Capsule()
+                            .fill(
+                                LinearGradient(
+                                    colors: [Color(red: 0.35, green: 0.68, blue: 1.0), Color(red: 0.12, green: 0.42, blue: 0.88)],
+                                    startPoint: .top,
+                                    endPoint: .bottom
+                                )
+                            )
+                            .frame(width: max(8, barGeo.size.width * ratio), height: 10)
+                    }
+                }
+                .frame(height: 10)
+
+                HStack {
+                    Text(formatSeconds(progress.currentTime))
+                        .font(.system(size: 10, weight: .bold).monospacedDigit())
+                        .foregroundColor(.black.opacity(0.75))
+                    Spacer()
+                    Text("-" + formatSeconds(max(0, progress.duration - progress.currentTime)))
+                        .font(.system(size: 10, weight: .bold).monospacedDigit())
+                        .foregroundColor(.black.opacity(0.75))
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.bottom, 12)
+        }
+        .frame(width: width, height: height)
+    }
+
+    // MARK: - Trigonometric Haptic Click Wheel
+    @ViewBuilder
+    private func iPodClickWheel(diameter: CGFloat) -> some View {
+        let centerSize = diameter * 0.36
+
+        ZStack {
+            // Matte White / Light Gray Click Wheel Surface
+            Circle()
+                .fill(Color(white: 0.95))
+                .frame(width: diameter, height: diameter)
+                .overlay(
+                    Circle()
+                        .stroke(Color.black.opacity(0.18), lineWidth: 1.5)
+                )
+                .shadow(color: .black.opacity(0.28), radius: 8, x: 0, y: 4)
+                .gesture(
+                    DragGesture(minimumDistance: 2)
+                        .onChanged { value in
+                            let center = CGPoint(x: diameter / 2.0, y: diameter / 2.0)
+                            let dx = Double(value.location.x - center.x)
+                            let dy = Double(value.location.y - center.y)
+                            let radius = sqrt(dx * dx + dy * dy)
+
+                            // Ignore touches inside the center button
+                            guard radius > Double(centerSize * 0.48) else { return }
+
+                            let angle = atan2(dy, dx) * 180.0 / .pi
+                            if let prev = lastWheelAngle {
+                                var delta = angle - prev
+                                if delta > 180 { delta -= 360 }
+                                if delta < -180 { delta += 360 }
+                                accumulatedDeltaAngle += delta
+
+                                // Every 16 degrees of thumb rotation = 1 mechanical click tick!
+                                let stepDegrees = 16.0
+                                if abs(accumulatedDeltaAngle) >= stepDegrees {
+                                    let steps = Int(accumulatedDeltaAngle / stepDegrees)
+                                    accumulatedDeltaAngle -= Double(steps) * stepDegrees
+                                    handleWheelScroll(steps: steps)
+                                }
+                            }
+                            lastWheelAngle = angle
+                        }
+                        .onEnded { _ in
+                            lastWheelAngle = nil
+                            accumulatedDeltaAngle = 0
+                        }
+                )
+
+            // Top "MENU" Button
+            VStack {
+                Button {
+                    triggerClickHaptic()
+                    handleMenuButton()
+                } label: {
+                    Text("MENU")
+                        .font(.system(size: 13, weight: .heavy, design: .rounded))
+                        .tracking(1.2)
+                        .foregroundColor(.gray)
+                        .padding(.top, 18)
+                        .frame(width: 90, height: 44)
+                }
+                Spacer()
+                // Bottom Play/Pause Button
+                Button {
+                    triggerClickHaptic()
+                    engine.togglePlayPause()
+                } label: {
+                    HStack(spacing: 2) {
+                        Image(systemName: "play.fill")
+                        Image(systemName: "pause.fill")
+                    }
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundColor(.gray)
+                    .padding(.bottom, 18)
+                    .frame(width: 90, height: 44)
+                }
+            }
+            .frame(width: diameter, height: diameter)
+
+            // Left Previous & Right Next Buttons
+            HStack {
+                Button {
+                    triggerClickHaptic()
+                    engine.previousTrack()
+                } label: {
+                    Image(systemName: "backward.end.alt.fill")
+                        .font(.system(size: 14, weight: .bold))
+                        .foregroundColor(.gray)
+                        .padding(.leading, 18)
+                        .frame(width: 54, height: 80)
+                }
+                Spacer()
+                Button {
+                    triggerClickHaptic()
+                    engine.nextTrack()
+                } label: {
+                    Image(systemName: "forward.end.alt.fill")
+                        .font(.system(size: 14, weight: .bold))
+                        .foregroundColor(.gray)
+                        .padding(.trailing, 18)
+                        .frame(width: 54, height: 80)
+                }
+            }
+            .frame(width: diameter, height: diameter)
+
+            // Center Tactile Select Button
+            Button {
+                triggerClickHaptic()
+                handleCenterSelect()
+            } label: {
+                Circle()
+                    .fill(
+                        LinearGradient(
+                            colors: [Color(white: 0.76), Color(white: 0.64)],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+                    .frame(width: centerSize, height: centerSize)
+                    .overlay(
+                        Circle()
+                            .stroke(Color.black.opacity(0.25), lineWidth: 1.2)
+                    )
+                    .shadow(color: .black.opacity(0.2), radius: 2, x: 0, y: 1)
+            }
+        }
+    }
+
+    // MARK: - iPod Click Wheel Logic & Haptics
+    private func triggerClickHaptic() {
+        let generator = UIImpactFeedbackGenerator(style: .light)
+        generator.impactOccurred()
+        AudioServicesPlaySystemSound(1104)
+    }
+
+    private func handleWheelScroll(steps: Int) {
+        guard steps != 0 else { return }
+        triggerClickHaptic()
+
+        if currentScreen == .nowPlaying {
+            // Scrolling the Click Wheel in Now Playing scrubs 3 seconds per click!
+            let target = max(0, min(progress.duration, progress.currentTime + Double(steps) * 3.0))
+            engine.seek(to: target)
+        } else {
+            let maxRow = max(0, currentRowCount - 1)
+            selectedRow = max(0, min(maxRow, selectedRow + (steps > 0 ? 1 : -1)))
+        }
+    }
+
+    private func handleMenuButton() {
+        if screenStack.count > 1 {
+            screenStack.removeLast()
+            selectedRow = 0
+        } else {
+            isPresented = false
+        }
+    }
+
+    private func handleCenterSelect() {
+        switch currentScreen {
+        case .rootMenu:
+            switch selectedRow {
+            case 0:
+                screenStack.append(.nowPlaying)
+            case 1:
+                selectedRow = 0
+                screenStack.append(.songsMenu)
+            case 2:
+                selectedRow = 0
+                screenStack.append(.playlistsMenu)
+            case 3:
+                if !engine.allTracks.isEmpty {
+                    engine.isShuffle = true
+                    if let rand = engine.allTracks.randomElement() {
+                        engine.playTrack(rand, in: engine.allTracks)
+                        screenStack.append(.nowPlaying)
+                    }
+                }
+            case 4:
+                backlightOn.toggle()
+            case 5:
+                isPresented = false
+            default:
+                break
+            }
+
+        case .songsMenu:
+            guard engine.allTracks.indices.contains(selectedRow) else { return }
+            let track = engine.allTracks[selectedRow]
+            engine.playTrack(track, in: engine.allTracks)
+            screenStack.append(.nowPlaying)
+
+        case .playlistsMenu:
+            guard engine.playlists.indices.contains(selectedRow) else { return }
+            let pTracks = engine.tracks(for: engine.playlists[selectedRow])
+            if let first = pTracks.first {
+                engine.playTrack(first, in: pTracks)
+                screenStack.append(.nowPlaying)
+            }
+
+        case .nowPlaying:
+            engine.togglePlayPause()
+        }
+    }
+
+    private var headerTitle: String {
+        switch currentScreen {
+        case .rootMenu: return "iPod"
+        case .playlistsMenu: return "Playlists"
+        case .songsMenu: return "Songs"
+        case .nowPlaying: return "Now Playing"
+        }
+    }
+
+    private var activeLyricString: String? {
+        guard let idx = LyricsManager.activeLineIndex(
+            in: engine.currentTrackLyrics,
+            currentTime: progress.currentTime,
+            duration: progress.duration,
+            autoOffset: engine.autoDetectedLyricOffset
+        ), engine.currentTrackLyrics.indices.contains(idx) else { return nil }
+        return engine.currentTrackLyrics[idx].text
+    }
+
+    private func previewArtworkForCurrentSelection() -> UIImage? {
+        switch currentScreen {
+        case .songsMenu:
+            if engine.allTracks.indices.contains(selectedRow) {
+                return ArtworkCache.shared.artwork(for: engine.allTracks[selectedRow].fileName)
+            }
+        case .playlistsMenu:
+            if engine.playlists.indices.contains(selectedRow) {
+                let pl = engine.playlists[selectedRow]
+                if let custom = ArtworkCache.shared.playlistCover(for: pl.id) { return custom }
+                if let first = engine.tracks(for: pl).first {
+                    return ArtworkCache.shared.artwork(for: first.fileName)
+                }
+            }
+        default:
+            break
+        }
+        if let active = engine.currentTrack {
+            return ArtworkCache.shared.artwork(for: active.fileName)
+        }
+        if let first = engine.allTracks.first {
+            return ArtworkCache.shared.artwork(for: first.fileName)
+        }
+        return nil
+    }
+
+    private func visibleMenuWindow(total: Int, selected: Int, maxRows: Int) -> Range<Int> {
+        guard total > maxRows else { return 0..<total }
+        let half = maxRows / 2
+        var start = max(0, selected - half)
+        if start + maxRows > total {
+            start = max(0, total - maxRows)
+        }
+        return start..<(start + maxRows)
+    }
+
+    private func formatSeconds(_ s: Double) -> String {
+        guard s.isFinite && s >= 0 else { return "0:00" }
+        let total = Int(s)
+        return String(format: "%d:%02d", total / 60, total % 60)
+    }
 }
 
 // MARK: - Continuous 60fps Spinning Disc / Reel Modifier
@@ -1644,2356 +2730,4 @@ struct LoopingMarqueeText: View {
         guard text > container && container > 0 else { return }
         let totalShift = text + spacing
         let duration = Double(totalShift) / 36.0
-        withAnimation(.linear(duration: duration).delay(1.0).repeatForever(autoreverses: false)) {
-            offset = -totalShift
-        }
-    }
-}
-
-// MARK: - 2-Line Capable Word-by-Word Karaoke Inline Lyric View
-struct WordByWordInlineLyricView: View {
-    @ObservedObject var progress: PlaybackProgressObserver
-    let lines: [LyricLine]
-    let autoOffset: Double
-    let isFetching: Bool
-    let onTap: () -> Void
-
-    private var activeIndex: Int? {
-        LyricsManager.activeLineIndex(
-            in: lines,
-            currentTime: progress.currentTime,
-            duration: progress.duration,
-            autoOffset: autoOffset
-        )
-    }
-
-    var body: some View {
-        Button(action: onTap) {
-            ZStack {
-                if let idx = activeIndex {
-                    let activeLine = lines[idx]
-                    let activeWordIdx = LyricsManager.activeWordProgress(
-                        in: activeLine,
-                        currentTime: progress.currentTime,
-                        autoOffset: autoOffset
-                    )
-
-                    buildKaraokeAttributedText(line: activeLine, activeWordIndex: activeWordIdx)
-                        .font(.system(size: 16, weight: .bold, design: .rounded))
-                        .shadow(color: .white.opacity(0.25), radius: 5, x: 0, y: 0)
-                        .lineLimit(2)
-                        .minimumScaleFactor(0.80)
-                        .multilineTextAlignment(.center)
-                        .frame(maxWidth: .infinity, alignment: .center)
-                        .id("inline_lyric_\(idx)")
-                        .transition(
-                            .asymmetric(
-                                insertion: .move(edge: .bottom).combined(with: .opacity),
-                                removal: .move(edge: .top).combined(with: .opacity)
-                            )
-                        )
-                        .animation(.spring(response: 0.30, dampingFraction: 0.84), value: idx)
-                } else if isFetching {
-                    HStack(spacing: 6) {
-                        ProgressView()
-                            .scaleEffect(0.75)
-                            .tint(.white.opacity(0.6))
-                        Text("Syncing version-matched lyrics...")
-                            .font(.system(size: 13, weight: .medium, design: .rounded))
-                            .foregroundColor(.white.opacity(0.55))
-                    }
-                } else {
-                    HStack(spacing: 5) {
-                        Image(systemName: "quote.bubble")
-                            .font(.system(size: 11))
-                        Text("Tap to fetch or paste lyrics")
-                            .font(.system(size: 12, weight: .medium, design: .rounded))
-                    }
-                    .foregroundColor(.white.opacity(0.38))
-                }
-            }
-            .frame(height: 44)
-            .padding(.horizontal, 14)
-        }
-        .buttonStyle(.plain)
-    }
-
-    private func buildKaraokeAttributedText(line: LyricLine, activeWordIndex: Int) -> Text {
-        var combined = Text("")
-        for (wIdx, word) in line.words.enumerated() {
-            let space = (wIdx == line.words.count - 1) ? "" : " "
-            let isSungOrCurrent = wIdx <= activeWordIndex
-            let piece = Text(word + space)
-                .foregroundColor(isSungOrCurrent ? .white : .white.opacity(0.40))
-            combined = combined + piece
-        }
-        return combined
-    }
-}
-
-// MARK: - Apple Music-Style Blurred Scrolling Lyrics Sheet
-struct AppleMusicLyricsSheetView: View {
-    @ObservedObject var engine: MusiQEngine
-    @ObservedObject var progress: PlaybackProgressObserver
-    let track: Track
-
-    @State private var showRawEditor: Bool = false
-    @State private var rawLyricsDraft: String = ""
-    @State private var isFetchingOnline: Bool = false
-    @Environment(\.dismiss) private var dismiss
-
-    private var activeIndex: Int? {
-        LyricsManager.activeLineIndex(
-            in: engine.currentTrackLyrics,
-            currentTime: progress.currentTime,
-            duration: progress.duration,
-            autoOffset: engine.autoDetectedLyricOffset
-        )
-    }
-
-    private var albumGradient: [Color] {
-        ArtworkCache.shared.playerGradient(for: track.fileName)
-    }
-
-    var body: some View {
-        ZStack {
-            LinearGradient(
-                colors: albumGradient,
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-            .ignoresSafeArea()
-
-            Color.black.opacity(0.32)
-                .ignoresSafeArea()
-
-            VStack(spacing: 0) {
-                Capsule()
-                    .fill(Color.white.opacity(0.32))
-                    .frame(width: 40, height: 5)
-                    .padding(.top, 10)
-                    .padding(.bottom, 12)
-
-                // Top Header
-                HStack(spacing: 14) {
-                    if let art = ArtworkCache.shared.artwork(for: track.fileName) {
-                        Image(uiImage: art)
-                            .resizable()
-                            .scaledToFill()
-                            .frame(width: 52, height: 52)
-                            .clipShape(RoundedRectangle(cornerRadius: 10))
-                            .shadow(color: .black.opacity(0.4), radius: 6, x: 0, y: 3)
-                    } else {
-                        RoundedRectangle(cornerRadius: 10)
-                            .fill(Color.white.opacity(0.15))
-                            .frame(width: 52, height: 52)
-                            .overlay(Image(systemName: "music.note").foregroundColor(.white))
-                    }
-
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(track.title)
-                            .font(.system(size: 17, weight: .bold))
-                            .foregroundColor(.white)
-                            .lineLimit(1)
-                        Text(track.artist)
-                            .font(.system(size: 14, weight: .medium))
-                            .foregroundColor(.white.opacity(0.68))
-                            .lineLimit(1)
-                    }
-
-                    Spacer()
-
-                    Menu {
-                        Button {
-                            engine.reloadLyricsForCurrentTrack(forceOnlineFetch: true)
-                        } label: {
-                            Label("Re-Fetch Synced Lyrics", systemImage: "sparkles")
-                        }
-
-                        Button {
-                            rawLyricsDraft = LyricsManager.shared.getLyrics(for: track)
-                            showRawEditor.toggle()
-                        } label: {
-                            Label(showRawEditor ? "View Synced Lyrics" : "Edit / Paste Raw Lyrics", systemImage: "pencil")
-                        }
-
-                        Button(role: .destructive) {
-                            LyricsManager.shared.saveLyrics("", matchedDuration: nil, for: track)
-                            engine.currentTrackLyrics = []
-                        } label: {
-                            Label("Clear Lyrics for This Track", systemImage: "trash")
-                        }
-
-                        Button(role: .destructive) {
-                            dismiss()
-                        } label: {
-                            Label("Close Lyrics", systemImage: "xmark")
-                        }
-                    } label: {
-                        ZStack {
-                            Circle()
-                                .fill(Color.white.opacity(0.16))
-                                .frame(width: 36, height: 36)
-                            Image(systemName: "ellipsis")
-                                .font(.system(size: 15, weight: .bold))
-                                .foregroundColor(.white)
-                        }
-                    }
-                }
-                .padding(.horizontal, 24)
-                .padding(.bottom, 12)
-
-                if showRawEditor {
-                    VStack(spacing: 12) {
-                        TextEditor(text: $rawLyricsDraft)
-                            .font(.system(size: 15, weight: .medium, design: .rounded))
-                            .padding(10)
-                            .background(Color.black.opacity(0.35))
-                            .clipShape(RoundedRectangle(cornerRadius: 14))
-                            .padding(.horizontal, 20)
-
-                        HStack(spacing: 16) {
-                            Button("Cancel") {
-                                showRawEditor = false
-                            }
-                            .foregroundColor(.white.opacity(0.75))
-
-                            Button {
-                                LyricsManager.shared.saveLyrics(rawLyricsDraft, matchedDuration: track.duration, for: track)
-                                engine.reloadLyricsForCurrentTrack()
-                                showRawEditor = false
-                            } label: {
-                                Text("Save Lyrics")
-                                    .font(.headline)
-                                    .padding(.horizontal, 22)
-                                    .padding(.vertical, 10)
-                                    .background(Color.white)
-                                    .foregroundColor(.black)
-                                    .clipShape(Capsule())
-                            }
-                        }
-                        .padding(.bottom, 16)
-                    }
-                } else {
-                    if engine.currentTrackLyrics.isEmpty {
-                        Spacer()
-                        VStack(spacing: 14) {
-                            if isFetchingOnline || engine.isFetchingLyricsInBackground {
-                                ProgressView()
-                                    .tint(.white)
-                                Text("Verifying track version & syncing lyrics...")
-                                    .font(.subheadline)
-                                    .foregroundColor(.white.opacity(0.7))
-                            } else {
-                                Image(systemName: "quote.bubble")
-                                    .font(.system(size: 42))
-                                    .foregroundColor(.white.opacity(0.45))
-                                Text("No Public Lyrics for This Track")
-                                    .font(.title3.bold())
-                                    .foregroundColor(.white)
-                                Text("Unreleased / Yedit tracks without verified online lyrics stay clean.\nYou can paste custom lyrics below.")
-                                    .font(.caption)
-                                    .foregroundColor(.white.opacity(0.65))
-                                    .multilineTextAlignment(.center)
-                                    .padding(.horizontal, 32)
-
-                                HStack(spacing: 12) {
-                                    Button {
-                                        engine.reloadLyricsForCurrentTrack(forceOnlineFetch: true)
-                                    } label: {
-                                        Label("Retry Auto-Match", systemImage: "sparkles")
-                                            .font(.subheadline.weight(.semibold))
-                                            .padding(.horizontal, 16)
-                                            .padding(.vertical, 10)
-                                            .background(Color.white.opacity(0.2))
-                                            .foregroundColor(.white)
-                                            .clipShape(Capsule())
-                                    }
-
-                                    Button {
-                                        rawLyricsDraft = ""
-                                        showRawEditor = true
-                                    } label: {
-                                        Label("Paste Lyrics", systemImage: "doc.on.clipboard")
-                                            .font(.subheadline.weight(.semibold))
-                                            .padding(.horizontal, 16)
-                                            .padding(.vertical, 10)
-                                            .background(Color.white.opacity(0.14))
-                                            .foregroundColor(.white)
-                                            .clipShape(Capsule())
-                                    }
-                                }
-                            }
-                        }
-                        Spacer()
-                    } else {
-                        ScrollViewReader { proxy in
-                            ScrollView(showsIndicators: false) {
-                                VStack(alignment: .leading, spacing: 24) {
-                                    Spacer().frame(height: 20)
-
-                                    ForEach(engine.currentTrackLyrics) { line in
-                                        let currentIdx = activeIndex ?? 0
-                                        let isCurrent = (line.index == currentIdx)
-                                        let distance = abs(line.index - currentIdx)
-
-                                        Button {
-                                            if let t = line.time {
-                                                let seekTarget = max(0, t + engine.autoDetectedLyricOffset)
-                                                engine.seek(to: seekTarget)
-                                            }
-                                        } label: {
-                                            if isCurrent {
-                                                let activeWordIdx = LyricsManager.activeWordProgress(
-                                                    in: line,
-                                                    currentTime: progress.currentTime,
-                                                    autoOffset: engine.autoDetectedLyricOffset
-                                                )
-                                                buildKaraokeSheetLine(line: line, activeWordIndex: activeWordIdx)
-                                                    .font(.system(size: 28, weight: .bold, design: .rounded))
-                                                    .shadow(color: .white.opacity(0.25), radius: 8, x: 0, y: 0)
-                                                    .multilineTextAlignment(.leading)
-                                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                            } else {
-                                                Text(line.text)
-                                                    .font(.system(size: 24, weight: .bold, design: .rounded))
-                                                    .foregroundColor(.white.opacity(max(0.22, 0.48 - Double(distance) * 0.08)))
-                                                    .blur(radius: min(CGFloat(distance) * 1.35, 4.8))
-                                                    .scaleEffect(0.96, anchor: .leading)
-                                                    .multilineTextAlignment(.leading)
-                                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                            }
-                                        }
-                                        .buttonStyle(.plain)
-                                        .id(line.index)
-                                        .animation(.spring(response: 0.36, dampingFraction: 0.84), value: currentIdx)
-                                    }
-
-                                    Spacer().frame(height: 150)
-                                }
-                                .padding(.horizontal, 26)
-                            }
-                            .mask(
-                                LinearGradient(
-                                    stops: [
-                                        .init(color: .clear, location: 0.0),
-                                        .init(color: .black, location: 0.07),
-                                        .init(color: .black, location: 0.89),
-                                        .init(color: .clear, location: 1.0)
-                                    ],
-                                    startPoint: .top,
-                                    endPoint: .bottom
-                                )
-                            )
-                            .onAppear {
-                                if let idx = activeIndex {
-                                    proxy.scrollTo(idx, anchor: UnitPoint(x: 0.5, y: 0.28))
-                                }
-                            }
-                            .onChange(of: activeIndex) { newIdx in
-                                guard let idx = newIdx else { return }
-                                withAnimation(.spring(response: 0.42, dampingFraction: 0.85)) {
-                                    proxy.scrollTo(idx, anchor: UnitPoint(x: 0.5, y: 0.28))
-                                }
-                            }
-                        }
-                    }
-
-                    // Bottom Playback Controls Inside Lyrics Sheet
-                    VStack(spacing: 12) {
-                        IsolatedScrubberView(progress: engine.progress) { newSeconds in
-                            engine.seek(to: newSeconds)
-                        }
-                        .padding(.horizontal, 26)
-
-                        HStack(spacing: 48) {
-                            Button {
-                                engine.previousTrack()
-                            } label: {
-                                Image(systemName: "backward.fill")
-                                    .font(.system(size: 26, weight: .bold))
-                                    .foregroundColor(.white)
-                            }
-
-                            Button {
-                                engine.togglePlayPause()
-                            } label: {
-                                Image(systemName: engine.isPlaying ? "pause.fill" : "play.fill")
-                                    .font(.system(size: 34, weight: .bold))
-                                    .foregroundColor(.white)
-                            }
-
-                            Button {
-                                engine.nextTrack()
-                            } label: {
-                                Image(systemName: "forward.fill")
-                                    .font(.system(size: 26, weight: .bold))
-                                    .foregroundColor(.white)
-                            }
-                        }
-                        .padding(.bottom, 16)
-                    }
-                    .padding(.top, 6)
-                }
-            }
-        }
-    }
-
-    private func buildKaraokeSheetLine(line: LyricLine, activeWordIndex: Int) -> Text {
-        var combined = Text("")
-        for (wIdx, word) in line.words.enumerated() {
-            let space = (wIdx == line.words.count - 1) ? "" : " "
-            let isSung = wIdx <= activeWordIndex
-            combined = combined + Text(word + space)
-                .foregroundColor(isSung ? .white : .white.opacity(0.42))
-        }
-        return combined
-    }
-}
-
-// MARK: - Playlist Cover View
-struct PlaylistArtworkThumbnailView: View {
-    let playlist: Playlist
-    let tracks: [Track]
-    let size: CGFloat
-    let cornerRadius: CGFloat
-
-    var body: some View {
-        if let customImg = ArtworkCache.shared.playlistCover(for: playlist.id) {
-            Image(uiImage: customImg)
-                .resizable()
-                .scaledToFill()
-                .frame(width: size, height: size)
-                .clipShape(RoundedRectangle(cornerRadius: cornerRadius))
-        } else {
-            let covers = tracks.compactMap { ArtworkCache.shared.artwork(for: $0.fileName) }
-            if covers.count >= 4 {
-                let half = size / 2.0
-                VStack(spacing: 0) {
-                    HStack(spacing: 0) {
-                        Image(uiImage: covers[0]).resizable().scaledToFill().frame(width: half, height: half).clipped()
-                        Image(uiImage: covers[1]).resizable().scaledToFill().frame(width: half, height: half).clipped()
-                    }
-                    HStack(spacing: 0) {
-                        Image(uiImage: covers[2]).resizable().scaledToFill().frame(width: half, height: half).clipped()
-                        Image(uiImage: covers[3]).resizable().scaledToFill().frame(width: half, height: half).clipped()
-                    }
-                }
-                .frame(width: size, height: size)
-                .clipShape(RoundedRectangle(cornerRadius: cornerRadius))
-            } else if let first = covers.first {
-                Image(uiImage: first)
-                    .resizable()
-                    .scaledToFill()
-                    .frame(width: size, height: size)
-                    .clipShape(RoundedRectangle(cornerRadius: cornerRadius))
-            } else {
-                ZStack {
-                    RoundedRectangle(cornerRadius: cornerRadius)
-                        .fill(LinearGradient(colors: [.purple.opacity(0.75), .indigo.opacity(0.45)], startPoint: .topLeading, endPoint: .bottomTrailing))
-                        .frame(width: size, height: size)
-                    Image(systemName: "music.note.list")
-                        .font(.system(size: size * 0.36, weight: .semibold))
-                        .foregroundColor(.white)
-                }
-            }
-        }
-    }
-}
-
-// MARK: - Root Tab View
-struct MusiQRootView: View {
-    @StateObject private var engine = MusiQEngine()
-    @State private var selectedTab: Int = 0
-    @State private var showFullPlayer: Bool = false
-
-    var body: some View {
-        ZStack(alignment: .bottom) {
-            TabView(selection: $selectedTab) {
-                PlaylistsHomeView(engine: engine, showFullPlayer: $showFullPlayer)
-                    .tabItem {
-                        Label("Playlists", systemImage: "music.note.list")
-                    }
-                    .tag(0)
-
-                AllSongsSearchView(engine: engine, showFullPlayer: $showFullPlayer)
-                    .tabItem {
-                        Label("Songs", systemImage: "music.note")
-                    }
-                    .tag(1)
-
-                DirectAudioImporterView(engine: engine)
-                    .tabItem {
-                        Label("Audio URL", systemImage: "arrow.down.circle.fill")
-                    }
-                    .tag(2)
-
-                ListeningStatsView(engine: engine)
-                    .tabItem {
-                        Label("Stats", systemImage: "chart.bar.fill")
-                    }
-                    .tag(3)
-            }
-            .tint(.purple)
-
-            if let current = engine.currentTrack {
-                MiniPlayerBar(engine: engine, track: current) {
-                    withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
-                        showFullPlayer = true
-                    }
-                }
-                .padding(.bottom, 54)
-            }
-        }
-        .fullScreenCover(isPresented: $showFullPlayer) {
-            FullPlayerDeckView(engine: engine, isPresented: $showFullPlayer)
-        }
-    }
-}
-
-// MARK: - Tab 1: Playlists Home View
-struct PlaylistsHomeView: View {
-    @ObservedObject var engine: MusiQEngine
-    @Binding var showFullPlayer: Bool
-    @State private var showingNewPlaylistAlert = false
-    @State private var newPlaylistName = ""
-
-    var body: some View {
-        NavigationStack {
-            ZStack {
-                Color(red: 0.06, green: 0.06, blue: 0.08).ignoresSafeArea()
-
-                if engine.playlists.isEmpty {
-                    VStack(spacing: 14) {
-                        Image(systemName: "rectangle.stack.badge.plus")
-                            .font(.system(size: 50))
-                            .foregroundColor(.purple.opacity(0.8))
-                        Text("No Playlists Yet")
-                            .font(.title3.bold())
-                        Text("Playlists are only created when you make them.\nTap '+' to build a custom playlist with custom cover art.")
-                            .font(.subheadline)
-                            .foregroundColor(.secondary)
-                            .multilineTextAlignment(.center)
-                            .padding(.horizontal, 40)
-
-                        Button {
-                            showingNewPlaylistAlert = true
-                        } label: {
-                            Label("Create Playlist", systemImage: "plus")
-                                .font(.headline)
-                                .padding(.horizontal, 20)
-                                .padding(.vertical, 12)
-                                .background(Color.purple)
-                                .foregroundColor(.white)
-                                .clipShape(Capsule())
-                        }
-                        .padding(.top, 6)
-                    }
-                } else {
-                    List {
-                        ForEach(engine.playlists) { playlist in
-                            let pTracks = engine.tracks(for: playlist)
-                            NavigationLink(destination: PlaylistDetailView(engine: engine, playlistID: playlist.id, showFullPlayer: $showFullPlayer)) {
-                                HStack(spacing: 16) {
-                                    PlaylistArtworkThumbnailView(
-                                        playlist: playlist,
-                                        tracks: pTracks,
-                                        size: 64,
-                                        cornerRadius: 12
-                                    )
-                                    .shadow(color: .black.opacity(0.35), radius: 4, x: 0, y: 2)
-
-                                    VStack(alignment: .leading, spacing: 5) {
-                                        Text(playlist.name)
-                                            .font(.system(size: 18, weight: .bold))
-                                            .foregroundColor(.white)
-                                        Text("\(pTracks.count) songs")
-                                            .font(.subheadline)
-                                            .foregroundColor(.secondary)
-                                    }
-                                }
-                                .padding(.vertical, 6)
-                            }
-                            .listRowBackground(Color.white.opacity(0.05))
-                        }
-                        .onDelete { indexSet in
-                            indexSet.map { engine.playlists[$0] }.forEach(engine.deletePlaylist)
-                        }
-                    }
-                    .scrollContentBackground(.hidden)
-                    .padding(.bottom, engine.currentTrack != nil ? 70 : 0)
-                }
-            }
-            .navigationTitle("MusiQ")
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button {
-                        engine.scanLocalLibrary()
-                    } label: {
-                        Image(systemName: "arrow.clockwise")
-                    }
-                }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        newPlaylistName = ""
-                        showingNewPlaylistAlert = true
-                    } label: {
-                        Image(systemName: "plus.circle.fill")
-                            .font(.title3)
-                    }
-                }
-            }
-            .alert("New Playlist", isPresented: $showingNewPlaylistAlert) {
-                TextField("Playlist Name", text: $newPlaylistName)
-                Button("Cancel", role: .cancel) {}
-                Button("Create") {
-                    engine.createPlaylist(name: newPlaylistName)
-                }
-            }
-        }
-    }
-}
-
-// MARK: - Clean Full-Bleed Playlist Detail View
-struct PlaylistDetailView: View {
-    @ObservedObject var engine: MusiQEngine
-    let playlistID: UUID
-    @Binding var showFullPlayer: Bool
-
-    @State private var showSongPicker = false
-    @State private var showEditPlaylistSheet = false
-    @State private var searchText = ""
-
-    var playlist: Playlist? {
-        engine.playlists.first(where: { $0.id == playlistID })
-    }
-
-    private var headerGradientColors: [Color] {
-        if let customImg = ArtworkCache.shared.playlistCover(for: playlistID) {
-            return customImg.extractPlayerGradientColors()
-        }
-        if let firstTrack = playlist.flatMap({ engine.tracks(for: $0).first }) {
-            return ArtworkCache.shared.playerGradient(for: firstTrack.fileName)
-        }
-        return [Color.purple.opacity(0.55), Color(red: 0.08, green: 0.06, blue: 0.14), Color(red: 0.06, green: 0.06, blue: 0.08)]
-    }
-
-    var body: some View {
-        let allPlaylistTracks = playlist.map { engine.tracks(for: $0) } ?? []
-        let tracks = searchText.isEmpty ? allPlaylistTracks : allPlaylistTracks.filter {
-            $0.title.localizedCaseInsensitiveContains(searchText) ||
-            $0.artist.localizedCaseInsensitiveContains(searchText)
-        }
-        let totalMinutes = Int(allPlaylistTracks.reduce(0) { $0 + $1.duration } / 60.0)
-
-        ZStack {
-            Color(red: 0.06, green: 0.06, blue: 0.08).ignoresSafeArea()
-
-            List {
-                VStack(spacing: 18) {
-                    HStack(alignment: .center, spacing: 18) {
-                        if let p = playlist {
-                            PlaylistArtworkThumbnailView(
-                                playlist: p,
-                                tracks: allPlaylistTracks,
-                                size: 116,
-                                cornerRadius: 16
-                            )
-                            .shadow(color: .black.opacity(0.55), radius: 12, x: 0, y: 6)
-                            .onTapGesture {
-                                showEditPlaylistSheet = true
-                            }
-                        }
-
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text("PLAYLIST")
-                                .font(.system(size: 11, weight: .bold))
-                                .tracking(1.4)
-                                .foregroundColor(.white.opacity(0.60))
-
-                            Text(playlist?.name ?? "Playlist")
-                                .font(.system(size: 26, weight: .heavy, design: .rounded))
-                                .foregroundColor(.white)
-                                .lineLimit(2)
-
-                            Text("\(allPlaylistTracks.count) songs • \(totalMinutes) min")
-                                .font(.subheadline.weight(.medium))
-                                .foregroundColor(.white.opacity(0.72))
-                        }
-                        Spacer(minLength: 0)
-                    }
-
-                    HStack(spacing: 12) {
-                        Button {
-                            showSongPicker = true
-                        } label: {
-                            HStack(spacing: 6) {
-                                Image(systemName: "plus")
-                                    .font(.system(size: 13, weight: .bold))
-                                Text("Add Songs")
-                                    .font(.system(size: 13, weight: .bold))
-                            }
-                            .padding(.horizontal, 16)
-                            .padding(.vertical, 10)
-                            .background(Color.white.opacity(0.14))
-                            .foregroundColor(.white)
-                            .clipShape(Capsule())
-                        }
-                        .buttonStyle(.plain)
-
-                        Button {
-                            showEditPlaylistSheet = true
-                        } label: {
-                            HStack(spacing: 6) {
-                                Image(systemName: "photo.on.rectangle")
-                                    .font(.system(size: 13, weight: .bold))
-                                Text("Edit Cover")
-                                    .font(.system(size: 13, weight: .bold))
-                            }
-                            .padding(.horizontal, 16)
-                            .padding(.vertical, 10)
-                            .background(Color.white.opacity(0.14))
-                            .foregroundColor(.white)
-                            .clipShape(Capsule())
-                        }
-                        .buttonStyle(.plain)
-
-                        Spacer()
-
-                        Button {
-                            guard !allPlaylistTracks.isEmpty else { return }
-                            engine.isShuffle = true
-                            if let randomTrack = allPlaylistTracks.randomElement() {
-                                engine.playTrack(randomTrack, in: allPlaylistTracks)
-                                showFullPlayer = true
-                            }
-                        } label: {
-                            ZStack {
-                                Circle()
-                                    .fill(Color.white.opacity(0.12))
-                                    .frame(width: 44, height: 44)
-                                Image(systemName: "shuffle")
-                                    .font(.system(size: 16, weight: .bold))
-                                    .foregroundColor(engine.isShuffle ? .purple : .white)
-                            }
-                        }
-                        .buttonStyle(.plain)
-
-                        Button {
-                            guard let first = allPlaylistTracks.first else { return }
-                            engine.playTrack(first, in: allPlaylistTracks)
-                            showFullPlayer = true
-                        } label: {
-                            ZStack {
-                                Circle()
-                                    .fill(Color.purple)
-                                    .frame(width: 52, height: 52)
-                                    .shadow(color: .purple.opacity(0.45), radius: 8, x: 0, y: 4)
-                                Image(systemName: "play.fill")
-                                    .font(.system(size: 20, weight: .bold))
-                                    .foregroundColor(.white)
-                            }
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-                .padding(.horizontal, 20)
-                .padding(.vertical, 18)
-                .background(
-                    LinearGradient(
-                        colors: [headerGradientColors.first ?? .purple.opacity(0.45), Color(red: 0.06, green: 0.06, blue: 0.08)],
-                        startPoint: .top,
-                        endPoint: .bottom
-                    )
-                )
-                .listRowInsets(EdgeInsets())
-                .listRowSeparator(.hidden)
-                .listRowBackground(Color.clear)
-
-                if tracks.isEmpty {
-                    VStack(spacing: 10) {
-                        Text("No songs in this playlist yet.")
-                            .font(.subheadline)
-                            .foregroundColor(.secondary)
-                        Button("Tap '+ Add Songs' above to pick tracks") {
-                            showSongPicker = true
-                        }
-                        .font(.caption.weight(.bold))
-                        .foregroundColor(.purple)
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 36)
-                    .listRowBackground(Color.clear)
-                    .listRowSeparator(.hidden)
-                } else {
-                    ForEach(Array(tracks.enumerated()), id: \.element.id) { idx, track in
-                        TrackRowView(indexNumber: idx + 1, track: track) {
-                            engine.playTrack(track, in: tracks)
-                            showFullPlayer = true
-                        }
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 4)
-                        .listRowInsets(EdgeInsets())
-                        .listRowBackground(Color.clear)
-                        .listRowSeparatorTint(Color.white.opacity(0.08))
-                    }
-                    .onDelete { offsets in
-                        offsets.forEach { idx in
-                            engine.removeTrack(fileName: tracks[idx].fileName, from: playlistID)
-                        }
-                    }
-                }
-            }
-            .listStyle(.plain)
-            .scrollContentBackground(.hidden)
-            .searchable(text: $searchText, prompt: "Search in playlist...")
-            .padding(.bottom, engine.currentTrack != nil ? 70 : 0)
-        }
-        .navigationTitle(playlist?.name ?? "Playlist")
-        .navigationBarTitleDisplayMode(.inline)
-        .sheet(isPresented: $showSongPicker) {
-            NavigationStack {
-                Group {
-                    if engine.allTracks.isEmpty {
-                        VStack(spacing: 12) {
-                            Text("No songs in library yet.")
-                                .foregroundColor(.secondary)
-                            Text("Import tracks in the 'Songs' tab first.")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
-                    } else {
-                        List(engine.allTracks) { track in
-                            Button {
-                                engine.addTrack(track, to: playlistID)
-                            } label: {
-                                HStack {
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(track.title)
-                                            .foregroundColor(.white)
-                                        Text("\(track.artist) • \(track.formattedDuration)")
-                                            .font(.caption)
-                                            .foregroundColor(.secondary)
-                                    }
-                                    Spacer()
-                                    if playlist?.trackFileNames.contains(track.fileName) == true {
-                                        Image(systemName: "checkmark.circle.fill")
-                                            .foregroundColor(.purple)
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                .navigationTitle("Add to Playlist")
-                .toolbar {
-                    ToolbarItem(placement: .topBarTrailing) {
-                        Button("Done") { showSongPicker = false }
-                    }
-                }
-            }
-        }
-        .sheet(isPresented: $showEditPlaylistSheet) {
-            if let p = playlist {
-                PlaylistEditorSheet(engine: engine, playlist: p)
-            }
-        }
-    }
-}
-
-// MARK: - Custom Playlist Cover & Name Editor Sheet
-struct PlaylistEditorSheet: View {
-    @ObservedObject var engine: MusiQEngine
-    let playlist: Playlist
-
-    @State private var editedName: String = ""
-    @State private var selectedPhoto: PhotosPickerItem? = nil
-    @State private var previewCover: UIImage? = nil
-    @Environment(\.dismiss) private var dismiss
-
-    var body: some View {
-        NavigationStack {
-            Form {
-                Section("Custom Playlist Cover Art") {
-                    HStack {
-                        Spacer()
-                        if let img = previewCover {
-                            Image(uiImage: img)
-                                .resizable()
-                                .scaledToFill()
-                                .frame(width: 120, height: 120)
-                                .clipShape(RoundedRectangle(cornerRadius: 14))
-                        } else {
-                            PlaylistArtworkThumbnailView(
-                                playlist: playlist,
-                                tracks: engine.tracks(for: playlist),
-                                size: 120,
-                                cornerRadius: 14
-                            )
-                        }
-                        Spacer()
-                    }
-                    .padding(.vertical, 6)
-
-                    PhotosPicker(selection: $selectedPhoto, matching: .images) {
-                        Label("Choose Custom Playlist Cover", systemImage: "photo.on.rectangle.angled")
-                    }
-                    .onChange(of: selectedPhoto) { newItem in
-                        guard let newItem = newItem else { return }
-                        Task {
-                            if let data = try? await newItem.loadTransferable(type: Data.self),
-                               let uiImg = UIImage(data: data) {
-                                await MainActor.run {
-                                    previewCover = uiImg.autoCroppedToSquare()
-                                }
-                            }
-                        }
-                    }
-                }
-
-                Section("Playlist Name") {
-                    TextField("Playlist Name", text: $editedName)
-                }
-            }
-            .navigationTitle("Edit Playlist")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button("Cancel") { dismiss() }
-                }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button("Save") {
-                        engine.updatePlaylistDetails(
-                            id: playlist.id,
-                            newName: editedName,
-                            customCover: previewCover
-                        )
-                        dismiss()
-                    }
-                    .fontWeight(.bold)
-                }
-            }
-            .onAppear {
-                editedName = playlist.name
-                previewCover = ArtworkCache.shared.playlistCover(for: playlist.id)
-            }
-        }
-    }
-}
-
-// MARK: - Tab 2: Global Searchable Songs Library
-struct AllSongsSearchView: View {
-    @ObservedObject var engine: MusiQEngine
-    @Binding var showFullPlayer: Bool
-    @State private var searchText: String = ""
-    @State private var showFileImporter: Bool = false
-    @State private var trackToTag: Track? = nil
-
-    var filteredTracks: [Track] {
-        if searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return engine.allTracks
-        }
-        return engine.allTracks.filter {
-            $0.title.localizedCaseInsensitiveContains(searchText) ||
-            $0.artist.localizedCaseInsensitiveContains(searchText) ||
-            $0.fileName.localizedCaseInsensitiveContains(searchText)
-        }
-    }
-
-    var body: some View {
-        NavigationStack {
-            ZStack {
-                Color(red: 0.06, green: 0.06, blue: 0.08).ignoresSafeArea()
-
-                if engine.allTracks.isEmpty {
-                    VStack(spacing: 14) {
-                        Image(systemName: "waveform.circle")
-                            .font(.system(size: 54))
-                            .foregroundColor(.purple)
-                        Text("No Songs Found")
-                            .font(.headline)
-                        Text("Import audio files directly from your iPhone Files app.")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                            .multilineTextAlignment(.center)
-                            .padding(.horizontal, 36)
-
-                        Button {
-                            showFileImporter = true
-                        } label: {
-                            Label("Import from Files App", systemImage: "folder.badge.plus")
-                                .font(.headline)
-                                .padding(.horizontal, 20)
-                                .padding(.vertical, 12)
-                                .background(Color.purple)
-                                .foregroundColor(.white)
-                                .clipShape(Capsule())
-                        }
-                        .padding(.top, 6)
-
-                        Button("Rescan Library") {
-                            engine.scanLocalLibrary()
-                        }
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                        .padding(.top, 4)
-                    }
-                } else {
-                    List {
-                        ForEach(filteredTracks) { track in
-                            TrackRowView(indexNumber: nil, track: track) {
-                                let snapshotQueue = filteredTracks
-                                engine.playTrack(track, in: snapshotQueue)
-                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                                    showFullPlayer = true
-                                }
-                            }
-                            .contextMenu {
-                                Button {
-                                    trackToTag = track
-                                } label: {
-                                    Label("Edit Tags & Cover Art", systemImage: "tag.fill")
-                                }
-
-                                if !engine.playlists.isEmpty {
-                                    Menu("Add to Playlist") {
-                                        ForEach(engine.playlists) { playlist in
-                                            Button(playlist.name) {
-                                                engine.addTrack(track, to: playlist.id)
-                                            }
-                                        }
-                                    }
-                                }
-
-                                Button(role: .destructive) {
-                                    engine.deleteTrackFromDisk(track)
-                                } label: {
-                                    Label("Delete Song", systemImage: "trash")
-                                }
-                            }
-                            .listRowBackground(Color.white.opacity(0.04))
-                        }
-                        .onDelete { offsets in
-                            offsets.map { filteredTracks[$0] }.forEach(engine.deleteTrackFromDisk)
-                        }
-                    }
-                    .scrollContentBackground(.hidden)
-                    .searchable(text: $searchText, placement: .navigationBarDrawer(displayMode: .always), prompt: "Search songs or artists...")
-                    .padding(.bottom, engine.currentTrack != nil ? 70 : 0)
-                }
-            }
-            .navigationTitle("All Songs (\(engine.allTracks.count))")
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button {
-                        engine.scanLocalLibrary()
-                    } label: {
-                        Image(systemName: "arrow.clockwise")
-                    }
-                }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        showFileImporter = true
-                    } label: {
-                        Label("Import Files", systemImage: "folder.badge.plus")
-                    }
-                }
-            }
-            .fileImporter(
-                isPresented: $showFileImporter,
-                allowedContentTypes: [.audio, .mp3, .mpeg4Audio, .wav],
-                allowsMultipleSelection: true
-            ) { result in
-                switch result {
-                case .success(let urls):
-                    let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-                    for url in urls {
-                        let gotAccess = url.startAccessingSecurityScopedResource()
-                        defer { if gotAccess { url.stopAccessingSecurityScopedResource() } }
-                        let dest = docs.appendingPathComponent(url.lastPathComponent)
-                        try? FileManager.default.removeItem(at: dest)
-                        try? FileManager.default.copyItem(at: url, to: dest)
-                    }
-                    engine.scanLocalLibrary()
-                case .failure(let err):
-                    print("Import failed: \(err)")
-                }
-            }
-            .sheet(item: $trackToTag) { track in
-                BuiltInTagEditorSheet(engine: engine, track: track)
-            }
-        }
-    }
-}
-
-// MARK: - Enlarged Track Row View
-struct TrackRowView: View {
-    let indexNumber: Int?
-    let track: Track
-    let onTap: () -> Void
-
-    var body: some View {
-        Button(action: onTap) {
-            HStack(spacing: 14) {
-                if let num = indexNumber {
-                    Text("\(num)")
-                        .font(.subheadline.monospacedDigit().weight(.semibold))
-                        .foregroundColor(.secondary)
-                        .frame(width: 24, alignment: .center)
-                }
-
-                if let uiImage = ArtworkCache.shared.artwork(for: track.fileName) {
-                    Image(uiImage: uiImage)
-                        .resizable()
-                        .scaledToFill()
-                        .frame(width: 58, height: 58)
-                        .clipShape(RoundedRectangle(cornerRadius: 10))
-                        .shadow(color: .black.opacity(0.3), radius: 4, x: 0, y: 2)
-                } else {
-                    RoundedRectangle(cornerRadius: 10)
-                        .fill(Color.white.opacity(0.1))
-                        .frame(width: 58, height: 58)
-                        .overlay(Image(systemName: "music.note").font(.title3).foregroundColor(.gray))
-                }
-
-                VStack(alignment: .leading, spacing: 5) {
-                    Text(track.title)
-                        .font(.system(size: 17, weight: .semibold))
-                        .foregroundColor(.white)
-                        .lineLimit(1)
-                    HStack(spacing: 6) {
-                        Text(track.artist)
-                            .font(.subheadline)
-                            .foregroundColor(.secondary)
-                            .lineLimit(1)
-                        Text("•")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                        Text(track.formattedDuration)
-                            .font(.subheadline.monospacedDigit())
-                            .foregroundColor(.secondary)
-                    }
-                }
-                Spacer()
-                Image(systemName: "play.fill")
-                    .font(.subheadline)
-                    .foregroundColor(.secondary)
-            }
-            .padding(.vertical, 4)
-        }
-    }
-}
-
-// MARK: - Mini Player Bar
-struct MiniPlayerBar: View {
-    @ObservedObject var engine: MusiQEngine
-    let track: Track
-    let onExpand: () -> Void
-
-    var body: some View {
-        HStack(spacing: 12) {
-            if let art = ArtworkCache.shared.artwork(for: track.fileName) {
-                Image(uiImage: art)
-                    .resizable()
-                    .scaledToFill()
-                    .frame(width: 44, height: 44)
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
-            } else {
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(Color.purple.opacity(0.3))
-                    .frame(width: 44, height: 44)
-                    .overlay(Image(systemName: "music.note").foregroundColor(.white))
-            }
-
-            VStack(alignment: .leading, spacing: 2) {
-                Text(track.title)
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundColor(.white)
-                    .lineLimit(1)
-                Text(track.artist)
-                    .font(.caption2)
-                    .foregroundColor(.secondary)
-                    .lineLimit(1)
-            }
-
-            Spacer()
-
-            Button {
-                engine.togglePlayPause()
-            } label: {
-                Image(systemName: engine.isPlaying ? "pause.fill" : "play.fill")
-                    .font(.title3)
-                    .foregroundColor(.white)
-                    .frame(width: 36, height: 36)
-            }
-
-            Button {
-                engine.nextTrack()
-            } label: {
-                Image(systemName: "forward.fill")
-                    .font(.subheadline)
-                    .foregroundColor(.white)
-                    .frame(width: 32, height: 32)
-            }
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 8)
-        .background(.ultraThinMaterial)
-        .clipShape(RoundedRectangle(cornerRadius: 16))
-        .padding(.horizontal, 12)
-        .onTapGesture(perform: onExpand)
-    }
-}
-
-// MARK: - Full-Screen Player (With Value-Captured Old-to-New Album Skip Transition)
-struct FullPlayerDeckView: View {
-    @ObservedObject var engine: MusiQEngine
-    @Binding var isPresented: Bool
-
-    @StateObject private var motion = MotionTiltManager()
-    @State private var activeBottomSheet: BottomPanel? = nil
-    @State private var dragOffset: CGSize = .zero
-
-    enum BottomPanel: Identifiable {
-        case dsp, lyrics, tagEditor, queue
-        var id: Int { hashValue }
-    }
-
-    private var dynamicAlbumGradient: [Color] {
-        let _ = engine.artworkRefreshID
-        return ArtworkCache.shared.playerGradient(for: engine.currentTrack?.fileName)
-    }
-
-    var body: some View {
-        GeometryReader { geo in
-            let safeWidth = geo.size.width
-            let artBoxSize = min(safeWidth - 76, 268)
-
-            ZStack {
-                LinearGradient(
-                    colors: dynamicAlbumGradient,
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
-                )
-                .ignoresSafeArea()
-                .animation(.easeInOut(duration: 0.65), value: engine.currentTrack?.fileName)
-
-                VStack(spacing: 6) {
-                    // Top Bar
-                    HStack {
-                        Button {
-                            isPresented = false
-                        } label: {
-                            Image(systemName: "chevron.left")
-                                .font(.title3.weight(.semibold))
-                                .foregroundColor(.white.opacity(0.85))
-                                .padding(8)
-                        }
-                        Spacer()
-                        Capsule()
-                            .fill(Color.white.opacity(0.3))
-                            .frame(width: 42, height: 5)
-                        Spacer()
-                        if let track = engine.currentTrack {
-                            Text(engine.formattedListenTime(for: track.fileName))
-                                .font(.caption2.monospacedDigit().weight(.semibold))
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 5)
-                                .background(Color.black.opacity(0.28))
-                                .clipShape(Capsule())
-                                .foregroundColor(.white.opacity(0.9))
-                        }
-                    }
-                    .padding(.horizontal, 16)
-
-                    // 3-Way Display Mode Switcher
-                    HStack(spacing: 10) {
-                        ForEach(VisualMode.allCases, id: \.self) { mode in
-                            Button {
-                                withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
-                                    engine.visualMode = mode
-                                }
-                            } label: {
-                                HStack(spacing: 6) {
-                                    Image(systemName: mode.icon)
-                                        .font(.caption)
-                                    Text(mode.rawValue)
-                                        .font(.caption.weight(.semibold))
-                                }
-                                .padding(.horizontal, 12)
-                                .padding(.vertical, 7)
-                                .background(engine.visualMode == mode ? Color.white.opacity(0.24) : Color.black.opacity(0.22))
-                                .foregroundColor(.white)
-                                .clipShape(Capsule())
-                            }
-                        }
-                    }
-
-                    Spacer(minLength: 8)
-
-                    // Value-Captured Visualizer Stage:
-                    // By binding `.id(activeTrack.fileName)` to the captured `activeTrack` value,
-                    // SwiftUI keeps the outgoing track's artwork on the exiting view while sliding in the new track's artwork!
-                    ZStack {
-                        if let activeTrack = engine.currentTrack {
-                            let capturedPalette = ArtworkCache.shared.cassettePalette(for: activeTrack.fileName)
-                            PlayerVisualizerStage(
-                                mode: engine.visualMode,
-                                track: activeTrack,
-                                isPlaying: engine.isPlaying,
-                                boxSize: artBoxSize,
-                                refreshID: engine.artworkRefreshID,
-                                zonePalette: capturedPalette
-                            )
-                            .id(activeTrack.fileName)
-                            .transition(
-                                .asymmetric(
-                                    insertion: .offset(x: engine.skipTransitionDirection >= 0 ? 140 : -140)
-                                        .combined(with: .scale(scale: 0.86))
-                                        .combined(with: .opacity),
-                                    removal: .offset(x: engine.skipTransitionDirection >= 0 ? -140 : 140)
-                                        .combined(with: .scale(scale: 0.86))
-                                        .combined(with: .opacity)
-                                )
-                            )
-                        }
-                    }
-                    .rotation3DEffect(
-                        .degrees(motion.pitch),
-                        axis: (x: 1, y: 0, z: 0),
-                        perspective: 0.4
-                    )
-                    .rotation3DEffect(
-                        .degrees(motion.roll),
-                        axis: (x: 0, y: 1, z: 0),
-                        perspective: 0.4
-                    )
-                    .offset(x: CGFloat(motion.roll * 1.3), y: CGFloat(motion.pitch * 1.3))
-                    .frame(width: safeWidth - 16, height: artBoxSize + 10)
-                    .padding(.bottom, 22)
-
-                    if let err = engine.playbackErrorMessage {
-                        Text(err)
-                            .font(.caption2)
-                            .foregroundColor(.red)
-                            .multilineTextAlignment(.center)
-                            .padding(.horizontal, 20)
-                    }
-
-                    // Song Title + Artist
-                    VStack(spacing: 4) {
-                        LoopingMarqueeText(
-                            text: engine.currentTrack?.title ?? "No Track Selected",
-                            font: .system(size: 22, weight: .bold),
-                            textColor: .white
-                        )
-                        .frame(width: safeWidth - 48)
-
-                        Text(engine.currentTrack?.artist ?? "MusiQ Local Library")
-                            .font(.subheadline.weight(.medium))
-                            .foregroundColor(.white.opacity(0.72))
-                            .lineLimit(1)
-                    }
-                    .padding(.horizontal, 24)
-
-                    // 2-Line Capable Word-by-Word Karaoke Inline Lyric Display
-                    WordByWordInlineLyricView(
-                        progress: engine.progress,
-                        lines: engine.currentTrackLyrics,
-                        autoOffset: engine.autoDetectedLyricOffset,
-                        isFetching: engine.isFetchingLyricsInBackground
-                    ) {
-                        activeBottomSheet = .lyrics
-                    }
-                    .padding(.horizontal, 20)
-                    .padding(.top, 2)
-
-                    // Isolated Scrubber + Timers
-                    IsolatedScrubberView(progress: engine.progress) { newSeconds in
-                        engine.seek(to: newSeconds)
-                    }
-                    .padding(.horizontal, 24)
-
-                    // A-B Loop Pill
-                    Button {
-                        engine.toggleABLoop()
-                    } label: {
-                        Text(abLoopLabel)
-                            .font(.caption2.weight(.semibold))
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 5)
-                            .background(engine.loopStart != nil ? Color.purple : Color.black.opacity(0.26))
-                            .foregroundColor(.white)
-                            .clipShape(Capsule())
-                    }
-
-                    // Transport Controls
-                    HStack(spacing: 34) {
-                        Button {
-                            engine.isShuffle.toggle()
-                        } label: {
-                            Image(systemName: "shuffle")
-                                .font(.title3)
-                                .foregroundColor(engine.isShuffle ? .white : .white.opacity(0.45))
-                        }
-
-                        Button {
-                            engine.previousTrack()
-                        } label: {
-                            Image(systemName: "backward.fill")
-                                .font(.title)
-                                .foregroundColor(.white)
-                        }
-
-                        Button {
-                            engine.togglePlayPause()
-                        } label: {
-                            ZStack {
-                                Circle()
-                                    .fill(Color.white.opacity(0.22))
-                                    .frame(width: 68, height: 68)
-                                Image(systemName: engine.isPlaying ? "pause.fill" : "play.fill")
-                                    .font(.system(size: 27, weight: .bold))
-                                    .foregroundColor(.white)
-                            }
-                        }
-
-                        Button {
-                            engine.nextTrack()
-                        } label: {
-                            Image(systemName: "forward.fill")
-                                .font(.title)
-                                .foregroundColor(.white)
-                        }
-
-                        Button {
-                            engine.isRepeat.toggle()
-                        } label: {
-                            Image(systemName: "repeat")
-                                .font(.title3)
-                                .foregroundColor(engine.isRepeat ? .white : .white.opacity(0.45))
-                        }
-                    }
-
-                    // Bottom Action Bar
-                    HStack(spacing: 22) {
-                        Button {
-                            activeBottomSheet = .dsp
-                        } label: {
-                            VStack(spacing: 4) {
-                                Image(systemName: "dial.high.fill")
-                                Text("DSP")
-                                    .font(.caption2)
-                            }
-                            .foregroundColor(.white.opacity(0.85))
-                        }
-
-                        Button {
-                            activeBottomSheet = .lyrics
-                        } label: {
-                            VStack(spacing: 4) {
-                                Image(systemName: "quote.bubble.fill")
-                                Text("Lyrics")
-                                    .font(.caption2)
-                            }
-                            .foregroundColor(.white.opacity(0.85))
-                        }
-
-                        Button {
-                            activeBottomSheet = .tagEditor
-                        } label: {
-                            VStack(spacing: 4) {
-                                Image(systemName: "tag.fill")
-                                Text("Tags")
-                                    .font(.caption2)
-                            }
-                            .foregroundColor(.white.opacity(0.85))
-                        }
-
-                        Button {
-                            activeBottomSheet = .queue
-                        } label: {
-                            VStack(spacing: 4) {
-                                Image(systemName: "list.bullet")
-                                Text("Queue")
-                                    .font(.caption2)
-                            }
-                            .foregroundColor(.white.opacity(0.85))
-                        }
-
-                        VStack(spacing: 2) {
-                            AudioSourcePickerButton()
-                                .frame(width: 26, height: 22)
-                            Text("Source")
-                                .font(.caption2)
-                                .foregroundColor(.white.opacity(0.85))
-                        }
-                    }
-                    .padding(.top, 4)
-                    .padding(.bottom, 12)
-                }
-            }
-            .offset(x: max(0, dragOffset.width), y: max(0, dragOffset.height * 0.3))
-            .gesture(
-                DragGesture()
-                    .onChanged { value in
-                        if value.translation.width > 0 || value.translation.height > 0 {
-                            dragOffset = value.translation
-                        }
-                    }
-                    .onEnded { value in
-                        if value.translation.width > 95 || value.translation.height > 140 {
-                            isPresented = false
-                        }
-                        withAnimation(.spring()) {
-                            dragOffset = .zero
-                        }
-                    }
-            )
-            .sheet(item: $activeBottomSheet) { panel in
-                switch panel {
-                case .dsp:
-                    DSPControlSheet(engine: engine)
-                        .presentationDetents([.medium])
-                case .lyrics:
-                    if let current = engine.currentTrack {
-                        AppleMusicLyricsSheetView(engine: engine, progress: engine.progress, track: current)
-                            .presentationDetents([.large])
-                            .presentationDragIndicator(.hidden)
-                    }
-                case .tagEditor:
-                    if let current = engine.currentTrack {
-                        BuiltInTagEditorSheet(engine: engine, track: current)
-                            .presentationDetents([.medium, .large])
-                    }
-                case .queue:
-                    QueueSheetView(engine: engine)
-                        .presentationDetents([.medium, .large])
-                }
-            }
-        }
-    }
-
-    private var abLoopLabel: String {
-        if let s = engine.loopStart, let e = engine.loopEnd {
-            return String(format: "A-B Loop: %.0fs - %.0fs (Tap to Clear)", s, e)
-        } else if let s = engine.loopStart {
-            return String(format: "Loop A: %.0fs (Tap to Set B)", s)
-        } else {
-            return "A-B Loop"
-        }
-    }
-}
-
-// MARK: - Isolated Scrubber & Timers
-struct IsolatedScrubberView: View {
-    @ObservedObject var progress: PlaybackProgressObserver
-    let onCommitSeek: (Double) -> Void
-
-    var body: some View {
-        VStack(spacing: 4) {
-            Slider(
-                value: Binding(
-                    get: { min(progress.currentTime, max(progress.duration, 1)) },
-                    set: { newVal in
-                        progress.isScrubbing = true
-                        progress.currentTime = newVal
-                    }
-                ),
-                in: 0...max(progress.duration, 1),
-                onEditingChanged: { editing in
-                    progress.isScrubbing = editing
-                    if !editing {
-                        onCommitSeek(progress.currentTime)
-                    }
-                }
-            )
-            .tint(.white)
-
-            HStack {
-                Text(formatTime(progress.currentTime))
-                    .font(.caption.monospacedDigit())
-                    .foregroundColor(.white.opacity(0.8))
-                Spacer()
-                Text("-" + formatTime(max(0, progress.duration - progress.currentTime)))
-                    .font(.caption.monospacedDigit())
-                    .foregroundColor(.white.opacity(0.8))
-            }
-        }
-    }
-
-    private func formatTime(_ seconds: Double) -> String {
-        guard seconds.isFinite && seconds >= 0 else { return "0:00" }
-        let total = Int(seconds)
-        return String(format: "%d:%02d", total / 60, total % 60)
-    }
-}
-
-// MARK: - 3-Way Visualizer Stage (Captures Track Snapshot for True Old->New Transition)
-struct PlayerVisualizerStage: View {
-    let mode: VisualMode
-    let track: Track
-    let isPlaying: Bool
-    let boxSize: CGFloat
-    let refreshID: UUID
-    let zonePalette: [Color]
-
-    var artworkImage: UIImage? {
-        let _ = refreshID
-        return ArtworkCache.shared.artwork(for: track.fileName)
-    }
-
-    var body: some View {
-        ZStack {
-            switch mode {
-            case .sleeve:
-                sleeveCover(size: boxSize)
-
-            case .cassette:
-                multiColorPaletteCassetteView(width: boxSize * 1.12, height: boxSize * 0.72)
-
-            case .sideVinyl:
-                let sleeveDim = boxSize * 0.80
-                let vinylDim = boxSize * 0.78
-                HStack(spacing: -vinylDim * 0.44) {
-                    sleeveCover(size: sleeveDim)
-                        .zIndex(2)
-
-                    ContinuousSpinView(isSpinning: isPlaying, rpm: 14.0) {
-                        ZStack {
-                            Circle()
-                                .fill(
-                                    RadialGradient(
-                                        colors: [Color(white: 0.18), Color.black, Color(white: 0.14), Color.black],
-                                        center: .center,
-                                        startRadius: 8,
-                                        endRadius: vinylDim * 0.5
-                                    )
-                                )
-                                .frame(width: vinylDim, height: vinylDim)
-                                .shadow(color: .black.opacity(0.5), radius: 10, x: 4, y: 6)
-
-                            Circle()
-                                .stroke(Color.white.opacity(0.08), lineWidth: 1)
-                                .frame(width: vinylDim * 0.82, height: vinylDim * 0.82)
-
-                            Circle()
-                                .stroke(Color.white.opacity(0.06), lineWidth: 1)
-                                .frame(width: vinylDim * 0.64, height: vinylDim * 0.64)
-
-                            if let img = artworkImage {
-                                Image(uiImage: img)
-                                    .resizable()
-                                    .scaledToFill()
-                                    .frame(width: vinylDim * 0.38, height: vinylDim * 0.38)
-                                    .clipShape(Circle())
-                            } else {
-                                Circle()
-                                    .fill(zonePalette[2])
-                                    .frame(width: vinylDim * 0.38, height: vinylDim * 0.38)
-                            }
-
-                            Circle()
-                                .fill(Color.black)
-                                .frame(width: 12, height: 12)
-                        }
-                    }
-                    .zIndex(1)
-                }
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func multiColorPaletteCassetteView(width: CGFloat, height: CGFloat) -> some View {
-        let reelSize = height * 0.36
-        let cLeft = zonePalette.indices.contains(0) ? zonePalette[0] : .white
-        let cMidLeft = zonePalette.indices.contains(1) ? zonePalette[1] : .yellow
-        let cCenter = zonePalette.indices.contains(2) ? zonePalette[2] : .orange
-        let cMidRight = zonePalette.indices.contains(3) ? zonePalette[3] : .yellow
-        let cRight = zonePalette.indices.contains(4) ? zonePalette[4] : .white
-
-        ZStack {
-            RoundedRectangle(cornerRadius: 18)
-                .fill(
-                    LinearGradient(
-                        stops: [
-                            .init(color: cLeft.opacity(0.85), location: 0.0),
-                            .init(color: cMidLeft.opacity(0.80), location: 0.24),
-                            .init(color: cCenter.opacity(0.85), location: 0.50),
-                            .init(color: cMidRight.opacity(0.80), location: 0.76),
-                            .init(color: cRight.opacity(0.85), location: 1.0)
-                        ],
-                        startPoint: .leading,
-                        endPoint: .trailing
-                    )
-                )
-                .background(
-                    RoundedRectangle(cornerRadius: 18)
-                        .fill(.ultraThinMaterial)
-                )
-                .frame(width: width, height: height)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 18)
-                        .stroke(
-                            LinearGradient(
-                                colors: [cLeft.opacity(0.9), cMidLeft, cCenter, cRight.opacity(0.9)],
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
-                            ),
-                            lineWidth: 2.2
-                        )
-                )
-                .shadow(color: .black.opacity(0.55), radius: 16, x: 0, y: 10)
-
-            VStack {
-                HStack {
-                    cassetteScrew()
-                    Spacer()
-                    cassetteScrew()
-                }
-                Spacer()
-                HStack {
-                    cassetteScrew()
-                    Spacer()
-                    cassetteScrew()
-                }
-            }
-            .padding(12)
-            .frame(width: width, height: height)
-
-            ZStack {
-                RoundedRectangle(cornerRadius: 11)
-                    .fill(
-                        LinearGradient(
-                            stops: [
-                                .init(color: cLeft, location: 0.0),
-                                .init(color: cLeft.opacity(0.95), location: 0.14),
-                                .init(color: cMidLeft, location: 0.30),
-                                .init(color: cCenter, location: 0.50),
-                                .init(color: cMidRight, location: 0.70),
-                                .init(color: cRight.opacity(0.95), location: 0.86),
-                                .init(color: cRight, location: 1.0)
-                            ],
-                            startPoint: .leading,
-                            endPoint: .trailing
-                        )
-                    )
-                    .frame(width: width * 0.88, height: height * 0.62)
-                    .overlay(
-                        VStack(spacing: 3) {
-                            Spacer()
-                            Rectangle()
-                                .fill(
-                                    LinearGradient(
-                                        colors: [cMidLeft, cCenter, cMidRight],
-                                        startPoint: .leading,
-                                        endPoint: .trailing
-                                    )
-                                )
-                                .frame(height: 5)
-                                .opacity(0.85)
-                            Rectangle()
-                                .fill(
-                                    LinearGradient(
-                                        colors: [cCenter, cMidLeft, cCenter],
-                                        startPoint: .leading,
-                                        endPoint: .trailing
-                                    )
-                                )
-                                .frame(height: 3)
-                                .opacity(0.75)
-                        }
-                        .padding(.bottom, 8)
-                        .clipShape(RoundedRectangle(cornerRadius: 11))
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 11)
-                            .stroke(Color.black.opacity(0.28), lineWidth: 1.2)
-                    )
-
-                VStack {
-                    HStack {
-                        Text("SIDE A")
-                            .font(.system(size: 8, weight: .black, design: .monospaced))
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
-                            .background(Color.black.opacity(0.65))
-                            .foregroundColor(.white)
-                            .clipShape(RoundedRectangle(cornerRadius: 4))
-
-                        Spacer()
-
-                        Text("HI-BIAS CrO2")
-                            .font(.system(size: 8, weight: .bold, design: .monospaced))
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
-                            .background(Color.black.opacity(0.65))
-                            .foregroundColor(.white.opacity(0.9))
-                            .clipShape(RoundedRectangle(cornerRadius: 4))
-                    }
-                    .padding(.horizontal, 10)
-                    .padding(.top, 7)
-                    Spacer()
-                }
-                .frame(width: width * 0.88, height: height * 0.62)
-
-                ZStack {
-                    Capsule()
-                        .fill(
-                            LinearGradient(
-                                colors: [Color.black.opacity(0.82), cCenter.opacity(0.45), Color.black.opacity(0.82)],
-                                startPoint: .leading,
-                                endPoint: .trailing
-                            )
-                        )
-                        .frame(width: width * 0.68, height: reelSize + 14)
-                        .overlay(
-                            Capsule()
-                                .stroke(Color.white.opacity(0.35), lineWidth: 1.3)
-                        )
-
-                    HStack(spacing: width * 0.14) {
-                        Circle()
-                            .fill(Color(red: 0.12, green: 0.08, blue: 0.07).opacity(0.92))
-                            .frame(width: reelSize * 1.25, height: reelSize * 1.25)
-                        Circle()
-                            .fill(Color(red: 0.12, green: 0.08, blue: 0.07).opacity(0.92))
-                            .frame(width: reelSize * 1.05, height: reelSize * 1.05)
-                    }
-                    .clipShape(Capsule().scale(0.95))
-
-                    HStack(spacing: width * 0.16) {
-                        ContinuousSpinView(isSpinning: isPlaying, rpm: 20.0) {
-                            cassetteSpindleWheel(size: reelSize, accent: cMidLeft)
-                        }
-                        ContinuousSpinView(isSpinning: isPlaying, rpm: 20.0) {
-                            cassetteSpindleWheel(size: reelSize, accent: cMidRight)
-                        }
-                    }
-                }
-                .offset(y: 4)
-            }
-            .offset(y: -height * 0.08)
-
-            VStack {
-                Spacer()
-                ZStack {
-                    RoundedRectangle(cornerRadius: 8)
-                        .fill(
-                            LinearGradient(
-                                colors: [Color.black.opacity(0.62), cCenter.opacity(0.45), Color.black.opacity(0.62)],
-                                startPoint: .leading,
-                                endPoint: .trailing
-                            )
-                        )
-                        .frame(width: width * 0.66, height: height * 0.20)
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 8)
-                                .stroke(Color.white.opacity(0.24), lineWidth: 1)
-                        )
-
-                    HStack(spacing: 16) {
-                        Circle().fill(Color.black.opacity(0.8)).frame(width: 9, height: 9)
-                        Text(track.title.uppercased())
-                            .font(.system(size: 8.5, weight: .black, design: .monospaced))
-                            .foregroundColor(.white.opacity(0.90))
-                            .lineLimit(1)
-                            .frame(maxWidth: width * 0.40)
-                        Circle().fill(Color.black.opacity(0.8)).frame(width: 9, height: 9)
-                    }
-                }
-                .padding(.bottom, 6)
-            }
-            .frame(width: width, height: height)
-        }
-    }
-
-    @ViewBuilder
-    private func cassetteSpindleWheel(size: CGFloat, accent: Color) -> some View {
-        ZStack {
-            Circle()
-                .stroke(Color.white.opacity(0.92), lineWidth: 3.5)
-                .frame(width: size, height: size)
-
-            Circle()
-                .stroke(accent.opacity(0.75), lineWidth: 2)
-                .frame(width: size * 0.72, height: size * 0.72)
-
-            ForEach(0..<6, id: \.self) { idx in
-                Rectangle()
-                    .fill(Color.white.opacity(0.92))
-                    .frame(width: 3, height: size * 0.32)
-                    .offset(y: -size * 0.30)
-                    .rotationEffect(.degrees(Double(idx) * 60.0))
-            }
-
-            Circle()
-                .fill(Color.black.opacity(0.7))
-                .frame(width: size * 0.40, height: size * 0.40)
-        }
-    }
-
-    @ViewBuilder
-    private func cassetteScrew() -> some View {
-        Circle()
-            .fill(Color.white.opacity(0.42))
-            .frame(width: 7, height: 7)
-            .overlay(
-                Rectangle()
-                    .fill(Color.black.opacity(0.55))
-                    .frame(width: 5, height: 1)
-                    .rotationEffect(.degrees(45))
-            )
-    }
-
-    @ViewBuilder
-    private func sleeveCover(size: CGFloat) -> some View {
-        if let img = artworkImage {
-            Image(uiImage: img)
-                .resizable()
-                .scaledToFill()
-                .frame(width: size, height: size)
-                .clipShape(RoundedRectangle(cornerRadius: 20))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 20)
-                        .stroke(Color.white.opacity(0.18), lineWidth: 1)
-                )
-                .shadow(color: .black.opacity(0.55), radius: 14, x: 0, y: 8)
-        } else {
-            RoundedRectangle(cornerRadius: 20)
-                .fill(LinearGradient(colors: [.purple.opacity(0.6), .indigo.opacity(0.3)], startPoint: .topLeading, endPoint: .bottomTrailing))
-                .frame(width: size, height: size)
-                .overlay(
-                    Image(systemName: "music.quarternote.3")
-                        .font(.system(size: size * 0.28))
-                        .foregroundColor(.white.opacity(0.75))
-                )
-                .shadow(color: .black.opacity(0.55), radius: 14, x: 0, y: 8)
-        }
-    }
-}
-
-// MARK: - Built-In Tag & Cover Art Editor
-struct BuiltInTagEditorSheet: View {
-    @ObservedObject var engine: MusiQEngine
-    let track: Track
-
-    @State private var editedTitle: String = ""
-    @State private var editedArtist: String = ""
-    @State private var selectedPhotoItem: PhotosPickerItem? = nil
-    @State private var previewImage: UIImage? = nil
-    @Environment(\.dismiss) private var dismiss
-
-    var body: some View {
-        NavigationStack {
-            Form {
-                Section("Cover Art (Auto-Cropped to 1:1 Square & Circle)") {
-                    HStack(spacing: 20) {
-                        Spacer()
-                        if let img = previewImage {
-                            Image(uiImage: img)
-                                .resizable()
-                                .scaledToFill()
-                                .frame(width: 96, height: 96)
-                                .clipShape(RoundedRectangle(cornerRadius: 14))
-                        } else {
-                            RoundedRectangle(cornerRadius: 14)
-                                .fill(Color.white.opacity(0.1))
-                                .frame(width: 96, height: 96)
-                                .overlay(Image(systemName: "photo").foregroundColor(.secondary))
-                        }
-
-                        if let img = previewImage {
-                            Image(uiImage: img)
-                                .resizable()
-                                .scaledToFill()
-                                .frame(width: 96, height: 96)
-                                .clipShape(Circle())
-                        }
-                        Spacer()
-                    }
-                    .padding(.vertical, 6)
-
-                    PhotosPicker(selection: $selectedPhotoItem, matching: .images) {
-                        Label("Choose Cover from Photos", systemImage: "photo.on.rectangle.angled")
-                    }
-                    .onChange(of: selectedPhotoItem) { newItem in
-                        guard let newItem = newItem else { return }
-                        Task {
-                            if let data = try? await newItem.loadTransferable(type: Data.self),
-                               let uiImg = UIImage(data: data) {
-                                await MainActor.run {
-                                    previewImage = uiImg.autoCroppedToSquare()
-                                }
-                            }
-                        }
-                    }
-                }
-
-                Section("Track Metadata") {
-                    TextField("Song Title", text: $editedTitle)
-                    TextField("Artist", text: $editedArtist)
-                }
-            }
-            .navigationTitle("Built-In Tag Editor")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button("Cancel") { dismiss() }
-                }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button("Save") {
-                        engine.updateTrackTags(
-                            track: track,
-                            newTitle: editedTitle,
-                            newArtist: editedArtist,
-                            newCover: previewImage
-                        )
-                        dismiss()
-                    }
-                    .fontWeight(.bold)
-                }
-            }
-            .onAppear {
-                editedTitle = track.title
-                editedArtist = track.artist
-                previewImage = ArtworkCache.shared.artwork(for: track.fileName)
-            }
-        }
-    }
-}
-
-// MARK: - DSP & EQ Sheet
-struct DSPControlSheet: View {
-    @ObservedObject var engine: MusiQEngine
-
-    var body: some View {
-        NavigationStack {
-            Form {
-                Section("EQ Preset") {
-                    Picker("EQ Profile", selection: Binding(
-                        get: { engine.eqPreset },
-                        set: { engine.setEQ($0) }
-                    )) {
-                        ForEach(EQPreset.allCases, id: \.self) { preset in
-                            Text(preset.rawValue).tag(preset)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                }
-
-                Section("Playback Speed (\(String(format: "%.2fx", engine.playbackRate)))") {
-                    Slider(
-                        value: Binding(
-                            get: { engine.playbackRate },
-                            set: { engine.setRate($0) }
-                        ),
-                        in: 0.5...2.0,
-                        step: 0.05
-                    )
-                    Button("Reset Speed (1.0x)") {
-                        engine.setRate(1.0)
-                    }
-                }
-
-                Section("Pitch Shift (\(Int(engine.pitchCents / 100)) Semitones)") {
-                    Slider(
-                        value: Binding(
-                            get: { engine.pitchCents },
-                            set: { engine.setPitch($0) }
-                        ),
-                        in: -1200...1200,
-                        step: 100
-                    )
-                    Button("Reset Pitch (0 st)") {
-                        engine.setPitch(0)
-                    }
-                }
-            }
-            .navigationTitle("DSP / Audio Engine")
-        }
-    }
-}
-
-// MARK: - Queue Sheet
-struct QueueSheetView: View {
-    @ObservedObject var engine: MusiQEngine
-
-    var body: some View {
-        NavigationStack {
-            List(Array(engine.currentQueue.enumerated()), id: \.element.id) { idx, track in
-                Button {
-                    engine.playTrack(track, in: engine.currentQueue)
-                } label: {
-                    HStack {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(track.title)
-                                .foregroundColor(idx == engine.currentIndex ? .purple : .white)
-                                .fontWeight(idx == engine.currentIndex ? .bold : .regular)
-                            Text("\(track.artist) • \(track.formattedDuration)")
-                                .font(.caption2)
-                                .foregroundColor(.secondary)
-                        }
-                        Spacer()
-                        if idx == engine.currentIndex {
-                            Image(systemName: "speaker.wave.2.fill")
-                                .foregroundColor(.purple)
-                        }
-                    }
-                }
-            }
-            .navigationTitle("Up Next")
-        }
-    }
-}
-
-// MARK: - Tab 3: Direct & Cloud Audio URL Importer
-struct DirectAudioImporterView: View {
-    @ObservedObject var engine: MusiQEngine
-    @State private var urlInput: String = ""
-    @State private var customTitle: String = ""
-    @State private var customArtist: String = ""
-    @State private var statusMessage: String = "Paste a direct audio URL (.mp3, .m4a, .wav) or Dropbox / Google Drive audio share link."
-    @State private var isDownloading: Bool = false
-
-    var body: some View {
-        NavigationStack {
-            Form {
-                Section("Audio File or Cloud Share Link") {
-                    HStack {
-                        TextField("https://example.com/song.mp3", text: $urlInput)
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled()
-                        if let clip = UIPasteboard.general.string, !clip.isEmpty {
-                            Button("Paste") {
-                                urlInput = clip
-                            }
-                            .font(.caption.weight(.bold))
-                            .buttonStyle(.bordered)
-                            .tint(.purple)
-                        }
-                    }
-                }
-
-                Section("Optional Custom Metadata") {
-                    TextField("Custom Song Title (Leave blank for auto)", text: $customTitle)
-                    TextField("Artist Name (Optional)", text: $customArtist)
-                }
-
-                Section {
-                    Button {
-                        startDirectDownload()
-                    } label: {
-                        HStack {
-                            Spacer()
-                            if isDownloading {
-                                ProgressView()
-                                    .padding(.trailing, 8)
-                                Text("Downloading & Tagging...")
-                            } else {
-                                Label("Download to MusiQ Library", systemImage: "arrow.down.circle.fill")
-                                    .font(.headline)
-                            }
-                            Spacer()
-                        }
-                    }
-                    .disabled(urlInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isDownloading)
-                }
-
-                Section("Status") {
-                    Text(statusMessage)
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
-            }
-            .navigationTitle("Audio URL Importer")
-        }
-    }
-
-    private func normalizeCloudAudioURL(_ raw: String) -> URL? {
-        var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        if s.contains("dropbox.com") {
-            s = s.replacingOccurrences(of: "?dl=0", with: "?dl=1")
-            if !s.contains("dl=1") {
-                s += (s.contains("?") ? "&dl=1" : "?dl=1")
-            }
-        }
-        if s.contains("drive.google.com/file/d/") {
-            let parts = s.components(separatedBy: "/file/d/")
-            if parts.count > 1, let fileID = parts[1].components(separatedBy: "/").first {
-                s = "https://drive.google.com/uc?export=download&id=\(fileID)"
-            }
-        }
-        return URL(string: s)
-    }
-
-    private func startDirectDownload() {
-        guard let targetURL = normalizeCloudAudioURL(urlInput) else {
-            statusMessage = "Invalid URL format."
-            return
-        }
-
-        isDownloading = true
-        statusMessage = "Downloading audio stream..."
-
-        Task {
-            do {
-                let (tempURL, response) = try await URLSession.shared.download(from: targetURL)
-                let mime = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Type")?.lowercased() ?? ""
-
-                var ext = targetURL.pathExtension.lowercased()
-                if !["mp3", "m4a", "wav", "flac", "aac"].contains(ext) {
-                    ext = mime.contains("mp4") || mime.contains("m4a") ? "m4a" : "mp3"
-                }
-
-                var resolvedTitle = customTitle.trimmingCharacters(in: .whitespacesAndNewlines)
-                if resolvedTitle.isEmpty {
-                    resolvedTitle = response.suggestedFilename?.replacingOccurrences(of: ".\(ext)", with: "")
-                        ?? targetURL.deletingPathExtension().lastPathComponent
-                }
-                if resolvedTitle.isEmpty || resolvedTitle == "uc" {
-                    resolvedTitle = "Track_\(Int(Date().timeIntervalSince1970))"
-                }
-
-                var resolvedArtist = customArtist.trimmingCharacters(in: .whitespacesAndNewlines)
-                if resolvedArtist.isEmpty {
-                    resolvedArtist = "Audio Import"
-                }
-
-                let safeBaseName = resolvedTitle
-                    .replacingOccurrences(of: "/", with: "-")
-                    .replacingOccurrences(of: ":", with: "-")
-                    .replacingOccurrences(of: "?", with: "")
-
-                let safeFileName = "\(safeBaseName).\(ext)"
-                let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-                let destinationURL = docs.appendingPathComponent(safeFileName)
-
-                if FileManager.default.fileExists(atPath: destinationURL.path) {
-                    try FileManager.default.removeItem(at: destinationURL)
-                }
-                try FileManager.default.moveItem(at: tempURL, to: destinationURL)
-
-                guard let verifyFile = try? AVAudioFile(forReading: destinationURL) else {
-                    try? FileManager.default.removeItem(at: destinationURL)
-                    throw NSError(domain: "MusiQ", code: -1, userInfo: [
-                        NSLocalizedDescriptionKey: "URL did not point to a valid direct audio file. Use the Files importer in the Songs tab for local files."
-                    ])
-                }
-
-                let exactDuration = Double(verifyFile.length) / max(verifyFile.processingFormat.sampleRate, 1)
-                ArtworkCache.shared.saveCustomMetadata(title: resolvedTitle, artist: resolvedArtist, for: safeFileName)
-
-                if let res = await LyricsManager.shared.fetchVersionMatchedLyrics(
-                    title: resolvedTitle,
-                    artist: resolvedArtist,
-                    targetDuration: exactDuration
-                ) {
-                    let tempTrack = Track(id: UUID(), title: resolvedTitle, artist: resolvedArtist, fileName: safeFileName, duration: exactDuration)
-                    LyricsManager.shared.saveLyrics(res.lyrics, matchedDuration: res.matchedDuration, for: tempTrack)
-                }
-
-                await MainActor.run {
-                    isDownloading = false
-                    statusMessage = "✅ Saved '\(resolvedTitle)' to your Songs library!"
-                    urlInput = ""
-                    customTitle = ""
-                    customArtist = ""
-                    engine.scanLocalLibrary()
-                }
-            } catch {
-                await MainActor.run {
-                    isDownloading = false
-                    statusMessage = "Import error: \(error.localizedDescription)"
-                }
-            }
-        }
-    }
-}
-
-// MARK: - Tab 4: Listening Minutes Tracker View
-struct ListeningStatsView: View {
-    @ObservedObject var engine: MusiQEngine
-
-    var sortedTracksByListenTime: [Track] {
-        engine.allTracks.sorted {
-            (engine.listenedSecondsByFile[$0.fileName] ?? 0) > (engine.listenedSecondsByFile[$1.fileName] ?? 0)
-        }
-    }
-
-    var body: some View {
-        NavigationStack {
-            ZStack {
-                Color(red: 0.06, green: 0.06, blue: 0.08).ignoresSafeArea()
-
-                List {
-                    Section {
-                        HStack {
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text("Total Listening Time")
-                                    .font(.subheadline)
-                                    .foregroundColor(.secondary)
-                                Text(String(format: "%.1f Minutes", engine.totalMinutesAcrossLibrary))
-                                    .font(.system(size: 28, weight: .bold, design: .rounded))
-                                    .foregroundColor(.purple)
-                            }
-                            Spacer()
-                            Image(systemName: "headphones.circle.fill")
-                                .font(.system(size: 44))
-                                .foregroundColor(.purple.opacity(0.8))
-                        }
-                        .padding(.vertical, 6)
-                        .listRowBackground(Color.white.opacity(0.06))
-                    }
-
-                    Section("Minutes Listened Per Song") {
-                        if sortedTracksByListenTime.isEmpty {
-                            Text("No songs in library yet.")
-                                .foregroundColor(.secondary)
-                                .listRowBackground(Color.white.opacity(0.04))
-                        } else {
-                            ForEach(sortedTracksByListenTime) { track in
-                                HStack(spacing: 12) {
-                                    if let img = ArtworkCache.shared.artwork(for: track.fileName) {
-                                        Image(uiImage: img)
-                                            .resizable()
-                                            .scaledToFill()
-                                            .frame(width: 44, height: 44)
-                                            .clipShape(RoundedRectangle(cornerRadius: 8))
-                                    } else {
-                                        RoundedRectangle(cornerRadius: 8)
-                                            .fill(Color.white.opacity(0.1))
-                                            .frame(width: 44, height: 44)
-                                            .overlay(Image(systemName: "music.note").foregroundColor(.gray))
-                                    }
-
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(track.title)
-                                            .font(.subheadline.weight(.medium))
-                                            .foregroundColor(.white)
-                                            .lineLimit(1)
-                                        Text(track.artist)
-                                            .font(.caption2)
-                                            .foregroundColor(.secondary)
-                                            .lineLimit(1)
-                                    }
-
-                                    Spacer()
-
-                                    Text(engine.formattedListenTime(for: track.fileName))
-                                        .font(.subheadline.monospacedDigit().weight(.semibold))
-                                        .foregroundColor(.purple)
-                                }
-                                .listRowBackground(Color.white.opacity(0.04))
-                            }
-                        }
-                    }
-                }
-                .scrollContentBackground(.hidden)
-                .padding(.bottom, engine.currentTrack != nil ? 70 : 0)
-            }
-            .navigationTitle("Listening Tracker")
-        }
-    }
-}
+        withAnimation(.linear(duration: duration).delay(1.0).
