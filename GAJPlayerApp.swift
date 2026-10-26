@@ -985,7 +985,6 @@ final class MusiQEngine: ObservableObject {
     @Published var artworkRefreshID: UUID = UUID()
     @Published var playbackErrorMessage: String? = nil
 
-    // Optional Crossfader Settings (Persisted)
     @Published var crossfadeEnabled: Bool = UserDefaults.standard.bool(forKey: "MusiQ_Crossfade_Enabled_v1") {
         didSet {
             UserDefaults.standard.set(crossfadeEnabled, forKey: "MusiQ_Crossfade_Enabled_v1")
@@ -1017,7 +1016,6 @@ final class MusiQEngine: ObservableObject {
 
     let progress = PlaybackProgressObserver()
 
-    // Dual-Deck Audio Graph: Deck A and Deck B mix into the shared EQ & MainMixerNode
     private let engine = AVAudioEngine()
     private let playerNodeA = AVAudioPlayerNode()
     private let playerNodeB = AVAudioPlayerNode()
@@ -1031,14 +1029,12 @@ final class MusiQEngine: ObservableObject {
 
     private let graphFormat = AVAudioFormat(standardFormatWithSampleRate: 44100, channels: 2)!
 
-    // Active Deck State
     private var activeAudioFile: AVAudioFile?
     private var activeConvertedBuffer: AVAudioPCMBuffer?
     private var seekFrameOffset: AVAudioFramePosition = 0
     private var sampleRate: Double = 44100
     private var totalFrames: AVAudioFramePosition = 0
 
-    // Incoming Crossfade Deck State
     private var incomingAudioFile: AVAudioFile?
     private var incomingConvertedBuffer: AVAudioPCMBuffer?
     private var incomingSampleRate: Double = 44100
@@ -1080,10 +1076,12 @@ final class MusiQEngine: ObservableObject {
     }
 
     private func setupEngineGraph() {
+        let deckMixer = AVAudioMixerNode()
         engine.attach(playerNodeA)
         engine.attach(playerNodeB)
         engine.attach(timePitchNodeA)
         engine.attach(timePitchNodeB)
+        engine.attach(deckMixer)
         engine.attach(eqNode)
 
         let bands = eqNode.bands
@@ -1102,14 +1100,6 @@ final class MusiQEngine: ObservableObject {
         bands[2].frequency = 6000
         bands[2].gain = 0
         bands[2].bypass = false
-
-        // Connect Deck A and Deck B into the main mixer, then route main mixer -> EQ -> output!
-        //Wait: mainMixerNode has multiple input buses automatically!
-        // Let's connect playerNodeA -> timePitchNodeA -> mainMixerNode (bus 0)
-        // and playerNodeB -> timePitchNodeB -> mainMixerNode (bus 1)
-        // or connect both into eqNode's mixer before mainMixerNode.
-        let deckMixer = AVAudioMixerNode()
-        engine.attach(deckMixer)
 
         engine.connect(playerNodeA, to: timePitchNodeA, format: graphFormat)
         engine.connect(timePitchNodeA, to: deckMixer, fromBus: 0, toBus: 0, format: graphFormat)
@@ -1677,7 +1667,6 @@ final class MusiQEngine: ObservableObject {
             }
             secondaryPlayerNode.play()
 
-            // Smoothly transition cover & title halfway or right as crossfade begins
             skipTransitionDirection = 1
             withAnimation(.spring(response: 0.48, dampingFraction: 0.84)) {
                 currentIndex = nextIdx
@@ -1696,11 +1685,9 @@ final class MusiQEngine: ObservableObject {
         let fadeSpan = max(1.0, crossfadeSeconds)
         let fraction = Float(min(1.0, max(0.0, crossfadeElapsed / fadeSpan)))
 
-        // Equal-power / smooth linear ramp between outgoing and incoming decks
         primaryPlayerNode.volume = 1.0 - fraction
         secondaryPlayerNode.volume = fraction
 
-        // Show incoming track progress on scrubber during crossfade
         progress.duration = incomingDuration
         progress.currentTime = min(incomingDuration, crossfadeElapsed)
 
@@ -1711,7 +1698,6 @@ final class MusiQEngine: ObservableObject {
 
     private func completeCrossfadeHandoff() {
         guard isCrossfading else { return }
-        // Stop old deck and swap active deck pointer!
         primaryPlayerNode.stop()
         primaryPlayerNode.volume = 0.0
         secondaryPlayerNode.volume = 1.0
@@ -1730,7 +1716,6 @@ final class MusiQEngine: ObservableObject {
         isCrossfading = false
         crossfadeElapsed = 0
 
-        // Attach completion handler for the remainder of the newly promoted primary deck if needed
         scheduleGeneration += 1
         updateNowPlayingInfo()
     }
@@ -1925,7 +1910,6 @@ final class MusiQEngine: ObservableObject {
                     return
                 }
 
-                // Trigger smooth Crossfade when entering the final `crossfadeSeconds` window of the song!
                 let remaining = self.progress.duration - clamped
                 if self.crossfadeEnabled,
                    self.loopStart == nil,
@@ -3227,7 +3211,7 @@ struct PlaylistArtworkThumbnailView: View {
     }
 }
 
-// MARK: - Root Tab View (Tab 3 is now "Settings" with Crossfader + iPod + Wi-Fi + URL Import)
+// MARK: - Root Tab View (Tab 3 is "Settings")
 struct MusiQRootView: View {
     @StateObject private var engine = MusiQEngine()
     @State private var selectedTab: Int = 0
@@ -3976,7 +3960,7 @@ struct MiniPlayerBar: View {
     }
 }
 
-// MARK: - Full-Screen Player
+// MARK: - Full-Screen Player (Scrubber-Safe Edge Dismissal)
 struct FullPlayerDeckView: View {
     @ObservedObject var engine: MusiQEngine
     @Binding var isPresented: Bool
@@ -4296,14 +4280,21 @@ struct FullPlayerDeckView: View {
             }
             .offset(x: max(0, dragOffset.width), y: 0)
             .gesture(
-                DragGesture()
+                DragGesture(minimumDistance: 20)
                     .onChanged { value in
-                        if value.translation.width > abs(value.translation.height) && value.translation.width > 0 {
-                            dragOffset = value.translation
-                        }
+                        // Never trigger swipe-to-dismiss while scrubbing the song slider,
+                        // and only allow swipe-back when starting near the left edge of the screen!
+                        guard !engine.progress.isScrubbing,
+                              value.startLocation.x < 45,
+                              value.translation.width > abs(value.translation.height),
+                              value.translation.width > 0 else { return }
+                        dragOffset = value.translation
                     }
                     .onEnded { value in
-                        if value.translation.width > 95 && value.translation.width > abs(value.translation.height) {
+                        if !engine.progress.isScrubbing,
+                           value.startLocation.x < 45,
+                           value.translation.width > 85,
+                           value.translation.width > abs(value.translation.height) {
                             isPresented = false
                         }
                         withAnimation(.spring()) {
