@@ -99,6 +99,150 @@ struct LyricLine: Identifiable, Equatable {
     let words: [String]
 }
 
+// MARK: - Physical Vinyl Disc & 20-Minute Side Allocation Models
+struct VinylGrooveSegment: Identifiable, Equatable {
+    let id: UUID = UUID()
+    let trackIndexOnSide: Int
+    let track: Track
+    let outerRadiusFraction: CGFloat // 0.94 (outer rim) down to 0.38 (inner label)
+    let innerRadiusFraction: CGFloat
+
+    var midRadiusFraction: CGFloat {
+        (outerRadiusFraction + innerRadiusFraction) / 2.0
+    }
+}
+
+struct VinylSide: Identifiable, Equatable {
+    let id: UUID = UUID()
+    let sideLetter: String // "A", "B", "C", "D", etc.
+    let tracks: [Track]
+    let totalDuration: TimeInterval
+    let segments: [VinylGrooveSegment]
+
+    var formattedDuration: String {
+        let mins = Int(totalDuration) / 60
+        let secs = Int(totalDuration) % 60
+        return String(format: "%d:%02d / 20:00", mins, secs)
+    }
+}
+
+struct VinylPhysicalDisc: Identifiable, Equatable {
+    let id: UUID = UUID()
+    let discNumber: Int // 1, 2, 3, 4...
+    let sideA: VinylSide
+    let sideB: VinylSide?
+}
+
+enum VinylPressingEngine {
+    static let maxSideSeconds: TimeInterval = 20.0 * 60.0 // 20 minutes per side (40 mins per disc)
+
+    static func pressPlaylistIntoDiscs(tracks: [Track]) -> [VinylPhysicalDisc] {
+        guard !tracks.isEmpty else {
+            let emptySide = VinylSide(sideLetter: "A", tracks: [], totalDuration: 0, segments: [])
+            return [VinylPhysicalDisc(discNumber: 1, sideA: emptySide, sideB: nil)]
+        }
+
+        var rawSides: [[Track]] = []
+        var currentBucket: [Track] = []
+        var currentBucketSeconds: TimeInterval = 0
+
+        for track in tracks {
+            let effectiveDur = max(30, min(track.duration > 0 ? track.duration : 180, maxSideSeconds))
+            // If adding this song exceeds 20 minutes on the current side (and current side isn't empty), move to next side!
+            if !currentBucket.isEmpty && (currentBucketSeconds + effectiveDur > maxSideSeconds) {
+                rawSides.append(currentBucket)
+                currentBucket = [track]
+                currentBucketSeconds = effectiveDur
+            } else {
+                currentBucket.append(track)
+                currentBucketSeconds += effectiveDur
+            }
+        }
+        if !currentBucket.isEmpty {
+            rawSides.append(currentBucket)
+        }
+
+        // Convert each bucket into a VinylSide with proportional concentric groove rings
+        let letters = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P"]
+        var builtSides: [VinylSide] = []
+
+        for (sIdx, sideTracks) in rawSides.enumerated() {
+            let letter = sIdx < letters.count ? letters[sIdx] : "S\(sIdx + 1)"
+            let totalDur = sideTracks.reduce(0.0) { $0 + max(30, $1.duration > 0 ? $1.duration : 180) }
+
+            let maxOuter: CGFloat = 0.93
+            let minInner: CGFloat = 0.39
+            let usableSpan = maxOuter - minInner
+            let gapPerTrack: CGFloat = sideTracks.count > 1 ? 0.008 : 0.0
+            let netSpan = max(0.15, usableSpan - gapPerTrack * CGFloat(max(0, sideTracks.count - 1)))
+
+            var cursor = maxOuter
+            var segments: [VinylGrooveSegment] = []
+
+            for (tIdx, t) in sideTracks.enumerated() {
+                let dur = max(30, t.duration > 0 ? t.duration : 180)
+                let weight = CGFloat(dur / max(totalDur, 1))
+                let bandWidth = max(0.035, netSpan * weight)
+                let outerR = cursor
+                let innerR = max(minInner, outerR - bandWidth)
+
+                segments.append(
+                    VinylGrooveSegment(
+                        trackIndexOnSide: tIdx,
+                        track: t,
+                        outerRadiusFraction: outerR,
+                        innerRadiusFraction: innerR
+                    )
+                )
+                cursor = max(minInner, innerR - gapPerTrack)
+            }
+
+            let actualTotal = sideTracks.reduce(0.0) { $0 + $1.duration }
+            builtSides.append(
+                VinylSide(
+                    sideLetter: letter,
+                    tracks: sideTracks,
+                    totalDuration: actualTotal,
+                    segments: segments
+                )
+            )
+        }
+
+        // Pair sides into Physical Discs (2 sides = 40 minutes per disc)
+        var discs: [VinylPhysicalDisc] = []
+        var i = 0
+        var discNum = 1
+        while i < builtSides.count {
+            let firstSide = builtSides[i]
+            let secondSide: VinylSide? = (i + 1 < builtSides.count) ? builtSides[i + 1] : nil
+            discs.append(VinylPhysicalDisc(discNumber: discNum, sideA: firstSide, sideB: secondSide))
+            i += 2
+            discNum += 1
+        }
+
+        return discs
+    }
+}
+
+// Concentric Annular Ring Shape for Each Song Groove Segment on the Vinyl
+struct VinylBandRingShape: Shape {
+    let outerFraction: CGFloat
+    let innerFraction: CGFloat
+
+    func path(in rect: CGRect) -> Path {
+        let center = CGPoint(x: rect.midX, y: rect.midY)
+        let fullRadius = min(rect.width, rect.height) / 2.0
+        let rOuter = fullRadius * outerFraction
+        let rInner = fullRadius * innerFraction
+        let midR = (rOuter + rInner) / 2.0
+        let thickness = max(1, rOuter - rInner)
+
+        var path = Path()
+        path.addArc(center: center, radius: midR, startAngle: .degrees(0), endAngle: .degrees(360), clockwise: false)
+        return path.strokedPath(StrokeStyle(lineWidth: thickness))
+    }
+}
+
 enum VisualMode: String, CaseIterable {
     case sleeve = "Sleeve"
     case cassette = "Cassette"
@@ -967,7 +1111,7 @@ final class PlaybackProgressObserver: ObservableObject {
     var isScrubbing: Bool = false
 }
 
-// MARK: - Dual-Deck Crash-Proof Audio Engine (With Optional Smooth Crossfader)
+// MARK: - Dual-Deck Crash-Proof Audio Engine (With Optional Smooth Crossfader & Vinyl Mode Lockout)
 final class MusiQEngine: ObservableObject {
     @Published var allTracks: [Track] = []
     @Published var playlists: [Playlist] = []
@@ -979,6 +1123,14 @@ final class MusiQEngine: ObservableObject {
 
     @Published var visualMode: VisualMode = .sideVinyl
     @Published var isIPodModeActive: Bool = false
+    @Published var isVinylModeActive: Bool = false {
+        didSet {
+            // Strictly disable and cancel any crossfading when entering Vinyl Mode!
+            if isVinylModeActive && isCrossfading {
+                cancelActiveCrossfade()
+            }
+        }
+    }
     @Published var pitchCents: Float = 0
     @Published var playbackRate: Float = 1.0
     @Published var eqPreset: EQPreset = .flat
@@ -1624,7 +1776,9 @@ final class MusiQEngine: ObservableObject {
     }
 
     private func beginCrossfadeToNextTrack() {
-        guard !isCrossfading,
+        // Never crossfade when Vinyl Mode is active!
+        guard !isVinylModeActive,
+              !isCrossfading,
               let nextIdx = computeNextTrackIndex(),
               currentQueue.indices.contains(nextIdx) else { return }
 
@@ -1911,7 +2065,9 @@ final class MusiQEngine: ObservableObject {
                 }
 
                 let remaining = self.progress.duration - clamped
+                // Crossfade is strictly disabled when Vinyl Mode is active!
                 if self.crossfadeEnabled,
+                   !self.isVinylModeActive,
                    self.loopStart == nil,
                    self.progress.duration > (self.crossfadeSeconds + 4.0),
                    remaining <= self.crossfadeSeconds,
@@ -1964,6 +2120,1013 @@ final class MusiQEngine: ObservableObject {
             info[MPMediaItemPropertyArtwork] = MPMediaItemArtwork(boundsSize: art.size) { _ in art }
         }
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+    }
+}
+
+// MARK: - Full-Screen Interactive Vinyl Turntable Mode (3D Crate Carousel + 20m Side Pressing + Glowing Needle Grooves)
+struct FullScreenVinylTurntableModeView: View {
+    @ObservedObject var engine: MusiQEngine
+    @ObservedObject var progress: PlaybackProgressObserver
+    let onQuit: () -> Void
+
+    @StateObject private var motion = MotionTiltManager()
+
+    // Stage 1: Crate Carousel vs Stage 2: Active Turntable Deck
+    @State private var selectedPlaylist: Playlist? = nil
+    @State private var pressedDiscs: [VinylPhysicalDisc] = []
+    @State private var activeDiscIndex: Int = 0
+    @State private var isShowingSideB: Bool = false
+    @State private var flipRotationDegrees: Double = 0
+
+    // Interactive Tonearm & Needle State
+    @State private var isNeedleLifted: Bool = true
+    @State private var hoveredSegment: VinylGrooveSegment? = nil
+    @State private var needleRadiusFraction: CGFloat = 1.08 // > 1.0 means resting off the record on the arm rest
+    @State private var platterMounted: Bool = false
+
+    // Synthesize crate items (All user playlists, plus a Master Library LP if playlists are empty or as a bonus crate record)
+    private var cratePlaylists: [Playlist] {
+        var list = engine.playlists
+        let allMaster = Playlist(
+            id: UUID(uuidString: "00000000-0000-0000-0000-000000000001") ?? UUID(),
+            name: "All Songs LP",
+            trackFileNames: engine.allTracks.map { $0.fileName },
+            hasCustomCover: false
+        )
+        if list.isEmpty {
+            return [allMaster]
+        } else {
+            list.append(allMaster)
+            return list
+        }
+    }
+
+    private var activeDisc: VinylPhysicalDisc? {
+        guard pressedDiscs.indices.contains(activeDiscIndex) else { return pressedDiscs.first }
+        return pressedDiscs[activeDiscIndex]
+    }
+
+    private var activeSide: VinylSide? {
+        guard let disc = activeDisc else { return nil }
+        if isShowingSideB, let b = disc.sideB {
+            return b
+        }
+        return disc.sideA
+    }
+
+    private var activePlaylistCenterImage: UIImage? {
+        guard let p = selectedPlaylist else { return nil }
+        if let custom = ArtworkCache.shared.playlistCover(for: p.id) {
+            return custom
+        }
+        let tracks = tracksForCratePlaylist(p)
+        if let first = tracks.first, let art = ArtworkCache.shared.artwork(for: first.fileName) {
+            return art
+        }
+        return nil
+    }
+
+    private var ambientColors: [Color] {
+        if let img = activePlaylistCenterImage {
+            return img.extractPlayerGradientColors()
+        }
+        if let cur = engine.currentTrack {
+            return ArtworkCache.shared.playerGradient(for: cur.fileName)
+        }
+        return [Color(red: 0.18, green: 0.10, blue: 0.28), Color(red: 0.06, green: 0.05, blue: 0.10), Color.black]
+    }
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack {
+                // Dynamic Vinyl Lounge Ambient Lighting
+                LinearGradient(
+                    colors: ambientColors,
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+                .ignoresSafeArea()
+                .animation(.easeInOut(duration: 0.7), value: selectedPlaylist?.id)
+
+                Color.black.opacity(0.38)
+                    .ignoresSafeArea()
+
+                VStack(spacing: 0) {
+                    // Top Bar
+                    HStack {
+                        Button {
+                            triggerHaptic(style: .medium)
+                            if selectedPlaylist != nil {
+                                withAnimation(.spring(response: 0.5, dampingFraction: 0.82)) {
+                                    platterMounted = false
+                                    selectedPlaylist = nil
+                                }
+                            } else {
+                                onQuit()
+                            }
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: selectedPlaylist != nil ? "chevron.left" : "xmark.circle.fill")
+                                    .font(.system(size: 14, weight: .bold))
+                                Text(selectedPlaylist != nil ? "Crate" : "Quit Vinyl")
+                                    .font(.system(size: 13, weight: .bold, design: .rounded))
+                            }
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 8)
+                            .background(Color.black.opacity(0.55))
+                            .foregroundColor(.white)
+                            .clipShape(Capsule())
+                            .overlay(Capsule().stroke(Color.white.opacity(0.18), lineWidth: 1))
+                        }
+
+                        Spacer()
+
+                        VStack(spacing: 1) {
+                            Text(selectedPlaylist == nil ? "VINYL CRATE" : "ANALOG TURNTABLE")
+                                .font(.system(size: 10, weight: .black, design: .monospaced))
+                                .tracking(1.6)
+                                .foregroundColor(.purple)
+                            Text("CROSSFADE OFF • 20M/SIDE")
+                                .font(.system(size: 8.5, weight: .bold, design: .monospaced))
+                                .foregroundColor(.white.opacity(0.55))
+                        }
+
+                        Spacer()
+
+                        if selectedPlaylist != nil {
+                            Button {
+                                triggerHaptic(style: .medium)
+                                onQuit()
+                            } label: {
+                                Text("Exit")
+                                    .font(.system(size: 12, weight: .bold, design: .rounded))
+                                    .padding(.horizontal, 12)
+                                    .padding(.vertical, 7)
+                                    .background(Color.white.opacity(0.12))
+                                    .foregroundColor(.white)
+                                    .clipShape(Capsule())
+                            }
+                        } else {
+                            Spacer().frame(width: 68)
+                        }
+                    }
+                    .padding(.horizontal, 20)
+                    .padding(.top, 8)
+                    .padding(.bottom, 10)
+
+                    if let playlist = selectedPlaylist {
+                        // STAGE 2: Interactive Multi-Disc Turntable Deck + Needle + Bottom Tracklist
+                        turntableDeckStage(playlist: playlist, screenSize: geo.size)
+                            .transition(.asymmetric(
+                                insertion: .move(edge: .bottom).combined(with: .opacity),
+                                removal: .scale(scale: 0.9).combined(with: .opacity)
+                            ))
+                    } else {
+                        // STAGE 1: 3D Swipeable Physical Vinyl Sleeves Carousel
+                        vinylCrateCarouselStage(screenSize: geo.size)
+                            .transition(.opacity.combined(with: .scale(scale: 0.95)))
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: - Stage 1: Swipeable Physical Vinyl Sleeves Carousel
+    @ViewBuilder
+    private func vinylCrateCarouselStage(screenSize: CGSize) -> some View {
+        let cardWidth = min(screenSize.width * 0.72, 270.0)
+
+        VStack(spacing: 18) {
+            Spacer(minLength: 8)
+
+            VStack(spacing: 6) {
+                Text("Select a Record to Spin")
+                    .font(.system(size: 26, weight: .heavy, design: .rounded))
+                    .foregroundColor(.white)
+                Text("Swipe through your playlists • Tap any record jacket to load its discs")
+                    .font(.caption)
+                    .foregroundColor(.white.opacity(0.65))
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 30)
+            }
+
+            TabView {
+                ForEach(cratePlaylists) { playlist in
+                    let pTracks = tracksForCratePlaylist(playlist)
+                    let discs = VinylPressingEngine.pressPlaylistIntoDiscs(tracks: pTracks)
+                    let totalMins = Int(pTracks.reduce(0) { $0 + $1.duration } / 60.0)
+
+                    GeometryReader { cardGeo in
+                        let midX = cardGeo.frame(in: .global).midX
+                        let screenMidX = screenSize.width / 2.0
+                        let distance = (midX - screenMidX) / screenSize.width
+                        let angle = Double(distance) * -24.0
+                        let scale = max(0.86, 1.0 - abs(distance) * 0.18)
+
+                        VStack(spacing: 22) {
+                            Spacer()
+
+                            // Physical Vinyl Jacket + Peeking Grooved Record
+                            Button {
+                                openPlaylistOnTurntable(playlist, precomputedDiscs: discs)
+                            } label: {
+                                ZStack {
+                                    // Peeking Vinyl Disc Sliding Out of the Right Side of the Jacket
+                                    ZStack {
+                                        Circle()
+                                            .fill(
+                                                RadialGradient(
+                                                    colors: [Color(white: 0.20), .black, Color(white: 0.14), .black],
+                                                    center: .center,
+                                                    startRadius: 8,
+                                                    endRadius: cardWidth * 0.46
+                                                )
+                                            )
+                                            .frame(width: cardWidth * 0.92, height: cardWidth * 0.92)
+                                            .shadow(color: .black.opacity(0.75), radius: 14, x: 8, y: 8)
+
+                                        Circle()
+                                            .stroke(Color.white.opacity(0.10), lineWidth: 1)
+                                            .frame(width: cardWidth * 0.76, height: cardWidth * 0.76)
+                                        Circle()
+                                            .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                                            .frame(width: cardWidth * 0.58, height: cardWidth * 0.58)
+
+                                        // Playlist Center Label on the Peeking Vinyl
+                                        PlaylistArtworkThumbnailView(
+                                            playlist: playlist,
+                                            tracks: pTracks,
+                                            size: cardWidth * 0.32,
+                                            cornerRadius: cardWidth * 0.16
+                                        )
+
+                                        Circle()
+                                            .fill(Color.black)
+                                            .frame(width: 10, height: 10)
+                                    }
+                                    .offset(x: cardWidth * 0.24)
+
+                                    // Physical Record Sleeve Jacket
+                                    ZStack(alignment: .bottomLeading) {
+                                        PlaylistArtworkThumbnailView(
+                                            playlist: playlist,
+                                            tracks: pTracks,
+                                            size: cardWidth,
+                                            cornerRadius: 14
+                                        )
+                                        .overlay(
+                                            RoundedRectangle(cornerRadius: 14)
+                                                .stroke(
+                                                    LinearGradient(
+                                                        colors: [.white.opacity(0.38), .clear, .black.opacity(0.5)],
+                                                        startPoint: .topLeading,
+                                                        endPoint: .bottomTrailing
+                                                    ),
+                                                    lineWidth: 1.5
+                                                )
+                                        )
+                                        .shadow(color: .black.opacity(0.65), radius: 18, x: -4, y: 12)
+
+                                        // Vinyl Pressing Spec Sticker Badge (1 LP / 2xLP / 3xLP)
+                                        HStack(spacing: 5) {
+                                            Image(systemName: "record.circle.fill")
+                                                .font(.caption2)
+                                            Text(discs.count == 1 ? "12\" LP • 33⅓ RPM" : "\(discs.count)xLP GATEFOLD SET")
+                                                .font(.system(size: 9.5, weight: .black, design: .monospaced))
+                                        }
+                                        .padding(.horizontal, 10)
+                                        .padding(.vertical, 5)
+                                        .background(Color.black.opacity(0.78))
+                                        .foregroundColor(.yellow)
+                                        .clipShape(Capsule())
+                                        .padding(12)
+                                    }
+                                    .offset(x: -cardWidth * 0.08)
+                                }
+                            }
+                            .buttonStyle(.plain)
+
+                            // Record Metadata & Press Details
+                            VStack(spacing: 6) {
+                                Text(playlist.name)
+                                    .font(.system(size: 24, weight: .heavy, design: .rounded))
+                                    .foregroundColor(.white)
+                                    .lineLimit(1)
+
+                                Text("\(pTracks.count) Tracks • \(totalMins) Mins • \(discs.count) Physical \(discs.count == 1 ? "Disc" : "Discs")")
+                                    .font(.subheadline.weight(.medium))
+                                    .foregroundColor(.white.opacity(0.72))
+
+                                Button {
+                                    openPlaylistOnTurntable(playlist, precomputedDiscs: discs)
+                                } label: {
+                                    HStack(spacing: 8) {
+                                        Image(systemName: "play.circle.fill")
+                                            .font(.title3)
+                                        Text("Open Vinyl & Drop Needle")
+                                            .font(.subheadline.weight(.bold))
+                                    }
+                                    .padding(.horizontal, 22)
+                                    .padding(.vertical, 11)
+                                    .background(Color.purple)
+                                    .foregroundColor(.white)
+                                    .clipShape(Capsule())
+                                    .shadow(color: .purple.opacity(0.5), radius: 10, x: 0, y: 5)
+                                }
+                                .padding(.top, 6)
+                            }
+
+                            Spacer()
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .scaleEffect(scale)
+                        .rotation3DEffect(.degrees(angle), axis: (x: 0, y: 1, z: 0), perspective: 0.45)
+                    }
+                }
+            }
+            .tabViewStyle(.page(indexDisplayMode: .always))
+            .frame(height: min(screenSize.height * 0.72, 520))
+
+            Spacer()
+        }
+    }
+
+    // MARK: - Stage 2: Interactive Turntable Deck, Glowing Groove Segments, Tonearm & Bottom Tracklist
+    @ViewBuilder
+    private func turntableDeckStage(playlist: Playlist, screenSize: CGSize) -> some View {
+        let platterDiameter = min(screenSize.width - 64, 286.0)
+        let currentSide = activeSide
+        let sideSegments = currentSide?.segments ?? []
+        let pTracks = tracksForCratePlaylist(playlist)
+
+        VStack(spacing: 10) {
+            // 1. Multi-Disc Selector (Disc 1, Disc 2, Disc 3...) + Side Flip Button (Side A <-> Side B)
+            VStack(spacing: 8) {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(Array(pressedDiscs.enumerated()), id: \.element.id) { dIdx, disc in
+                            let isSelectedDisc = (dIdx == activeDiscIndex)
+                            Button {
+                                selectDisc(index: dIdx)
+                            } label: {
+                                HStack(spacing: 6) {
+                                    Image(systemName: "record.circle")
+                                        .font(.caption.bold())
+                                    Text("Disc \(disc.discNumber)")
+                                        .font(.caption.weight(.bold))
+                                    Text(disc.sideB != nil ? "(Sides \(disc.sideA.sideLetter)/\(disc.sideB!.sideLetter))" : "(Side \(disc.sideA.sideLetter))")
+                                        .font(.caption2)
+                                        .opacity(0.8)
+                                }
+                                .padding(.horizontal, 13)
+                                .padding(.vertical, 7)
+                                .background(isSelectedDisc ? Color.purple : Color.white.opacity(0.12))
+                                .foregroundColor(.white)
+                                .clipShape(Capsule())
+                            }
+                        }
+
+                        // Flip Side Button (20 mins per side)
+                        if let disc = activeDisc, let sideB = disc.sideB {
+                            Button {
+                                flipVinylSide()
+                            } label: {
+                                HStack(spacing: 5) {
+                                    Image(systemName: "arrow.triangle.2.circlepath")
+                                        .font(.caption.bold())
+                                    Text(isShowingSideB ? "Side \(sideB.sideLetter) Active (Flip to \(disc.sideA.sideLetter))" : "Side \(disc.sideA.sideLetter) Active (Flip to \(sideB.sideLetter))")
+                                        .font(.caption.weight(.bold))
+                                }
+                                .padding(.horizontal, 13)
+                                .padding(.vertical, 7)
+                                .background(Color.orange.opacity(0.85))
+                                .foregroundColor(.black)
+                                .clipShape(Capsule())
+                            }
+                        }
+                    }
+                    .padding(.horizontal, 20)
+                }
+
+                // Floating Needle Hover / Active Track HUD Pill
+                ZStack {
+                    if let hovered = hoveredSegment {
+                        HStack(spacing: 8) {
+                            Circle()
+                                .fill(Color.yellow)
+                                .frame(width: 8, height: 8)
+                                .shadow(color: .yellow, radius: 4)
+                            Text("NEEDLE OVER GROOVE \(hovered.trackIndexOnSide + 1):")
+                                .font(.system(size: 10, weight: .black, design: .monospaced))
+                                .foregroundColor(.yellow)
+                            Text(hovered.track.title)
+                                .font(.system(size: 13, weight: .bold, design: .rounded))
+                                .foregroundColor(.white)
+                                .lineLimit(1)
+                            Text("(\(hovered.track.formattedDuration))")
+                                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                                .foregroundColor(.white.opacity(0.75))
+                        }
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 6)
+                        .background(Color.black.opacity(0.78))
+                        .clipShape(Capsule())
+                        .overlay(Capsule().stroke(Color.yellow.opacity(0.65), lineWidth: 1.2))
+                        .transition(.scale(scale: 0.9).combined(with: .opacity))
+                    } else if let playingTrack = engine.currentTrack,
+                              currentSide?.tracks.contains(where: { $0.fileName == playingTrack.fileName }) == true {
+                        HStack(spacing: 8) {
+                            Image(systemName: engine.isPlaying ? "waveform" : "pause.fill")
+                                .font(.caption2.bold())
+                                .foregroundColor(.purple)
+                            Text("SPINNING SIDE \(currentSide?.sideLetter ?? "A"):")
+                                .font(.system(size: 10, weight: .black, design: .monospaced))
+                                .foregroundColor(.purple)
+                            Text(playingTrack.title)
+                                .font(.system(size: 13, weight: .bold, design: .rounded))
+                                .foregroundColor(.white)
+                                .lineLimit(1)
+                            Text("• \(currentSide?.formattedDuration ?? "")")
+                                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                                .foregroundColor(.white.opacity(0.65))
+                        }
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 6)
+                        .background(Color.black.opacity(0.55))
+                        .clipShape(Capsule())
+                    } else {
+                        Text("Drag the needle over any groove ring to preview & drop onto a song • \(currentSide?.formattedDuration ?? "0:00 / 20:00")")
+                            .font(.system(size: 11, weight: .semibold, design: .rounded))
+                            .foregroundColor(.white.opacity(0.70))
+                            .lineLimit(1)
+                            .padding(.horizontal, 16)
+                    }
+                }
+                .frame(height: 30)
+            }
+
+            // 2. Physical Turntable Deck Plinth + Spinning Grooved Vinyl + Interactive Tonearm
+            ZStack {
+                // Brushed Dark Aluminum Turntable Plinth Base
+                RoundedRectangle(cornerRadius: 28)
+                    .fill(
+                        LinearGradient(
+                            colors: [
+                                Color(red: 0.14, green: 0.14, blue: 0.17),
+                                Color(red: 0.07, green: 0.07, blue: 0.09),
+                                Color(red: 0.11, green: 0.11, blue: 0.13)
+                            ],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+                    .frame(width: platterDiameter + 44, height: platterDiameter + 34)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 28)
+                            .stroke(Color.white.opacity(0.18), lineWidth: 1.5)
+                    )
+                    .shadow(color: .black.opacity(0.75), radius: 20, x: 0, y: 12)
+
+                // Turntable Corner Strobe Lamp & 33/45 RPM Indicator Details
+                VStack {
+                    HStack {
+                        // Glowing Orange Strobe Speed Prism
+                        HStack(spacing: 5) {
+                            Circle()
+                                .fill(engine.isPlaying && !isNeedleLifted ? Color.orange : Color.orange.opacity(0.35))
+                                .frame(width: 8, height: 8)
+                                .shadow(color: .orange, radius: engine.isPlaying ? 6 : 0)
+                            Text("33⅓ RPM QUARTZ")
+                                .font(.system(size: 8, weight: .black, design: .monospaced))
+                                .foregroundColor(.white.opacity(0.65))
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(Color.black.opacity(0.55))
+                        .clipShape(Capsule())
+
+                        Spacer()
+
+                        // Lift / Cue Needle Button
+                        Button {
+                            toggleNeedleLift()
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: isNeedleLifted ? "arrow.down.to.line" : "arrow.up.to.line")
+                                    .font(.system(size: 9, weight: .bold))
+                                Text(isNeedleLifted ? "DROP NEEDLE" : "LIFT NEEDLE")
+                                    .font(.system(size: 8.5, weight: .black, design: .monospaced))
+                            }
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 4)
+                            .background(isNeedleLifted ? Color.purple.opacity(0.85) : Color.white.opacity(0.18))
+                            .foregroundColor(.white)
+                            .clipShape(Capsule())
+                        }
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.top, 12)
+
+                    Spacer()
+
+                    HStack {
+                        Text("SIDE \(currentSide?.sideLetter ?? "A")")
+                            .font(.system(size: 9, weight: .black, design: .monospaced))
+                            .foregroundColor(.white.opacity(0.55))
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .background(Color.black.opacity(0.45))
+                            .clipShape(Capsule())
+                        Spacer()
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 10)
+                }
+                .frame(width: platterDiameter + 44, height: platterDiameter + 34)
+
+                // Recessed Metallic Platter Rim (With Strobe Dots)
+                Circle()
+                    .stroke(
+                        AngularGradient(
+                            colors: [.gray.opacity(0.4), .white.opacity(0.8), .gray.opacity(0.3), .white.opacity(0.7), .gray.opacity(0.4)],
+                            center: .center
+                        ),
+                        lineWidth: 5
+                    )
+                    .frame(width: platterDiameter + 6, height: platterDiameter + 6)
+
+                // Spinning Physical Vinyl Record with Interactive Glowing Song Segments
+                ContinuousSpinView(isSpinning: engine.isPlaying && !isNeedleLifted, rpm: 33.3) {
+                    ZStack {
+                        // Base Black Vinyl Disc
+                        Circle()
+                            .fill(
+                                RadialGradient(
+                                    colors: [
+                                        Color(white: 0.16),
+                                        Color(white: 0.05),
+                                        Color(white: 0.13),
+                                        Color(white: 0.04),
+                                        Color.black
+                                    ],
+                                    center: .center,
+                                    startRadius: 12,
+                                    endRadius: platterDiameter * 0.5
+                                )
+                            )
+                            .frame(width: platterDiameter, height: platterDiameter)
+
+                        // Iridescent Light Sheen Across the Vinyl Grooves
+                        Circle()
+                            .fill(
+                                AngularGradient(
+                                    gradient: Gradient(colors: [
+                                        .clear,
+                                        .white.opacity(0.11),
+                                        .clear,
+                                        .purple.opacity(0.09),
+                                        .clear,
+                                        .white.opacity(0.11),
+                                        .clear
+                                    ]),
+                                    center: .center
+                                )
+                            )
+                            .frame(width: platterDiameter, height: platterDiameter)
+
+                        // Concentric Song Groove Segments (Each Song is a Physical Ring that Glows when Hovered or Playing!)
+                        ForEach(sideSegments) { seg in
+                            let isHovered = (hoveredSegment?.id == seg.id)
+                            let isCurrentlyPlayingTrack = (engine.currentTrack?.fileName == seg.track.fileName && !isNeedleLifted)
+
+                            ZStack {
+                                // Base Groove Band Texture
+                                VinylBandRingShape(
+                                    outerFraction: seg.outerRadiusFraction,
+                                    innerFraction: seg.innerRadiusFraction
+                                )
+                                .foregroundColor(
+                                    isHovered
+                                        ? Color.yellow.opacity(0.42)
+                                        : (isCurrentlyPlayingTrack ? Color.purple.opacity(0.34) : Color.white.opacity(seg.trackIndexOnSide % 2 == 0 ? 0.06 : 0.03))
+                                )
+                                .frame(width: platterDiameter, height: platterDiameter)
+                                .shadow(
+                                    color: isHovered ? .yellow.opacity(0.9) : (isCurrentlyPlayingTrack ? .purple.opacity(0.75) : .clear),
+                                    radius: isHovered ? 10 : 6
+                                )
+
+                                // Outer Track Lead-In Groove Divider Line
+                                Circle()
+                                    .stroke(
+                                        isHovered ? Color.yellow : Color.white.opacity(0.16),
+                                        lineWidth: isHovered ? 1.8 : 0.7
+                                    )
+                                    .frame(
+                                        width: platterDiameter * seg.outerRadiusFraction,
+                                        height: platterDiameter * seg.outerRadiusFraction
+                                    )
+                            }
+                        }
+
+                        // Center Playlist Cover Art Label (As Requested: Uses Playlist Cover Image!)
+                        ZStack {
+                            PlaylistArtworkThumbnailView(
+                                playlist: playlist,
+                                tracks: pTracks,
+                                size: platterDiameter * 0.35,
+                                cornerRadius: platterDiameter * 0.175
+                            )
+                            .clipShape(Circle())
+                            .overlay(
+                                Circle()
+                                    .stroke(Color.white.opacity(0.28), lineWidth: 1.5)
+                            )
+
+                            // Side Letter Stamp on Label
+                            VStack {
+                                Spacer()
+                                Text("SIDE \(currentSide?.sideLetter ?? "A")")
+                                    .font(.system(size: 7.5, weight: .black, design: .monospaced))
+                                    .padding(.horizontal, 5)
+                                    .padding(.vertical, 1.5)
+                                    .background(Color.black.opacity(0.72))
+                                    .foregroundColor(.white)
+                                    .clipShape(Capsule())
+                                    .padding(.bottom, 6)
+                            }
+                            .frame(width: platterDiameter * 0.35, height: platterDiameter * 0.35)
+
+                            // Center Metal Spindle Hole
+                            Circle()
+                                .fill(Color(white: 0.85))
+                                .frame(width: 14, height: 14)
+                            Circle()
+                                .fill(Color.black)
+                                .frame(width: 8, height: 8)
+                        }
+                    }
+                }
+                .scaleEffect(platterMounted ? 1.0 : 0.72)
+                .opacity(platterMounted ? 1.0 : 0.0)
+                .rotation3DEffect(.degrees(flipRotationDegrees), axis: (x: 0, y: 1, z: 0), perspective: 0.45)
+                // Interactive Drag Gesture Across the Vinyl Grooves to Scrub the Needle & Preview Any Segment!
+                .gesture(
+                    DragGesture(minimumDistance: 0)
+                        .onChanged { value in
+                            let center = CGPoint(x: platterDiameter / 2.0, y: platterDiameter / 2.0)
+                            let dx = value.location.x - center.x
+                            let dy = value.location.y - center.y
+                            let dist = hypot(dx, dy)
+                            let maxR = platterDiameter / 2.0
+                            let normR = max(0.35, min(1.05, dist / maxR))
+
+                            withAnimation(.interactiveSpring(response: 0.22, dampingFraction: 0.82)) {
+                                isNeedleLifted = true
+                                needleRadiusFraction = normR
+                            }
+
+                            // Check which song segment ring the needle is hovering over
+                            if let matchedSeg = sideSegments.first(where: {
+                                normR <= $0.outerRadiusFraction + 0.015 && normR >= $0.innerRadiusFraction - 0.015
+                            }) {
+                                if hoveredSegment?.id != matchedSeg.id {
+                                    triggerHaptic(style: .light)
+                                    withAnimation(.easeOut(duration: 0.15)) {
+                                        hoveredSegment = matchedSeg
+                                    }
+                                }
+                            } else {
+                                hoveredSegment = nil
+                            }
+                        }
+                        .onEnded { _ in
+                            // Dropping the needle onto the hovered groove segment plays that song on the turntable!
+                            if let targetSeg = hoveredSegment {
+                                dropNeedleAndPlay(segment: targetSeg, in: currentSide)
+                            }
+                        }
+                )
+
+                // 3. Realistic Pivoting Tonearm & Glowing Stylus Cartridge Overlay
+                TonearmAssemblyOverlayView(
+                    platterDiameter: platterDiameter,
+                    needleRadiusFraction: needleRadiusFraction,
+                    isNeedleLifted: isNeedleLifted,
+                    isHoveringTrack: hoveredSegment != nil
+                )
+                .allowsHitTesting(false)
+            }
+            .rotation3DEffect(.degrees(motion.pitch * 0.65), axis: (x: 1, y: 0, z: 0), perspective: 0.4)
+            .rotation3DEffect(.degrees(motion.roll * 0.65), axis: (x: 0, y: 1, z: 0), perspective: 0.4)
+
+            // 4. Bottom Side Tracklist ("Song 1 is this, Song 2 is this, Song 3 is this...")
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("DISC \(activeDisc?.discNumber ?? 1) • SIDE \(currentSide?.sideLetter ?? "A") TRACKLIST")
+                        .font(.system(size: 11, weight: .black, design: .monospaced))
+                        .tracking(1.2)
+                        .foregroundColor(.white.opacity(0.75))
+                    Spacer()
+                    Text(currentSide?.formattedDuration ?? "0:00 / 20:00")
+                        .font(.system(size: 11, weight: .bold, design: .monospaced))
+                        .foregroundColor(.purple)
+                }
+                .padding(.horizontal, 22)
+
+                if sideSegments.isEmpty {
+                    Text("No songs on this side.")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .center)
+                        .padding(.vertical, 20)
+                } else {
+                    ScrollView(showsIndicators: false) {
+                        VStack(spacing: 8) {
+                            ForEach(sideSegments) { seg in
+                                let isHovered = (hoveredSegment?.id == seg.id)
+                                let isPlayingThis = (engine.currentTrack?.fileName == seg.track.fileName && !isNeedleLifted)
+
+                                Button {
+                                    dropNeedleAndPlay(segment: seg, in: currentSide)
+                                } label: {
+                                    HStack(spacing: 12) {
+                                        // Track Number Badge ("Song 1", "Song 2"...)
+                                        Text("SONG \(seg.trackIndexOnSide + 1)")
+                                            .font(.system(size: 10, weight: .black, design: .monospaced))
+                                            .padding(.horizontal, 8)
+                                            .padding(.vertical, 5)
+                                            .background(
+                                                isHovered
+                                                    ? Color.yellow
+                                                    : (isPlayingThis ? Color.purple : Color.white.opacity(0.12))
+                                            )
+                                            .foregroundColor(isHovered ? .black : .white)
+                                            .clipShape(Capsule())
+
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text(seg.track.title)
+                                                .font(.system(size: 15, weight: .bold, design: .rounded))
+                                                .foregroundColor(isHovered ? .yellow : (isPlayingThis ? .purple : .white))
+                                                .lineLimit(1)
+                                            Text(seg.track.artist)
+                                                .font(.caption)
+                                                .foregroundColor(.white.opacity(0.62))
+                                                .lineLimit(1)
+                                        }
+
+                                        Spacer()
+
+                                        if isPlayingThis && engine.isPlaying {
+                                            Image(systemName: "waveform")
+                                                .font(.caption.bold())
+                                                .foregroundColor(.purple)
+                                        }
+
+                                        Text(seg.track.formattedDuration)
+                                            .font(.caption.monospacedDigit().weight(.semibold))
+                                            .foregroundColor(.white.opacity(0.75))
+                                    }
+                                    .padding(.horizontal, 14)
+                                    .padding(.vertical, 10)
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 14)
+                                            .fill(
+                                                isHovered
+                                                    ? Color.yellow.opacity(0.16)
+                                                    : (isPlayingThis ? Color.purple.opacity(0.18) : Color.white.opacity(0.06))
+                                            )
+                                            .overlay(
+                                                RoundedRectangle(cornerRadius: 14)
+                                                    .stroke(
+                                                        isHovered ? Color.yellow.opacity(0.7) : (isPlayingThis ? Color.purple.opacity(0.6) : Color.clear),
+                                                        lineWidth: 1.2
+                                                    )
+                                            )
+                                    )
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                        .padding(.horizontal, 20)
+                        .padding(.bottom, 16)
+                    }
+                }
+            }
+        }
+        .onChange(of: engine.currentTrack?.fileName) { newFileName in
+            syncNeedleToCurrentlyPlayingTrack(fileName: newFileName)
+        }
+    }
+
+    // MARK: - Turntable Helper Actions
+    private func tracksForCratePlaylist(_ playlist: Playlist) -> [Track] {
+        if playlist.name == "All Songs LP" && !engine.playlists.contains(where: { $0.id == playlist.id }) {
+            return engine.allTracks
+        }
+        return engine.tracks(for: playlist)
+    }
+
+    private func openPlaylistOnTurntable(_ playlist: Playlist, precomputedDiscs: [VinylPhysicalDisc]) {
+        triggerHaptic(style: .heavy)
+        pressedDiscs = precomputedDiscs
+        activeDiscIndex = 0
+        isShowingSideB = false
+        hoveredSegment = nil
+        isNeedleLifted = true
+        needleRadiusFraction = 1.08
+        platterMounted = false
+
+        withAnimation(.spring(response: 0.52, dampingFraction: 0.80)) {
+            selectedPlaylist = playlist
+        }
+        withAnimation(.spring(response: 0.58, dampingFraction: 0.76).delay(0.08)) {
+            platterMounted = true
+        }
+    }
+
+    private func selectDisc(index: Int) {
+        guard index != activeDiscIndex else { return }
+        triggerHaptic(style: .medium)
+        withAnimation(.spring(response: 0.35, dampingFraction: 0.82)) {
+            isNeedleLifted = true
+            needleRadiusFraction = 1.08
+            hoveredSegment = nil
+            platterMounted = false
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
+            activeDiscIndex = index
+            isShowingSideB = false
+            withAnimation(.spring(response: 0.48, dampingFraction: 0.78)) {
+                platterMounted = true
+            }
+        }
+    }
+
+    private func flipVinylSide() {
+        triggerHaptic(style: .medium)
+        withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) {
+            isNeedleLifted = true
+            needleRadiusFraction = 1.08
+            hoveredSegment = nil
+        }
+        withAnimation(.easeInOut(duration: 0.26)) {
+            flipRotationDegrees = 90
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.26) {
+            isShowingSideB.toggle()
+            flipRotationDegrees = -90
+            withAnimation(.spring(response: 0.42, dampingFraction: 0.78)) {
+                flipRotationDegrees = 0
+            }
+        }
+    }
+
+    private func toggleNeedleLift() {
+        triggerHaptic(style: .medium)
+        if isNeedleLifted {
+            // Drop needle onto the first segment or currently selected track
+            if let side = activeSide, let firstSeg = side.segments.first {
+                let targetSeg = side.segments.first(where: { $0.track.fileName == engine.currentTrack?.fileName }) ?? firstSeg
+                dropNeedleAndPlay(segment: targetSeg, in: side)
+            }
+        } else {
+            withAnimation(.spring(response: 0.38, dampingFraction: 0.82)) {
+                isNeedleLifted = true
+                needleRadiusFraction = 1.08
+                hoveredSegment = nil
+            }
+            if engine.isPlaying {
+                engine.togglePlayPause()
+            }
+        }
+    }
+
+    private func dropNeedleAndPlay(segment: VinylGrooveSegment, in side: VinylSide?) {
+        guard let side = side else { return }
+        triggerHaptic(style: .heavy)
+        AudioServicesPlaySystemSound(1104)
+
+        withAnimation(.spring(response: 0.46, dampingFraction: 0.78)) {
+            needleRadiusFraction = segment.midRadiusFraction
+            isNeedleLifted = false
+            hoveredSegment = nil
+        }
+
+        // Play the selected song within this side's track queue (with Crossfade automatically disabled by isVinylModeActive)
+        engine.playTrack(segment.track, in: side.tracks)
+    }
+
+    private func syncNeedleToCurrentlyPlayingTrack(fileName: String?) {
+        guard let fileName = fileName, !isNeedleLifted else { return }
+        if let side = activeSide,
+           let matchedSeg = side.segments.first(where: { $0.track.fileName == fileName }) {
+            withAnimation(.spring(response: 0.45, dampingFraction: 0.82)) {
+                needleRadiusFraction = matchedSeg.midRadiusFraction
+            }
+        }
+    }
+
+    private func triggerHaptic(style: UIImpactFeedbackGenerator.FeedbackStyle) {
+        let gen = UIImpactFeedbackGenerator(style: style)
+        gen.impactOccurred()
+    }
+}
+
+// MARK: - Pivoting Turntable Tonearm & Glowing Stylus Cartridge View
+struct TonearmAssemblyOverlayView: View {
+    let platterDiameter: CGFloat
+    let needleRadiusFraction: CGFloat // 1.08 = parked on rest, 0.92 = outer rim, 0.40 = inner label
+    let isNeedleLifted: Bool
+    let isHoveringTrack: Bool
+
+    // Maps radius fraction (1.08 -> 0.38) to tonearm pivot rotation angle (0° parked -> 38° inner groove)
+    private var armRotationDegrees: Double {
+        let clamped = Double(max(0.35, min(1.10, needleRadiusFraction)))
+        let progress = (1.08 - clamped) / (1.08 - 0.38)
+        return progress * 36.0
+    }
+
+    var body: some View {
+        let armLength = platterDiameter * 0.76
+        ZStack(alignment: .topTrailing) {
+            Color.clear
+                .frame(width: platterDiameter + 44, height: platterDiameter + 34)
+
+            // Tonearm Gimbal Pivot Base in Top-Right Corner of the Plinth
+            ZStack {
+                Circle()
+                    .fill(
+                        RadialGradient(
+                            colors: [Color(white: 0.45), Color(white: 0.18), Color.black],
+                            center: .center,
+                            startRadius: 2,
+                            endRadius: 24
+                        )
+                    )
+                    .frame(width: 46, height: 46)
+                    .overlay(Circle().stroke(Color.white.opacity(0.28), lineWidth: 1))
+                    .shadow(color: .black.opacity(0.6), radius: 6, x: 0, y: 4)
+
+                // Counterweight + Metallic Tonearm Tube + Glowing Stylus Headshell
+                VStack(spacing: 0) {
+                    // Rear Counterweight Cylinder
+                    RoundedRectangle(cornerRadius: 4)
+                        .fill(
+                            LinearGradient(
+                                colors: [Color(white: 0.35), Color(white: 0.75), Color(white: 0.30)],
+                                startPoint: .leading,
+                                endPoint: .trailing
+                            )
+                        )
+                        .frame(width: 18, height: 20)
+
+                    // Pivot Hub Cap
+                    Circle()
+                        .fill(Color(white: 0.85))
+                        .frame(width: 18, height: 18)
+
+                    // Brushed Chrome Tonearm Tube
+                    Rectangle()
+                        .fill(
+                            LinearGradient(
+                                colors: [Color(white: 0.55), Color.white, Color(white: 0.45)],
+                                startPoint: .leading,
+                                endPoint: .trailing
+                            )
+                        )
+                        .frame(width: 5.5, height: armLength * 0.78)
+                        .shadow(color: .black.opacity(0.65), radius: isNeedleLifted ? 8 : 3, x: isNeedleLifted ? -6 : -2, y: isNeedleLifted ? 8 : 3)
+
+                    // Angled Phono Cartridge Headshell & Glowing Diamond Stylus Tip
+                    ZStack(alignment: .bottom) {
+                        RoundedRectangle(cornerRadius: 4)
+                            .fill(Color(white: 0.14))
+                            .frame(width: 16, height: 28)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 4)
+                                    .stroke(isHoveringTrack ? Color.yellow : Color.white.opacity(0.45), lineWidth: 1.2)
+                            )
+
+                        // Glowing Stylus Needle Tip
+                        Circle()
+                            .fill(isHoveringTrack ? Color.yellow : (isNeedleLifted ? Color.white.opacity(0.6) : Color.purple))
+                            .frame(width: 7, height: 7)
+                            .shadow(
+                                color: isHoveringTrack ? .yellow : (isNeedleLifted ? .clear : .purple),
+                                radius: isHoveringTrack ? 8 : 5
+                            )
+                            .offset(y: 3)
+                    }
+                    .rotationEffect(.degrees(22))
+                }
+                .offset(y: (armLength * 0.40) - 14)
+                .rotationEffect(.degrees(armRotationDegrees), anchor: .center)
+                .scaleEffect(isNeedleLifted ? 1.03 : 1.0)
+            }
+            .padding(.top, 22)
+            .padding(.trailing, 14)
+        }
     }
 }
 
@@ -3211,7 +4374,7 @@ struct PlaylistArtworkThumbnailView: View {
     }
 }
 
-// MARK: - Root Tab View (Tab 3 is "Settings")
+// MARK: - Root Tab View (Supports Full-Screen iPod Mode & Full-Screen Vinyl Turntable Mode)
 struct MusiQRootView: View {
     @StateObject private var engine = MusiQEngine()
     @State private var selectedTab: Int = 0
@@ -3261,6 +4424,11 @@ struct MusiQRootView: View {
         .fullScreenCover(isPresented: $engine.isIPodModeActive) {
             FullScreenIPodClassicModeView(engine: engine, progress: engine.progress) {
                 engine.isIPodModeActive = false
+            }
+        }
+        .fullScreenCover(isPresented: $engine.isVinylModeActive) {
+            FullScreenVinylTurntableModeView(engine: engine, progress: engine.progress) {
+                engine.isVinylModeActive = false
             }
         }
     }
@@ -4282,8 +5450,6 @@ struct FullPlayerDeckView: View {
             .gesture(
                 DragGesture(minimumDistance: 20)
                     .onChanged { value in
-                        // Never trigger swipe-to-dismiss while scrubbing the song slider,
-                        // and only allow swipe-back when starting near the left edge of the screen!
                         guard !engine.progress.isScrubbing,
                               value.startLocation.x < 45,
                               value.translation.width > abs(value.translation.height),
@@ -4900,7 +6066,7 @@ struct QueueSheetView: View {
     }
 }
 
-// MARK: - Tab 3: Settings Tab (Optional Crossfader + iPod Mode + Wi-Fi Browser Drop + Audio URL Importer)
+// MARK: - Tab 3: Settings Tab (Optional Crossfader + iPod Mode + Vinyl Turntable Mode + Wi-Fi Drop + URL Importer)
 struct MusiQSettingsAndToolsView: View {
     @ObservedObject var engine: MusiQEngine
     @StateObject private var wifiServer = WiFiUploadServer()
@@ -4938,20 +6104,30 @@ struct MusiQSettingsAndToolsView: View {
                         .padding(.vertical, 4)
                     }
 
-                    Text("When enabled, MusiQ smoothly fades out the ending song while fading in the next song across dual audio decks.")
+                    Text("When enabled, MusiQ smoothly fades out the ending song while fading in the next song across dual audio decks (automatically disabled while in Vinyl Mode).")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
 
-                // 2. Full-Screen Standalone iPod Classic Mode Switch
-                Section("Classic Hardware Mode") {
+                // 2. Classic Hardware Modes (iPod Classic Mode + Physical Vinyl Turntable Mode!)
+                Section("Classic Hardware Modes") {
                     Toggle(isOn: $engine.isIPodModeActive) {
                         Label("iPod Mode", systemImage: "ipod")
                             .font(.headline)
                     }
                     .tint(.purple)
 
-                    Text("Transforms MusiQ into a full-screen 5th Gen iPod Classic with a tactile Click Wheel. Tap 'Quit iPod' in the top-left corner to return.")
+                    Text("Transforms MusiQ into a full-screen 5th Gen iPod Classic with a tactile Click Wheel.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+
+                    Toggle(isOn: $engine.isVinylModeActive) {
+                        Label("Vinyl Mode", systemImage: "record.circle.fill")
+                            .font(.headline)
+                    }
+                    .tint(.purple)
+
+                    Text("Browse your playlists as physical 12\" vinyl records pressed into 20-minute sides (40 mins per disc). Drag the needle across glowing song grooves to drop & spin with crossfade disabled.")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
