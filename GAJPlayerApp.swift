@@ -78,6 +78,17 @@ struct Track: Identifiable, Hashable, Codable {
     }
 }
 
+struct PendingImportCandidate: Identifiable {
+    let id = UUID()
+    let tempFileURL: URL
+    let proposedFileName: String
+    let proposedTitle: String
+    let proposedArtist: String
+    let duration: TimeInterval
+    let matchedExistingTrack: Track
+    let matchReason: String
+}
+
 struct CustomTrackMetadata: Codable {
     var title: String?
     var artist: String?
@@ -97,150 +108,6 @@ struct LyricLine: Identifiable, Equatable {
     let endTime: TimeInterval?
     let text: String
     let words: [String]
-}
-
-// MARK: - Physical Vinyl Disc & 20-Minute Side Allocation Models
-struct VinylGrooveSegment: Identifiable, Equatable {
-    let id: UUID = UUID()
-    let trackIndexOnSide: Int
-    let track: Track
-    let outerRadiusFraction: CGFloat // 0.94 (outer rim) down to 0.38 (inner label)
-    let innerRadiusFraction: CGFloat
-
-    var midRadiusFraction: CGFloat {
-        (outerRadiusFraction + innerRadiusFraction) / 2.0
-    }
-}
-
-struct VinylSide: Identifiable, Equatable {
-    let id: UUID = UUID()
-    let sideLetter: String // "A", "B", "C", "D", etc.
-    let tracks: [Track]
-    let totalDuration: TimeInterval
-    let segments: [VinylGrooveSegment]
-
-    var formattedDuration: String {
-        let mins = Int(totalDuration) / 60
-        let secs = Int(totalDuration) % 60
-        return String(format: "%d:%02d / 20:00", mins, secs)
-    }
-}
-
-struct VinylPhysicalDisc: Identifiable, Equatable {
-    let id: UUID = UUID()
-    let discNumber: Int // 1, 2, 3, 4...
-    let sideA: VinylSide
-    let sideB: VinylSide?
-}
-
-enum VinylPressingEngine {
-    static let maxSideSeconds: TimeInterval = 20.0 * 60.0 // 20 minutes per side (40 mins per disc)
-
-    static func pressPlaylistIntoDiscs(tracks: [Track]) -> [VinylPhysicalDisc] {
-        guard !tracks.isEmpty else {
-            let emptySide = VinylSide(sideLetter: "A", tracks: [], totalDuration: 0, segments: [])
-            return [VinylPhysicalDisc(discNumber: 1, sideA: emptySide, sideB: nil)]
-        }
-
-        var rawSides: [[Track]] = []
-        var currentBucket: [Track] = []
-        var currentBucketSeconds: TimeInterval = 0
-
-        for track in tracks {
-            let effectiveDur = max(30, min(track.duration > 0 ? track.duration : 180, maxSideSeconds))
-            // If adding this song exceeds 20 minutes on the current side (and current side isn't empty), move to next side!
-            if !currentBucket.isEmpty && (currentBucketSeconds + effectiveDur > maxSideSeconds) {
-                rawSides.append(currentBucket)
-                currentBucket = [track]
-                currentBucketSeconds = effectiveDur
-            } else {
-                currentBucket.append(track)
-                currentBucketSeconds += effectiveDur
-            }
-        }
-        if !currentBucket.isEmpty {
-            rawSides.append(currentBucket)
-        }
-
-        // Convert each bucket into a VinylSide with proportional concentric groove rings
-        let letters = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P"]
-        var builtSides: [VinylSide] = []
-
-        for (sIdx, sideTracks) in rawSides.enumerated() {
-            let letter = sIdx < letters.count ? letters[sIdx] : "S\(sIdx + 1)"
-            let totalDur = sideTracks.reduce(0.0) { $0 + max(30, $1.duration > 0 ? $1.duration : 180) }
-
-            let maxOuter: CGFloat = 0.93
-            let minInner: CGFloat = 0.39
-            let usableSpan = maxOuter - minInner
-            let gapPerTrack: CGFloat = sideTracks.count > 1 ? 0.008 : 0.0
-            let netSpan = max(0.15, usableSpan - gapPerTrack * CGFloat(max(0, sideTracks.count - 1)))
-
-            var cursor = maxOuter
-            var segments: [VinylGrooveSegment] = []
-
-            for (tIdx, t) in sideTracks.enumerated() {
-                let dur = max(30, t.duration > 0 ? t.duration : 180)
-                let weight = CGFloat(dur / max(totalDur, 1))
-                let bandWidth = max(0.035, netSpan * weight)
-                let outerR = cursor
-                let innerR = max(minInner, outerR - bandWidth)
-
-                segments.append(
-                    VinylGrooveSegment(
-                        trackIndexOnSide: tIdx,
-                        track: t,
-                        outerRadiusFraction: outerR,
-                        innerRadiusFraction: innerR
-                    )
-                )
-                cursor = max(minInner, innerR - gapPerTrack)
-            }
-
-            let actualTotal = sideTracks.reduce(0.0) { $0 + $1.duration }
-            builtSides.append(
-                VinylSide(
-                    sideLetter: letter,
-                    tracks: sideTracks,
-                    totalDuration: actualTotal,
-                    segments: segments
-                )
-            )
-        }
-
-        // Pair sides into Physical Discs (2 sides = 40 minutes per disc)
-        var discs: [VinylPhysicalDisc] = []
-        var i = 0
-        var discNum = 1
-        while i < builtSides.count {
-            let firstSide = builtSides[i]
-            let secondSide: VinylSide? = (i + 1 < builtSides.count) ? builtSides[i + 1] : nil
-            discs.append(VinylPhysicalDisc(discNumber: discNum, sideA: firstSide, sideB: secondSide))
-            i += 2
-            discNum += 1
-        }
-
-        return discs
-    }
-}
-
-// Concentric Annular Ring Shape for Each Song Groove Segment on the Vinyl
-struct VinylBandRingShape: Shape {
-    let outerFraction: CGFloat
-    let innerFraction: CGFloat
-
-    func path(in rect: CGRect) -> Path {
-        let center = CGPoint(x: rect.midX, y: rect.midY)
-        let fullRadius = min(rect.width, rect.height) / 2.0
-        let rOuter = fullRadius * outerFraction
-        let rInner = fullRadius * innerFraction
-        let midR = (rOuter + rInner) / 2.0
-        let thickness = max(1, rOuter - rInner)
-
-        var path = Path()
-        path.addArc(center: center, radius: midR, startAngle: .degrees(0), endAngle: .degrees(360), clockwise: false)
-        return path.strokedPath(StrokeStyle(lineWidth: thickness))
-    }
 }
 
 enum VisualMode: String, CaseIterable {
@@ -272,7 +139,7 @@ final class WiFiUploadServer: ObservableObject {
     @Published var lastUploadedFile: String = ""
 
     private var listener: NWListener?
-    var onFileUploaded: (() -> Void)?
+    var onFileUploaded: ((URL, String) -> Void)?
 
     func toggleServer() {
         if isRunning {
@@ -350,7 +217,7 @@ final class WiFiUploadServer: ObservableObject {
                             let bodyData = accumulated.subdata(in: headerEndRange.upperBound..<accumulated.count)
                             let rawFileName = Self.extractHeaderValue(from: headerStr, key: "X-File-Name") ?? "Track_\(Int(Date().timeIntervalSince1970)).mp3"
                             let decodedName = rawFileName.removingPercentEncoding ?? rawFileName
-                            self.saveUploadedAudioData(bodyData, fileName: decodedName)
+                            self.stageUploadedAudioData(bodyData, fileName: decodedName)
                             self.sendJSONSuccess(over: connection)
                             return
                         }
@@ -368,20 +235,19 @@ final class WiFiUploadServer: ObservableObject {
         receiveNextChunk()
     }
 
-    private func saveUploadedAudioData(_ data: Data, fileName: String) {
+    private func stageUploadedAudioData(_ data: Data, fileName: String) {
         guard data.count > 4096 else { return }
         let safeName = fileName
             .replacingOccurrences(of: "/", with: "-")
             .replacingOccurrences(of: ":", with: "-")
-        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        let dest = docs.appendingPathComponent(safeName)
-        try? FileManager.default.removeItem(at: dest)
-        try? data.write(to: dest)
+        let tempDir = FileManager.default.temporaryDirectory
+        let tempURL = tempDir.appendingPathComponent("wifi_\(UUID().uuidString)_\(safeName)")
+        try? data.write(to: tempURL)
 
         DispatchQueue.main.async {
             self.uploadedCount += 1
             self.lastUploadedFile = safeName
-            self.onFileUploaded?()
+            self.onFileUploaded?(tempURL, safeName)
         }
     }
 
@@ -993,7 +859,7 @@ final class LyricsManager {
         do {
             var req = URLRequest(url: url)
             req.timeoutInterval = 10
-            req.setValue("MusiQ iOS Player v4.0", forHTTPHeaderField: "User-Agent")
+            req.setValue("MusiQ iOS Player v4.5", forHTTPHeaderField: "User-Agent")
             let (data, _) = try await URLSession.shared.data(for: req)
             guard let results = try JSONSerialization.jsonObject(with: data) as? [[String: Any]],
                   !results.isEmpty else {
@@ -1071,18 +937,18 @@ final class LyricsManager {
         return nil
     }
 
-    private static func normalizeAlphanumeric(_ s: String) -> String {
+    static func normalizeAlphanumeric(_ s: String) -> String {
         s.lowercased().filter { $0.isLetter || $0.isNumber }
     }
 
-    private static func sanitizeTitle(_ raw: String) -> String {
+    static func sanitizeTitle(_ raw: String) -> String {
         var s = raw
         s = s.replacingOccurrences(of: #"^\d{1,2}[\.\-\s]+"#, with: "", options: .regularExpression)
         s = s.replacingOccurrences(of: #"\s*[\(\[][^\)\]]*(feat|ft\.|official|video|audio|lyrics|explicit|clean|remaster|version|hq|hd|yedit|edit|v\d+)[^\)\]]*[\)\]]"#, with: "", options: [.regularExpression, .caseInsensitive])
         return s.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private static func extractPrimaryArtist(_ raw: String) -> String {
+    static func extractPrimaryArtist(_ raw: String) -> String {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty || trimmed == "Unknown Artist" || trimmed == "Audio Import" {
             return ""
@@ -1111,7 +977,7 @@ final class PlaybackProgressObserver: ObservableObject {
     var isScrubbing: Bool = false
 }
 
-// MARK: - Dual-Deck Crash-Proof Audio Engine (With Optional Smooth Crossfader & Vinyl Mode Lockout)
+// MARK: - Dual-Deck Crash-Proof Audio Engine (With Duplicate Recognition, Enhanced Queue & Toast Notifications)
 final class MusiQEngine: ObservableObject {
     @Published var allTracks: [Track] = []
     @Published var playlists: [Playlist] = []
@@ -1123,19 +989,16 @@ final class MusiQEngine: ObservableObject {
 
     @Published var visualMode: VisualMode = .sideVinyl
     @Published var isIPodModeActive: Bool = false
-    @Published var isVinylModeActive: Bool = false {
-        didSet {
-            // Strictly disable and cancel any crossfading when entering Vinyl Mode!
-            if isVinylModeActive && isCrossfading {
-                cancelActiveCrossfade()
-            }
-        }
-    }
     @Published var pitchCents: Float = 0
     @Published var playbackRate: Float = 1.0
     @Published var eqPreset: EQPreset = .flat
     @Published var artworkRefreshID: UUID = UUID()
     @Published var playbackErrorMessage: String? = nil
+
+    // Toast Banner & Duplicate Song Disclaimer State
+    @Published var toastBannerText: String? = nil
+    @Published var pendingDuplicateQueue: [PendingImportCandidate] = []
+    @Published var activeDuplicateAlert: PendingImportCandidate? = nil
 
     @Published var crossfadeEnabled: Bool = UserDefaults.standard.bool(forKey: "MusiQ_Crossfade_Enabled_v1") {
         didSet {
@@ -1215,6 +1078,251 @@ final class MusiQEngine: ObservableObject {
         loadListeningStats()
         scanLocalLibrary()
         setupRemoteTransportControls()
+    }
+
+    func showToast(_ message: String) {
+        let gen = UIImpactFeedbackGenerator(style: .medium)
+        gen.impactOccurred()
+        withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+            toastBannerText = message
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.4) { [weak self] in
+            guard let self = self else { return }
+            if self.toastBannerText == message {
+                withAnimation(.easeOut(duration: 0.25)) {
+                    self.toastBannerText = nil
+                }
+            }
+        }
+    }
+
+    // MARK: - Duplicate Song Recognition & Ingestion Pipeline
+    func ingestStagedAudioFile(
+        tempURL: URL,
+        proposedFileName: String,
+        customTitle: String? = nil,
+        customArtist: String? = nil
+    ) {
+        let asset = AVURLAsset(url: tempURL)
+        var detectedTitle = (proposedFileName as NSString).deletingPathExtension
+        var detectedArtist = "Unknown Artist"
+
+        for format in asset.availableMetadataFormats {
+            for item in asset.metadata(forFormat: format) {
+                if item.commonKey == .commonKeyTitle, let val = item.value as? String, !val.isEmpty {
+                    detectedTitle = val
+                } else if item.commonKey == .commonKeyArtist, let val = item.value as? String, !val.isEmpty {
+                    detectedArtist = val
+                }
+            }
+        }
+
+        if let cTitle = customTitle?.trimmingCharacters(in: .whitespacesAndNewlines), !cTitle.isEmpty {
+            detectedTitle = cTitle
+        }
+        if let cArtist = customArtist?.trimmingCharacters(in: .whitespacesAndNewlines), !cArtist.isEmpty {
+            detectedArtist = cArtist
+        }
+
+        let durSeconds = CMTimeGetSeconds(asset.duration)
+        let safeDur = durSeconds.isFinite && durSeconds > 0 ? durSeconds : 0
+
+        if let duplicateMatch = findExistingDuplicate(
+            proposedFileName: proposedFileName,
+            title: detectedTitle,
+            artist: detectedArtist,
+            duration: safeDur
+        ) {
+            let candidate = PendingImportCandidate(
+                tempFileURL: tempURL,
+                proposedFileName: proposedFileName,
+                proposedTitle: detectedTitle,
+                proposedArtist: detectedArtist,
+                duration: safeDur,
+                matchedExistingTrack: duplicateMatch.track,
+                matchReason: duplicateMatch.reason
+            )
+            DispatchQueue.main.async {
+                let notify = UINotificationFeedbackGenerator()
+                notify.notificationOccurred(.warning)
+                if self.activeDuplicateAlert == nil {
+                    self.activeDuplicateAlert = candidate
+                } else {
+                    self.pendingDuplicateQueue.append(candidate)
+                }
+            }
+        } else {
+            finalizeImport(
+                tempURL: tempURL,
+                targetFileName: proposedFileName,
+                title: detectedTitle,
+                artist: detectedArtist,
+                duration: safeDur
+            )
+        }
+    }
+
+    private func findExistingDuplicate(
+        proposedFileName: String,
+        title: String,
+        artist: String,
+        duration: TimeInterval
+    ) -> (track: Track, reason: String)? {
+        let normProposedTitle = LyricsManager.normalizeAlphanumeric(LyricsManager.sanitizeTitle(title))
+        let normProposedArtist = LyricsManager.normalizeAlphanumeric(LyricsManager.extractPrimaryArtist(artist))
+        let incomingLyrics = LyricsManager.normalizeAlphanumeric(AVURLAsset(url: URL(fileURLWithPath: proposedFileName)).lyrics ?? "")
+
+        for existing in allTracks {
+            if existing.fileName.lowercased() == proposedFileName.lowercased() {
+                return (existing, "Identical file name ('\(existing.fileName)')")
+            }
+
+            let normExistingTitle = LyricsManager.normalizeAlphanumeric(LyricsManager.sanitizeTitle(existing.title))
+            let normExistingArtist = LyricsManager.normalizeAlphanumeric(LyricsManager.extractPrimaryArtist(existing.artist))
+
+            if !normProposedTitle.isEmpty && normProposedTitle == normExistingTitle {
+                let durDiff = abs(existing.duration - duration)
+                if normProposedArtist == normExistingArtist || durDiff < 4.0 {
+                    return (existing, "Same song title ('\(existing.title)') & artist/duration match")
+                }
+                return (existing, "Same song title ('\(existing.title)') already in library")
+            }
+
+            // Also check saved lyrics similarity if both have lyrics
+            let savedLyrics = LyricsManager.normalizeAlphanumeric(LyricsManager.shared.getLyrics(for: existing))
+            if incomingLyrics.count > 60 && savedLyrics.count > 60 && incomingLyrics.prefix(120) == savedLyrics.prefix(120) {
+                return (existing, "Identical lyrics match with '\(existing.title)'")
+            }
+        }
+        return nil
+    }
+
+    func resolveDuplicateCandidate(_ candidate: PendingImportCandidate, decision: DuplicateResolutionDecision) {
+        switch decision {
+        case .skip:
+            try? FileManager.default.removeItem(at: candidate.tempFileURL)
+            showToast("Skipped duplicate '\(candidate.proposedTitle)'")
+
+        case .replaceExisting:
+            let existingFile = candidate.matchedExistingTrack.fileName
+            finalizeImport(
+                tempURL: candidate.tempFileURL,
+                targetFileName: existingFile,
+                title: candidate.proposedTitle,
+                artist: candidate.proposedArtist,
+                duration: candidate.duration
+            )
+            showToast("Replaced '\(candidate.proposedTitle)'")
+
+        case .keepBoth:
+            let ext = (candidate.proposedFileName as NSString).pathExtension
+            let base = (candidate.proposedFileName as NSString).deletingPathExtension
+            let uniqueName = "\(base)_Copy_\(Int(Date().timeIntervalSince1970) % 1000).\(ext.isEmpty ? "mp3" : ext)"
+            finalizeImport(
+                tempURL: candidate.tempFileURL,
+                targetFileName: uniqueName,
+                title: candidate.proposedTitle + " (Copy)",
+                artist: candidate.proposedArtist,
+                duration: candidate.duration
+            )
+            showToast("Kept both copies of '\(candidate.proposedTitle)'")
+        }
+
+        if !pendingDuplicateQueue.isEmpty {
+            let next = pendingDuplicateQueue.removeFirst()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                self.activeDuplicateAlert = next
+            }
+        } else {
+            activeDuplicateAlert = nil
+        }
+    }
+
+    enum DuplicateResolutionDecision {
+        case skip
+        case replaceExisting
+        case keepBoth
+    }
+
+    private func finalizeImport(
+        tempURL: URL,
+        targetFileName: String,
+        title: String,
+        artist: String,
+        duration: TimeInterval
+    ) {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let dest = docs.appendingPathComponent(targetFileName)
+        try? FileManager.default.removeItem(at: dest)
+        try? FileManager.default.moveItem(at: tempURL, to: dest)
+
+        if artist != "Unknown Artist" {
+            ArtworkCache.shared.saveCustomMetadata(title: title, artist: artist, for: targetFileName)
+        }
+
+        Task {
+            if let res = await LyricsManager.shared.fetchVersionMatchedLyrics(
+                title: title,
+                artist: artist,
+                targetDuration: duration
+            ) {
+                let t = Track(id: UUID(), title: title, artist: artist, fileName: targetFileName, duration: duration)
+                LyricsManager.shared.saveLyrics(res.lyrics, matchedDuration: res.matchedDuration, for: t)
+            }
+            await MainActor.run {
+                self.scanLocalLibrary()
+            }
+        }
+    }
+
+    // MARK: - Enhanced Queue Manipulation (Play Next, Add to End, Reorder, Clear)
+    func playNextInQueue(_ track: Track) {
+        if currentQueue.isEmpty {
+            playTrack(track, in: [track])
+            showToast("Playing '\(track.title)'")
+            return
+        }
+        let insertIndex = min(currentIndex + 1, currentQueue.count)
+        withAnimation(.spring(response: 0.36, dampingFraction: 0.82)) {
+            currentQueue.insert(track, at: insertIndex)
+        }
+        showToast("Playing Next: '\(track.title)'")
+    }
+
+    func appendToQueue(_ track: Track) {
+        if currentQueue.isEmpty {
+            playTrack(track, in: [track])
+            showToast("Playing '\(track.title)'")
+            return
+        }
+        withAnimation(.spring(response: 0.36, dampingFraction: 0.82)) {
+            currentQueue.append(track)
+        }
+        showToast("Added '\(track.title)' to Queue")
+    }
+
+    func moveUpcomingQueueItems(from source: IndexSet, to destination: Int) {
+        let upcomingOffset = currentIndex + 1
+        guard upcomingOffset < currentQueue.count else { return }
+        let adjustedSource = IndexSet(source.map { $0 + upcomingOffset })
+        let adjustedDest = destination + upcomingOffset
+        currentQueue.move(fromOffsets: adjustedSource, toOffset: adjustedDest)
+    }
+
+    func removeQueueItem(at absoluteIndex: Int) {
+        guard currentQueue.indices.contains(absoluteIndex), absoluteIndex != currentIndex else { return }
+        currentQueue.remove(at: absoluteIndex)
+        if absoluteIndex < currentIndex {
+            currentIndex = max(0, currentIndex - 1)
+        }
+    }
+
+    func clearUpcomingQueue() {
+        guard currentIndex + 1 < currentQueue.count else { return }
+        withAnimation(.spring(response: 0.35, dampingFraction: 0.82)) {
+            currentQueue.removeSubrange((currentIndex + 1)..<currentQueue.count)
+        }
+        showToast("Cleared Upcoming Queue")
     }
 
     private func configureAudioSession() {
@@ -1550,11 +1658,14 @@ final class MusiQEngine: ObservableObject {
         }
     }
 
-    func createPlaylist(name: String) {
+    @discardableResult
+    func createPlaylist(name: String) -> Playlist? {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        playlists.append(Playlist(name: trimmed))
+        guard !trimmed.isEmpty else { return nil }
+        let newP = Playlist(name: trimmed)
+        playlists.append(newP)
         savePlaylists()
+        return newP
     }
 
     func updatePlaylistDetails(id: UUID, newName: String, customCover: UIImage?) {
@@ -1581,6 +1692,9 @@ final class MusiQEngine: ObservableObject {
         if !playlists[idx].trackFileNames.contains(track.fileName) {
             playlists[idx].trackFileNames.append(track.fileName)
             savePlaylists()
+            showToast("Added to '\(playlists[idx].name)'")
+        } else {
+            showToast("Already in '\(playlists[idx].name)'")
         }
     }
 
@@ -1776,9 +1890,7 @@ final class MusiQEngine: ObservableObject {
     }
 
     private func beginCrossfadeToNextTrack() {
-        // Never crossfade when Vinyl Mode is active!
-        guard !isVinylModeActive,
-              !isCrossfading,
+        guard !isCrossfading,
               let nextIdx = computeNextTrackIndex(),
               currentQueue.indices.contains(nextIdx) else { return }
 
@@ -2065,9 +2177,7 @@ final class MusiQEngine: ObservableObject {
                 }
 
                 let remaining = self.progress.duration - clamped
-                // Crossfade is strictly disabled when Vinyl Mode is active!
                 if self.crossfadeEnabled,
-                   !self.isVinylModeActive,
                    self.loopStart == nil,
                    self.progress.duration > (self.crossfadeSeconds + 4.0),
                    remaining <= self.crossfadeSeconds,
@@ -2123,1108 +2233,86 @@ final class MusiQEngine: ObservableObject {
     }
 }
 
-// MARK: - Ultra-Realistic Hi-Fi Turntable & Crate Mode (Technics SL-1200 Architecture + Exact Trigonometric Needle Kinematics)
-struct FullScreenVinylTurntableModeView: View {
+// MARK: - Quick "Add to Playlist" Sheet (With Instant New Playlist Creation)
+struct QuickAddToPlaylistSheet: View {
     @ObservedObject var engine: MusiQEngine
-    @ObservedObject var progress: PlaybackProgressObserver
-    let onQuit: () -> Void
-
-    @State private var selectedPlaylist: Playlist? = nil
-    @State private var pressedDiscs: [VinylPhysicalDisc] = []
-    @State private var activeDiscIndex: Int = 0
-    @State private var isShowingSideB: Bool = false
-    @State private var flipRotationDegrees: Double = 0
-
-    // Tonearm & Stylus Kinematics State
-    // needleRadiusFraction: 1.14 = resting on arm-rest clip, 0.92 = outer groove, 0.40 = inner groove
-    @State private var isNeedleLifted: Bool = true
-    @State private var isDraggingNeedle: Bool = false
-    @State private var needleRadiusFraction: CGFloat = 1.14
-    @State private var hoveredSegment: VinylGrooveSegment? = nil
-    @State private var platterMounted: Bool = false
-
-    private var cratePlaylists: [Playlist] {
-        var list = engine.playlists
-        let allMaster = Playlist(
-            id: UUID(uuidString: "00000000-0000-0000-0000-000000000001") ?? UUID(),
-            name: "Master Library LP",
-            trackFileNames: engine.allTracks.map { $0.fileName },
-            hasCustomCover: false
-        )
-        if list.isEmpty {
-            return [allMaster]
-        } else {
-            list.append(allMaster)
-            return list
-        }
-    }
-
-    private var activeDisc: VinylPhysicalDisc? {
-        guard pressedDiscs.indices.contains(activeDiscIndex) else { return pressedDiscs.first }
-        return pressedDiscs[activeDiscIndex]
-    }
-
-    private var activeSide: VinylSide? {
-        guard let disc = activeDisc else { return nil }
-        if isShowingSideB, let b = disc.sideB {
-            return b
-        }
-        return disc.sideA
-    }
-
-    /// Calculates the live radial position of the stylus tip inside the currently playing groove segment
-    private var effectiveNeedleRadiusFraction: CGFloat {
-        if isDraggingNeedle || isNeedleLifted {
-            return needleRadiusFraction
-        }
-        guard let side = activeSide,
-              let curTrack = engine.currentTrack,
-              let seg = side.segments.first(where: { $0.track.fileName == curTrack.fileName }) else {
-            return needleRadiusFraction
-        }
-        let ratio = CGFloat(min(max(progress.currentTime / max(progress.duration, 1), 0), 1))
-        // Move stylus smoothly from the segment's outer radius to its inner radius as the song plays!
-        return seg.outerRadiusFraction - (seg.outerRadiusFraction - seg.innerRadiusFraction) * ratio
-    }
+    let track: Track
+    @State private var newPlaylistTitle: String = ""
+    @Environment(\.dismiss) private var dismiss
 
     var body: some View {
-        GeometryReader { geo in
-            ZStack {
-                // Dedicated Hi-Fi Listening Room Console Backdrop (Dark Anodized Gunmetal + Walnut Trim)
-                Color(red: 0.045, green: 0.045, blue: 0.052)
-                    .ignoresSafeArea()
-
-                // Subtle Brushed Metal Micro-Grain Texture Overlay
-                LinearGradient(
-                    colors: [
-                        Color.white.opacity(0.03),
-                        Color.clear,
-                        Color.black.opacity(0.65)
-                    ],
-                    startPoint: .top,
-                    endPoint: .bottom
-                )
-                .ignoresSafeArea()
-
-                VStack(spacing: 0) {
-                    // Hardware Top Header Bar
-                    HStack {
+        NavigationStack {
+            List {
+                Section("Create & Add to New Playlist") {
+                    HStack(spacing: 10) {
+                        TextField("New Playlist Name...", text: $newPlaylistTitle)
                         Button {
-                            triggerHaptic(style: .medium)
-                            if selectedPlaylist != nil {
-                                withAnimation(.spring(response: 0.46, dampingFraction: 0.84)) {
-                                    isNeedleLifted = true
-                                    needleRadiusFraction = 1.14
-                                    platterMounted = false
-                                    selectedPlaylist = nil
-                                }
-                            } else {
-                                onQuit()
+                            if let created = engine.createPlaylist(name: newPlaylistTitle) {
+                                engine.addTrack(track, to: created.id)
+                                newPlaylistTitle = ""
+                                dismiss()
                             }
                         } label: {
-                            HStack(spacing: 6) {
-                                Image(systemName: selectedPlaylist != nil ? "chevron.left" : "power")
-                                    .font(.system(size: 12, weight: .bold))
-                                Text(selectedPlaylist != nil ? "RECORD CRATE" : "POWER OFF")
-                                    .font(.system(size: 11, weight: .black, design: .monospaced))
-                                    .tracking(1.0)
-                            }
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 8)
-                            .background(Color(white: 0.13))
-                            .foregroundColor(Color(white: 0.90))
-                            .clipShape(RoundedRectangle(cornerRadius: 6))
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 6)
-                                    .stroke(Color.white.opacity(0.18), lineWidth: 1)
-                            )
+                            Text("Create & Add")
+                                .font(.caption.weight(.bold))
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 7)
+                                .background(Color.purple)
+                                .foregroundColor(.white)
+                                .clipShape(Capsule())
                         }
-
-                        Spacer()
-
-                        VStack(spacing: 2) {
-                            Text("MUSIQ SL-1200MK7")
-                                .font(.system(size: 11, weight: .black, design: .monospaced))
-                                .tracking(2.0)
-                                .foregroundColor(Color(white: 0.88))
-                            Text("DIRECT DRIVE TURNTABLE SYSTEM")
-                                .font(.system(size: 7.5, weight: .bold, design: .monospaced))
-                                .tracking(1.2)
-                                .foregroundColor(Color(red: 0.85, green: 0.68, blue: 0.32))
-                        }
-
-                        Spacer()
-
-                        if selectedPlaylist != nil {
-                            Button {
-                                triggerHaptic(style: .medium)
-                                onQuit()
-                            } label: {
-                                Text("QUIT")
-                                    .font(.system(size: 11, weight: .black, design: .monospaced))
-                                    .padding(.horizontal, 12)
-                                    .padding(.vertical, 8)
-                                    .background(Color(white: 0.13))
-                                    .foregroundColor(.red.opacity(0.9))
-                                    .clipShape(RoundedRectangle(cornerRadius: 6))
-                                    .overlay(
-                                        RoundedRectangle(cornerRadius: 6)
-                                            .stroke(Color.red.opacity(0.3), lineWidth: 1)
-                                    )
-                            }
-                        } else {
-                            Spacer().frame(width: 72)
-                        }
+                        .disabled(newPlaylistTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     }
-                    .padding(.horizontal, 18)
-                    .padding(.top, 8)
-                    .padding(.bottom, 10)
+                }
 
-                    if let playlist = selectedPlaylist {
-                        realisticTurntableDeckView(playlist: playlist, screenSize: geo.size)
-                            .transition(.opacity)
+                Section("Your Playlists") {
+                    if engine.playlists.isEmpty {
+                        Text("No playlists created yet. Use the field above to make one!")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
                     } else {
-                        realisticWoodenCrateBrowser(screenSize: geo.size)
-                            .transition(.opacity)
-                    }
-                }
-            }
-        }
-    }
-
-    // MARK: - Stage 1: Physical Record Store Crate Browser
-    @ViewBuilder
-    private func realisticWoodenCrateBrowser(screenSize: CGSize) -> some View {
-        let sleeveSize = min(screenSize.width * 0.68, 256.0)
-
-        VStack(spacing: 16) {
-            Spacer(minLength: 4)
-
-            VStack(spacing: 4) {
-                Text("VINYL COLLECTION")
-                    .font(.system(size: 12, weight: .black, design: .monospaced))
-                    .tracking(2.5)
-                    .foregroundColor(Color(red: 0.85, green: 0.68, blue: 0.32))
-                Text("Swipe through your physical pressings • Tap a sleeve to mount on platter")
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundColor(.white.opacity(0.55))
-            }
-
-            TabView {
-                ForEach(cratePlaylists) { playlist in
-                    let pTracks = tracksForCratePlaylist(playlist)
-                    let discs = VinylPressingEngine.pressPlaylistIntoDiscs(tracks: pTracks)
-                    let totalMins = Int(pTracks.reduce(0) { $0 + $1.duration } / 60.0)
-
-                    GeometryReader { cardGeo in
-                        let midX = cardGeo.frame(in: .global).midX
-                        let delta = (midX - screenSize.width / 2.0) / screenSize.width
-                        let tilt = Double(delta) * -18.0
-                        let scale = max(0.88, 1.0 - abs(delta) * 0.14)
-
-                        VStack(spacing: 24) {
-                            Spacer()
-
+                        ForEach(engine.playlists) { playlist in
+                            let alreadyIn = playlist.trackFileNames.contains(track.fileName)
                             Button {
-                                mountPlaylistOnTurntable(playlist, precomputedDiscs: discs)
+                                engine.addTrack(track, to: playlist.id)
+                                dismiss()
                             } label: {
-                                ZStack {
-                                    // Photorealistic Grooved Vinyl Disc Peeking Out of the Cardboard Jacket
-                                    PhotorealisticVinylRecordCanvas(
-                                        diameter: sleeveSize * 0.94,
-                                        segments: discs.first?.sideA.segments ?? [],
-                                        hoveredSegmentID: nil,
-                                        playingTrackFileName: nil,
+                                HStack(spacing: 14) {
+                                    PlaylistArtworkThumbnailView(
                                         playlist: playlist,
-                                        tracks: pTracks,
-                                        sideLetter: "A"
+                                        tracks: engine.tracks(for: playlist),
+                                        size: 46,
+                                        cornerRadius: 10
                                     )
-                                    .offset(x: sleeveSize * 0.25)
-                                    .shadow(color: .black.opacity(0.85), radius: 16, x: 10, y: 10)
 
-                                    // Matte Cardboard LP Sleeve with Spine Crease & Edge Wear Highlight
-                                    ZStack(alignment: .bottomLeading) {
-                                        PlaylistArtworkThumbnailView(
-                                            playlist: playlist,
-                                            tracks: pTracks,
-                                            size: sleeveSize,
-                                            cornerRadius: 6
-                                        )
-                                        .overlay(
-                                            // Subtle Vinyl Ring-Wear Impression & Spine Crease
-                                            ZStack {
-                                                Circle()
-                                                    .stroke(Color.white.opacity(0.05), lineWidth: 2)
-                                                    .frame(width: sleeveSize * 0.92, height: sleeveSize * 0.92)
-                                                HStack(spacing: 0) {
-                                                    Rectangle()
-                                                        .fill(
-                                                            LinearGradient(
-                                                                colors: [.white.opacity(0.18), .black.opacity(0.45), .clear],
-                                                                startPoint: .leading,
-                                                                endPoint: .trailing
-                                                            )
-                                                        )
-                                                        .frame(width: 10)
-                                                    Spacer()
-                                                }
-                                            }
-                                            .clipShape(RoundedRectangle(cornerRadius: 6))
-                                        )
-                                        .overlay(
-                                            RoundedRectangle(cornerRadius: 6)
-                                                .stroke(Color.white.opacity(0.15), lineWidth: 0.8)
-                                        )
-                                        .shadow(color: .black.opacity(0.85), radius: 20, x: -6, y: 14)
-
-                                        // Authentic OBI / Pressing Spec Strip
-                                        HStack(spacing: 6) {
-                                            Text("\(discs.count)xLP")
-                                                .font(.system(size: 10, weight: .black, design: .monospaced))
-                                                .padding(.horizontal, 6)
-                                                .padding(.vertical, 3)
-                                                .background(Color(red: 0.85, green: 0.68, blue: 0.32))
-                                                .foregroundColor(.black)
-                                                .clipShape(RoundedRectangle(cornerRadius: 3))
-
-                                            Text("180G AUDIOPHILE PRESSING")
-                                                .font(.system(size: 8.5, weight: .bold, design: .monospaced))
-                                                .foregroundColor(.white.opacity(0.9))
-                                        }
-                                        .padding(8)
-                                        .background(Color.black.opacity(0.82))
-                                        .clipShape(RoundedRectangle(cornerRadius: 5))
-                                        .padding(12)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(playlist.name)
+                                            .font(.headline)
+                                            .foregroundColor(.white)
+                                        Text("\(playlist.trackFileNames.count) songs")
+                                            .font(.caption)
+                                            .foregroundColor(.secondary)
                                     }
-                                    .offset(x: -sleeveSize * 0.08)
+
+                                    Spacer()
+
+                                    Image(systemName: alreadyIn ? "checkmark.circle.fill" : "plus.circle")
+                                        .font(.title3)
+                                        .foregroundColor(alreadyIn ? .purple : .white.opacity(0.6))
                                 }
                             }
-                            .buttonStyle(.plain)
-
-                            // Record Store Index Card Plaque
-                            VStack(spacing: 6) {
-                                Text(playlist.name.uppercased())
-                                    .font(.system(size: 20, weight: .black, design: .monospaced))
-                                    .tracking(1.2)
-                                    .foregroundColor(.white)
-                                    .lineLimit(1)
-
-                                Text("\(pTracks.count) TRACKS • \(totalMins) MINS • \(discs.count) \(discs.count == 1 ? "DISC (SIDES A/B)" : "DISCS (20M/SIDE)")")
-                                    .font(.system(size: 11, weight: .bold, design: .monospaced))
-                                    .foregroundColor(Color(white: 0.58))
-
-                                Button {
-                                    mountPlaylistOnTurntable(playlist, precomputedDiscs: discs)
-                                } label: {
-                                    HStack(spacing: 8) {
-                                        Image(systemName: "record.circle")
-                                            .font(.system(size: 14, weight: .bold))
-                                        Text("PLACE ON PLATTER")
-                                            .font(.system(size: 12, weight: .black, design: .monospaced))
-                                            .tracking(1.0)
-                                    }
-                                    .padding(.horizontal, 22)
-                                    .padding(.vertical, 11)
-                                    .background(Color(red: 0.85, green: 0.68, blue: 0.32))
-                                    .foregroundColor(.black)
-                                    .clipShape(RoundedRectangle(cornerRadius: 6))
-                                }
-                                .padding(.top, 6)
-                            }
-
-                            Spacer()
-                        }
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .scaleEffect(scale)
-                        .rotation3DEffect(.degrees(tilt), axis: (x: 0, y: 1, z: 0), perspective: 0.4)
-                    }
-                }
-            }
-            .tabViewStyle(.page(indexDisplayMode: .always))
-            .frame(height: min(screenSize.height * 0.72, 510))
-
-            Spacer()
-        }
-    }
-
-    // MARK: - Stage 2: Realistic Technics SL-1200 Turntable Plinth + Exact Trigonometric Tonearm
-    @ViewBuilder
-    private func realisticTurntableDeckView(playlist: Playlist, screenSize: CGSize) -> some View {
-        let deckWidth = min(screenSize.width - 24, 372.0)
-        let deckHeight = deckWidth * 0.88
-        // Platter is positioned slightly left-of-center just like a real Technics SL-1200 to leave room for the right-hand tonearm assembly!
-        let platterDiameter = deckWidth * 0.72
-        let platterCenter = CGPoint(x: deckWidth * 0.41, y: deckHeight * 0.50)
-        let pivotCenter = CGPoint(x: deckWidth * 0.86, y: deckHeight * 0.22)
-
-        let currentSide = activeSide
-        let sideSegments = currentSide?.segments ?? []
-        let pTracks = tracksForCratePlaylist(playlist)
-        let isPlatterSpinning = engine.isPlaying && !isNeedleLifted && !isDraggingNeedle
-
-        VStack(spacing: 10) {
-            // 1. Disc & Side Selector Strip (20 Mins Per Side / 40 Mins Per Disc)
-            HStack(spacing: 8) {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 6) {
-                        ForEach(Array(pressedDiscs.enumerated()), id: \.element.id) { dIdx, disc in
-                            let isSel = (dIdx == activeDiscIndex)
-                            Button {
-                                switchPhysicalDisc(to: dIdx)
-                            } label: {
-                                Text("DISC \(disc.discNumber)")
-                                    .font(.system(size: 10.5, weight: .black, design: .monospaced))
-                                    .padding(.horizontal, 11)
-                                    .padding(.vertical, 6)
-                                    .background(isSel ? Color(red: 0.85, green: 0.68, blue: 0.32) : Color(white: 0.14))
-                                    .foregroundColor(isSel ? .black : .white.opacity(0.8))
-                                    .clipShape(RoundedRectangle(cornerRadius: 5))
-                            }
                         }
                     }
                 }
-
-                if let disc = activeDisc, let sideB = disc.sideB {
-                    Button {
-                        flipPhysicalRecordSide()
-                    } label: {
-                        HStack(spacing: 5) {
-                            Image(systemName: "arrow.triangle.2.circlepath")
-                                .font(.system(size: 10, weight: .bold))
-                            Text("FLIP TO SIDE \(isShowingSideB ? disc.sideA.sideLetter : sideB.sideLetter)")
-                                .font(.system(size: 10, weight: .black, design: .monospaced))
-                        }
-                        .padding(.horizontal, 11)
-                        .padding(.vertical, 6)
-                        .background(Color(white: 0.18))
-                        .foregroundColor(Color(red: 0.85, green: 0.68, blue: 0.32))
-                        .clipShape(RoundedRectangle(cornerRadius: 5))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 5)
-                                .stroke(Color(red: 0.85, green: 0.68, blue: 0.32).opacity(0.5), lineWidth: 1)
-                        )
-                    }
-                }
             }
-            .padding(.horizontal, 18)
-
-            // 2. Analog VFD (Vacuum Fluorescent Display) Status Readout Bar
-            HStack {
-                if let hovered = hoveredSegment {
-                    HStack(spacing: 8) {
-                        Circle()
-                            .fill(Color(red: 1.0, green: 0.78, blue: 0.20))
-                            .frame(width: 7, height: 7)
-                            .shadow(color: .orange, radius: 4)
-                        Text("CUE GROOVE \(hovered.trackIndexOnSide + 1):")
-                            .font(.system(size: 10, weight: .black, design: .monospaced))
-                            .foregroundColor(Color(red: 1.0, green: 0.78, blue: 0.20))
-                        Text(hovered.track.title.uppercased())
-                            .font(.system(size: 11, weight: .bold, design: .monospaced))
-                            .foregroundColor(.white)
-                            .lineLimit(1)
-                        Spacer()
-                        Text(hovered.track.formattedDuration)
-                            .font(.system(size: 10, weight: .bold, design: .monospaced))
-                            .foregroundColor(Color(red: 1.0, green: 0.78, blue: 0.20))
-                    }
-                } else if let cur = engine.currentTrack, !isNeedleLifted {
-                    HStack(spacing: 8) {
-                        Circle()
-                            .fill(Color.green)
-                            .frame(width: 7, height: 7)
-                            .shadow(color: .green, radius: 4)
-                        Text("SIDE \(currentSide?.sideLetter ?? "A") •")
-                            .font(.system(size: 10, weight: .black, design: .monospaced))
-                            .foregroundColor(.green)
-                        Text(cur.title.uppercased())
-                            .font(.system(size: 11, weight: .bold, design: .monospaced))
-                            .foregroundColor(.white)
-                            .lineLimit(1)
-                        Spacer()
-                        Text(formatTime(progress.currentTime) + " / " + cur.formattedDuration)
-                            .font(.system(size: 10, weight: .bold, design: .monospaced))
-                            .foregroundColor(.green.opacity(0.9))
-                    }
-                } else {
-                    HStack(spacing: 8) {
-                        Circle()
-                            .fill(Color.red.opacity(0.8))
-                            .frame(width: 7, height: 7)
-                        Text("STYLUS LIFTED • DRAG NEEDLE ACROSS GROOVES OR TAP A SONG")
-                            .font(.system(size: 9.5, weight: .bold, design: .monospaced))
-                            .foregroundColor(Color(white: 0.65))
-                            .lineLimit(1)
-                        Spacer()
-                    }
-                }
-            }
-            .padding(.horizontal, 12)
-            .frame(height: 30)
-            .background(Color.black.opacity(0.85))
-            .clipShape(RoundedRectangle(cornerRadius: 6))
-            .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.white.opacity(0.14), lineWidth: 1))
-            .padding(.horizontal, 18)
-
-            // 3. The Physical Technics SL-1200 Turntable Cabinet & Unified Tonearm Canvas
-            ZStack {
-                // Outer Rosewood / Walnut Cabinet Bezel
-                RoundedRectangle(cornerRadius: 18)
-                    .fill(
-                        LinearGradient(
-                            colors: [
-                                Color(red: 0.24, green: 0.14, blue: 0.08),
-                                Color(red: 0.14, green: 0.08, blue: 0.04),
-                                Color(red: 0.20, green: 0.11, blue: 0.06)
-                            ],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        )
-                    )
-                    .frame(width: deckWidth + 10, height: deckHeight + 10)
-                    .shadow(color: .black.opacity(0.9), radius: 22, x: 0, y: 14)
-
-                // Brushed Dark Gunmetal Aluminum Top Plate
-                RoundedRectangle(cornerRadius: 14)
-                    .fill(
-                        LinearGradient(
-                            colors: [
-                                Color(red: 0.13, green: 0.13, blue: 0.15),
-                                Color(red: 0.08, green: 0.08, blue: 0.095),
-                                Color(red: 0.11, green: 0.11, blue: 0.125)
-                            ],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        )
-                    )
-                    .frame(width: deckWidth, height: deckHeight)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 14)
-                            .stroke(Color.white.opacity(0.16), lineWidth: 1)
-                    )
-
-                // Recessed Platter Well + Machined Aluminum Strobe Dots Rim
-                ZStack {
-                    // Recessed Dark Well Shadow
-                    Circle()
-                        .fill(Color.black.opacity(0.85))
-                        .frame(width: platterDiameter + 16, height: platterDiameter + 16)
-
-                    // Die-Cast Aluminum Platter Bezel with 72 Strobe Dots
-                    Circle()
-                        .stroke(
-                            LinearGradient(
-                                colors: [Color(white: 0.55), Color(white: 0.22), Color(white: 0.65), Color(white: 0.20)],
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
-                            ),
-                            lineWidth: 6
-                        )
-                        .frame(width: platterDiameter + 8, height: platterDiameter + 8)
-
-                    ContinuousSpinView(isSpinning: isPlatterSpinning, rpm: 33.33) {
-                        ZStack {
-                            // Strobe Dots Ring on Platter Edge
-                            Circle()
-                                .stroke(
-                                    Color.white.opacity(0.65),
-                                    style: StrokeStyle(lineWidth: 2.5, dash: [2, 6.5])
-                                )
-                                .frame(width: platterDiameter + 7, height: platterDiameter + 7)
-
-                            // The Photorealistic Micro-Grooved 12" Vinyl Record
-                            PhotorealisticVinylRecordCanvas(
-                                diameter: platterDiameter,
-                                segments: sideSegments,
-                                hoveredSegmentID: hoveredSegment?.id,
-                                playingTrackFileName: (!isNeedleLifted && !isDraggingNeedle) ? engine.currentTrack?.fileName : nil,
-                                playlist: playlist,
-                                tracks: pTracks,
-                                sideLetter: currentSide?.sideLetter ?? "A"
-                            )
-                        }
-                    }
-                    // Counter-Rotating Specular Light Sheen (Stays stationary relative to room lighting while grooves spin underneath!)
-                    Circle()
-                        .fill(
-                            AngularGradient(
-                                gradient: Gradient(stops: [
-                                    .init(color: .clear, location: 0.0),
-                                    .init(color: .white.opacity(0.14), location: 0.12),
-                                    .init(color: .clear, location: 0.25),
-                                    .init(color: .clear, location: 0.50),
-                                    .init(color: .white.opacity(0.14), location: 0.62),
-                                    .init(color: .clear, location: 0.75),
-                                    .init(color: .clear, location: 1.0)
-                                ]),
-                                center: .center
-                            )
-                        )
-                        .frame(width: platterDiameter, height: platterDiameter)
-                        .rotationEffect(.degrees(-18))
-                        .allowsHitTesting(false)
-                }
-                .scaleEffect(platterMounted ? 1.0 : 0.82)
-                .opacity(platterMounted ? 1.0 : 0.0)
-                .rotation3DEffect(.degrees(flipRotationDegrees), axis: (x: 0, y: 1, z: 0), perspective: 0.4)
-                .position(platterCenter)
-
-                // Bottom-Left Physical Machined Aluminum START/STOP Button & Red Strobe Illuminator
-                VStack(alignment: .leading, spacing: 6) {
-                    // Glowing Red Strobe Prism Tower
-                    HStack(spacing: 5) {
-                        RoundedRectangle(cornerRadius: 2)
-                            .fill(isPlatterSpinning ? Color.red : Color.red.opacity(0.35))
-                            .frame(width: 10, height: 6)
-                            .shadow(color: .red, radius: isPlatterSpinning ? 6 : 0)
-                        Text("33  45")
-                            .font(.system(size: 7.5, weight: .black, design: .monospaced))
-                            .foregroundColor(.white.opacity(0.6))
-                    }
-
-                    // Rectangular Technics START / STOP Hardware Button
-                    Button {
-                        toggleTurntableStartStop()
-                    } label: {
-                        VStack(spacing: 2) {
-                            Text("START • STOP")
-                                .font(.system(size: 7.5, weight: .black, design: .monospaced))
-                                .foregroundColor(.black.opacity(0.85))
-                        }
-                        .frame(width: 68, height: 28)
-                        .background(
-                            LinearGradient(
-                                colors: [Color(white: 0.82), Color(white: 0.62)],
-                                startPoint: .top,
-                                endPoint: .bottom
-                            )
-                        )
-                        .clipShape(RoundedRectangle(cornerRadius: 4))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 4)
-                                .stroke(Color.black.opacity(0.7), lineWidth: 1.5)
-                        )
-                        .shadow(color: .black.opacity(0.6), radius: 3, x: 0, y: 2)
-                    }
-                    .buttonStyle(.plain)
-                }
-                .position(x: 48, y: deckHeight - 30)
-
-                // Right-Side Cue Lever Button (LIFT / DROP STYLUS)
-                Button {
-                    toggleTurntableStartStop()
-                } label: {
-                    VStack(spacing: 2) {
-                        Image(systemName: isNeedleLifted ? "arrow.down.to.line" : "arrow.up.to.line")
-                            .font(.system(size: 10, weight: .bold))
-                        Text(isNeedleLifted ? "DROP" : "CUE")
-                            .font(.system(size: 7.5, weight: .black, design: .monospaced))
-                    }
-                    .frame(width: 42, height: 42)
-                    .background(Color(white: 0.16))
-                    .foregroundColor(isNeedleLifted ? Color(red: 0.85, green: 0.68, blue: 0.32) : .white)
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 8)
-                            .stroke(Color.white.opacity(0.22), lineWidth: 1)
-                    )
-                }
-                .buttonStyle(.plain)
-                .position(x: deckWidth - 32, y: deckHeight - 34)
-
-                // Unified Inverse-Kinematics Tonearm & Stylus Overlay (Physically Lands on Exact Groove Radius!)
-                RealisticTonearmCanvasView(
-                    deckSize: CGSize(width: deckWidth, height: deckHeight),
-                    platterCenter: platterCenter,
-                    platterRadius: platterDiameter / 2.0,
-                    pivotCenter: pivotCenter,
-                    targetRadiusFraction: effectiveNeedleRadiusFraction,
-                    isNeedleLifted: isNeedleLifted || isDraggingNeedle,
-                    isHoveringSegment: hoveredSegment != nil
-                )
-                .allowsHitTesting(false)
-            }
-            .frame(width: deckWidth + 10, height: deckHeight + 10)
-            // Unified Touch & Drag Scrubbing Across the Platter & Tonearm
-            .gesture(
-                DragGesture(minimumDistance: 0, coordinateSpace: .local)
-                    .onChanged { value in
-                        let dx = value.location.x - platterCenter.x
-                        let dy = value.location.y - platterCenter.y
-                        let dist = hypot(dx, dy)
-                        let maxR = platterDiameter / 2.0
-                        let normR = max(0.36, min(1.12, dist / maxR))
-
-                        isDraggingNeedle = true
-                        isNeedleLifted = true
-                        needleRadiusFraction = normR
-
-                        // Hit-test exact song groove ring under the stylus tip
-                        if let matchedSeg = sideSegments.first(where: {
-                            normR <= $0.outerRadiusFraction + 0.012 && normR >= $0.innerRadiusFraction - 0.012
-                        }) {
-                            if hoveredSegment?.id != matchedSeg.id {
-                                triggerHaptic(style: .light)
-                                hoveredSegment = matchedSeg
-                            }
-                        } else {
-                            hoveredSegment = nil
-                        }
-                    }
-                    .onEnded { _ in
-                        isDraggingNeedle = false
-                        if let seg = hoveredSegment {
-                            dropStylusOntoSegment(seg, in: currentSide)
-                        } else if needleRadiusFraction > 1.02 {
-                            // Parked back on arm rest
-                            withAnimation(.spring(response: 0.38, dampingFraction: 0.82)) {
-                                isNeedleLifted = true
-                                needleRadiusFraction = 1.14
-                            }
-                            if engine.isPlaying {
-                                engine.togglePlayPause()
-                            }
-                        } else if let nearest = sideSegments.min(by: {
-                            abs($0.midRadiusFraction - needleRadiusFraction) < abs($1.midRadiusFraction - needleRadiusFraction)
-                        }) {
-                            dropStylusOntoSegment(nearest, in: currentSide)
-                        }
-                    }
-            )
-
-            // 4. Bottom Side Tracklist ("Song 1 is this, Song 2 is this...")
-            VStack(alignment: .leading, spacing: 6) {
-                HStack {
-                    Text("DISC \(activeDisc?.discNumber ?? 1) • SIDE \(currentSide?.sideLetter ?? "A") GROOVE INDEX")
-                        .font(.system(size: 10.5, weight: .black, design: .monospaced))
-                        .tracking(1.2)
-                        .foregroundColor(Color(red: 0.85, green: 0.68, blue: 0.32))
-                    Spacer()
-                    Text(currentSide?.formattedDuration ?? "0:00 / 20:00")
-                        .font(.system(size: 10.5, weight: .bold, design: .monospaced))
-                        .foregroundColor(.white.opacity(0.6))
-                }
-                .padding(.horizontal, 20)
-
-                if sideSegments.isEmpty {
-                    Text("No songs pressed on this side.")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .center)
-                        .padding(.vertical, 16)
-                } else {
-                    ScrollView(showsIndicators: false) {
-                        VStack(spacing: 6) {
-                            ForEach(sideSegments) { seg in
-                                let isHovered = (hoveredSegment?.id == seg.id)
-                                let isPlayingThis = (!isNeedleLifted && !isDraggingNeedle && engine.currentTrack?.fileName == seg.track.fileName)
-
-                                Button {
-                                    dropStylusOntoSegment(seg, in: currentSide)
-                                } label: {
-                                    HStack(spacing: 12) {
-                                        Text("\(currentSide?.sideLetter ?? "A")\(seg.trackIndexOnSide + 1)")
-                                            .font(.system(size: 11, weight: .black, design: .monospaced))
-                                            .frame(width: 32, height: 24)
-                                            .background(
-                                                isHovered
-                                                    ? Color(red: 1.0, green: 0.78, blue: 0.20)
-                                                    : (isPlayingThis ? Color(red: 0.85, green: 0.68, blue: 0.32) : Color(white: 0.14))
-                                            )
-                                            .foregroundColor((isHovered || isPlayingThis) ? .black : .white.opacity(0.85))
-                                            .clipShape(RoundedRectangle(cornerRadius: 4))
-
-                                        VStack(alignment: .leading, spacing: 2) {
-                                            Text("Song \(seg.trackIndexOnSide + 1): \(seg.track.title)")
-                                                .font(.system(size: 14, weight: .bold))
-                                                .foregroundColor(isHovered ? Color(red: 1.0, green: 0.78, blue: 0.20) : (isPlayingThis ? Color(red: 0.85, green: 0.68, blue: 0.32) : .white))
-                                                .lineLimit(1)
-                                            Text(seg.track.artist)
-                                                .font(.system(size: 11.5, weight: .medium))
-                                                .foregroundColor(.white.opacity(0.55))
-                                                .lineLimit(1)
-                                        }
-
-                                        Spacer()
-
-                                        if isPlayingThis && engine.isPlaying {
-                                            Image(systemName: "speaker.wave.2.fill")
-                                                .font(.caption)
-                                                .foregroundColor(Color(red: 0.85, green: 0.68, blue: 0.32))
-                                        }
-
-                                        Text(seg.track.formattedDuration)
-                                            .font(.system(size: 11.5, weight: .bold, design: .monospaced))
-                                            .foregroundColor(.white.opacity(0.70))
-                                    }
-                                    .padding(.horizontal, 12)
-                                    .padding(.vertical, 8)
-                                    .background(
-                                        RoundedRectangle(cornerRadius: 8)
-                                            .fill(
-                                                isHovered
-                                                    ? Color(red: 1.0, green: 0.78, blue: 0.20).opacity(0.14)
-                                                    : (isPlayingThis ? Color(red: 0.85, green: 0.68, blue: 0.32).opacity(0.14) : Color(white: 0.07))
-                                            )
-                                            .overlay(
-                                                RoundedRectangle(cornerRadius: 8)
-                                                    .stroke(
-                                                        isHovered
-                                                            ? Color(red: 1.0, green: 0.78, blue: 0.20).opacity(0.65)
-                                                            : (isPlayingThis ? Color(red: 0.85, green: 0.68, blue: 0.32).opacity(0.55) : Color.white.opacity(0.06)),
-                                                        lineWidth: 1
-                                                    )
-                                            )
-                                    )
-                                }
-                                .buttonStyle(.plain)
-                            }
-                        }
-                        .padding(.horizontal, 18)
-                        .padding(.bottom, 12)
-                    }
+            .navigationTitle("Add '\(track.title)'")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Cancel") { dismiss() }
                 }
             }
         }
-    }
-
-    // MARK: - Turntable Mechanics & Actions
-    private func tracksForCratePlaylist(_ playlist: Playlist) -> [Track] {
-        if playlist.name == "Master Library LP" && !engine.playlists.contains(where: { $0.id == playlist.id }) {
-            return engine.allTracks
-        }
-        return engine.tracks(for: playlist)
-    }
-
-    private func mountPlaylistOnTurntable(_ playlist: Playlist, precomputedDiscs: [VinylPhysicalDisc]) {
-        triggerHaptic(style: .heavy)
-        pressedDiscs = precomputedDiscs
-        activeDiscIndex = 0
-        isShowingSideB = false
-        hoveredSegment = nil
-        isNeedleLifted = true
-        needleRadiusFraction = 1.14
-        platterMounted = false
-
-        withAnimation(.easeInOut(duration: 0.32)) {
-            selectedPlaylist = playlist
-        }
-        withAnimation(.spring(response: 0.50, dampingFraction: 0.80).delay(0.06)) {
-            platterMounted = true
-        }
-    }
-
-    private func switchPhysicalDisc(to index: Int) {
-        guard index != activeDiscIndex else { return }
-        triggerHaptic(style: .medium)
-        withAnimation(.spring(response: 0.35, dampingFraction: 0.82)) {
-            isNeedleLifted = true
-            needleRadiusFraction = 1.14
-            hoveredSegment = nil
-            platterMounted = false
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
-            activeDiscIndex = index
-            isShowingSideB = false
-            withAnimation(.spring(response: 0.46, dampingFraction: 0.80)) {
-                platterMounted = true
-            }
-        }
-    }
-
-    private func flipPhysicalRecordSide() {
-        triggerHaptic(style: .medium)
-        withAnimation(.spring(response: 0.32, dampingFraction: 0.84)) {
-            isNeedleLifted = true
-            needleRadiusFraction = 1.14
-            hoveredSegment = nil
-        }
-        withAnimation(.easeInOut(duration: 0.24)) {
-            flipRotationDegrees = 90
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.24) {
-            isShowingSideB.toggle()
-            flipRotationDegrees = -90
-            withAnimation(.spring(response: 0.40, dampingFraction: 0.80)) {
-                flipRotationDegrees = 0
-            }
-        }
-    }
-
-    private func toggleTurntableStartStop() {
-        triggerHaptic(style: .heavy)
-        AudioServicesPlaySystemSound(1104)
-        if isNeedleLifted {
-            if let side = activeSide, let firstSeg = side.segments.first {
-                let targetSeg = side.segments.first(where: { $0.track.fileName == engine.currentTrack?.fileName }) ?? firstSeg
-                dropStylusOntoSegment(targetSeg, in: side)
-            }
-        } else {
-            withAnimation(.spring(response: 0.42, dampingFraction: 0.82)) {
-                isNeedleLifted = true
-                needleRadiusFraction = 1.14
-                hoveredSegment = nil
-            }
-            if engine.isPlaying {
-                engine.togglePlayPause()
-            }
-        }
-    }
-
-    private func dropStylusOntoSegment(_ segment: VinylGrooveSegment, in side: VinylSide?) {
-        guard let side = side else { return }
-        triggerHaptic(style: .heavy)
-        AudioServicesPlaySystemSound(1104)
-
-        withAnimation(.spring(response: 0.48, dampingFraction: 0.80)) {
-            needleRadiusFraction = segment.outerRadiusFraction - 0.01
-            isNeedleLifted = false
-            hoveredSegment = nil
-        }
-
-        engine.playTrack(segment.track, in: side.tracks)
-    }
-
-    private func formatTime(_ s: Double) -> String {
-        guard s.isFinite && s >= 0 else { return "0:00" }
-        let total = Int(s)
-        return String(format: "%d:%02d", total / 60, total % 60)
-    }
-
-    private func triggerHaptic(style: UIImpactFeedbackGenerator.FeedbackStyle) {
-        let gen = UIImpactFeedbackGenerator(style: style)
-        gen.impactOccurred()
-    }
-}
-
-// MARK: - Photorealistic 180g Vinyl Record Renderer (75+ Micro-Grooves, Track Gap Bands & Center Playlist Label)
-struct PhotorealisticVinylRecordCanvas: View {
-    let diameter: CGFloat
-    let segments: [VinylGrooveSegment]
-    let hoveredSegmentID: UUID?
-    let playingTrackFileName: String?
-    let playlist: Playlist
-    let tracks: [Track]
-    let sideLetter: String
-
-    var body: some View {
-        ZStack {
-            // 1. Deep 180g Carbon-Black Vinyl Disc Base + Micro-Groove Canvas
-            Canvas { context, size in
-                let center = CGPoint(x: size.width / 2.0, y: size.height / 2.0)
-                let maxR = min(size.width, size.height) / 2.0
-
-                // Base Vinyl Body
-                let baseCircle = Path(ellipseIn: CGRect(x: 0, y: 0, width: size.width, height: size.height))
-                context.fill(baseCircle, with: .color(Color(red: 0.04, green: 0.04, blue: 0.045)))
-
-                // Outer Beveled Lead-In Lip
-                var outerLip = Path()
-                outerLip.addArc(center: center, radius: maxR * 0.985, startAngle: .zero, endAngle: .degrees(360), clockwise: false)
-                context.stroke(outerLip, with: .color(Color.white.opacity(0.14)), lineWidth: 1.5)
-
-                // Draw Each Song's Concentric Groove Band & Fine Micro-Groove Lines
-                for seg in segments {
-                    let rOut = maxR * seg.outerRadiusFraction
-                    let rIn = maxR * seg.innerRadiusFraction
-                    let isHovered = (seg.id == hoveredSegmentID)
-                    let isPlaying = (seg.track.fileName == playingTrackFileName)
-
-                    // Highlighted Band Fill when Needle Hovers or Plays this Segment
-                    if isHovered || isPlaying {
-                        let midR = (rOut + rIn) / 2.0
-                        let bandW = max(1, rOut - rIn)
-                        var glowArc = Path()
-                        glowArc.addArc(center: center, radius: midR, startAngle: .zero, endAngle: .degrees(360), clockwise: false)
-                        let highlightColor = isHovered
-                            ? Color(red: 1.0, green: 0.80, blue: 0.22).opacity(0.32)
-                            : Color(red: 0.85, green: 0.68, blue: 0.32).opacity(0.18)
-                        context.stroke(glowArc, with: .color(highlightColor), lineWidth: bandW)
-                    }
-
-                    // Render 16 Fine Concentric Micro-Grooves Inside Each Song Band
-                    let grooveCount = 16
-                    for g in 0...grooveCount {
-                        let frac = CGFloat(g) / CGFloat(grooveCount)
-                        let r = rOut - (rOut - rIn) * frac
-                        var groovePath = Path()
-                        groovePath.addArc(center: center, radius: r, startAngle: .zero, endAngle: .degrees(360), clockwise: false)
-
-                        let alpha: Double = isHovered ? 0.36 : (g % 3 == 0 ? 0.11 : 0.05)
-                        let strokeCol = isHovered
-                            ? Color(red: 1.0, green: 0.84, blue: 0.30).opacity(alpha)
-                            : Color.white.opacity(alpha)
-                        context.stroke(groovePath, with: .color(strokeCol), lineWidth: 0.55)
-                    }
-
-                    // Shiny Uncut Wax Inter-Track Separator Ring Between Songs
-                    var separator = Path()
-                    separator.addArc(center: center, radius: rIn, startAngle: .zero, endAngle: .degrees(360), clockwise: false)
-                    context.stroke(separator, with: .color(Color.black.opacity(0.95)), lineWidth: 1.8)
-                }
-
-                // Inner Run-Out Matrix Etching Ring (Between 0.39 and 0.35)
-                var runout = Path()
-                runout.addArc(center: center, radius: maxR * 0.365, startAngle: .zero, endAngle: .degrees(360), clockwise: false)
-                context.stroke(runout, with: .color(Color.white.opacity(0.08)), lineWidth: 0.7)
-            }
-            .frame(width: diameter, height: diameter)
-
-            // 2. Center Pressed Paper Record Label (Uses Playlist Cover Image!)
-            ZStack {
-                PlaylistArtworkThumbnailView(
-                    playlist: playlist,
-                    tracks: tracks,
-                    size: diameter * 0.33,
-                    cornerRadius: diameter * 0.165
-                )
-                .clipShape(Circle())
-                .overlay(
-                    // Authentic Paper Label Stamper Ring Impression
-                    Circle()
-                        .stroke(Color.black.opacity(0.35), lineWidth: 1.2)
-                        .frame(width: diameter * 0.24, height: diameter * 0.24)
-                )
-                .overlay(
-                    Circle()
-                        .stroke(Color.white.opacity(0.22), lineWidth: 1)
-                )
-
-                // Machined Aluminum Center Spindle Adapter & 7mm Hole
-                Circle()
-                    .fill(
-                        RadialGradient(
-                            colors: [Color(white: 0.85), Color(white: 0.45), Color(white: 0.20)],
-                            center: .center,
-                            startRadius: 1,
-                            endRadius: 9
-                        )
-                    )
-                    .frame(width: 16, height: 16)
-
-                Circle()
-                    .fill(Color(red: 0.06, green: 0.06, blue: 0.07))
-                    .frame(width: 7, height: 7)
-            }
-        }
-    }
-}
-
-// MARK: - Exact Inverse-Kinematics Tonearm & Headshell Renderer (Guarantees Stylus Lands on the Exact Song Groove!)
-struct RealisticTonearmCanvasView: View {
-    let deckSize: CGSize
-    let platterCenter: CGPoint
-    let platterRadius: CGFloat
-    let pivotCenter: CGPoint
-    let targetRadiusFraction: CGFloat // 1.14 = parked on rest, 0.92..0.39 = exact radial groove on record
-    let isNeedleLifted: Bool
-    let isHoveringSegment: Bool
-
-    var body: some View {
-        Canvas { context, _ in
-            // 1. Compute Exact Stylus Contact Coordinates (S_x, S_y) on the Platter
-            // The stylus sweeps along a slightly curved arc to the right of the spindle (angle ~ +18° from horizontal right of platterCenter)
-            let clampedFrac = max(0.36, min(1.16, targetRadiusFraction))
-            let targetR = platterRadius * clampedFrac
-
-            let sweepAngleRad: CGFloat = 0.26 // ~15° below horizontal right of the platter center
-            let stylusPoint: CGPoint
-            if clampedFrac > 1.05 {
-                // Parked on the tonearm rest post on the right side of the deck
-                stylusPoint = CGPoint(x: pivotCenter.x - 6, y: platterCenter.y + platterRadius * 0.58)
-            } else {
-                stylusPoint = CGPoint(
-                    x: platterCenter.x + targetR * cos(sweepAngleRad),
-                    y: platterCenter.y + targetR * sin(sweepAngleRad)
-                )
-            }
-
-            // 2. Draw Gimbal Pivot Base Assembly (Top-Right of Turntable)
-            let baseRadius: CGFloat = 28
-            let baseRect = CGRect(x: pivotCenter.x - baseRadius, y: pivotCenter.y - baseRadius, width: baseRadius * 2, height: baseRadius * 2)
-            context.fill(Path(ellipseIn: baseRect), with: .color(Color(white: 0.10)))
-            context.stroke(Path(ellipseIn: baseRect), with: .color(Color.white.opacity(0.25)), lineWidth: 1.5)
-
-            let innerGimbalRect = CGRect(x: pivotCenter.x - 16, y: pivotCenter.y - 16, width: 32, height: 32)
-            context.fill(Path(ellipseIn: innerGimbalRect), with: .color(Color(white: 0.28)))
-            context.stroke(Path(ellipseIn: innerGimbalRect), with: .color(Color.white.opacity(0.45)), lineWidth: 1.2)
-
-            // 3. Compute Vector from Gimbal Pivot -> Stylus Tip
-            let dx = stylusPoint.x - pivotCenter.x
-            let dy = stylusPoint.y - pivotCenter.y
-            let dist = max(1, hypot(dx, dy))
-            let ux = dx / dist
-            let uy = dy / dist
-            // Perpendicular normal vector for S-curve offset and counterweight width
-            let nx = -uy
-            let ny = ux
-
-            // 4. Draw Rear Counterweight Behind the Pivot
-            let cwStart = CGPoint(x: pivotCenter.x - ux * 12, y: pivotCenter.y - uy * 12)
-            let cwEnd = CGPoint(x: pivotCenter.x - ux * 36, y: pivotCenter.y - uy * 36)
-            var cwPath = Path()
-            cwPath.move(to: cwStart)
-            cwPath.addLine(to: cwEnd)
-            context.stroke(cwPath, with: .color(Color(white: 0.35)), style: StrokeStyle(lineWidth: 15, lineCap: .butt))
-
-            var cwScaleRing = Path()
-            cwScaleRing.move(to: cwStart)
-            cwScaleRing.addLine(to: CGPoint(x: pivotCenter.x - ux * 17, y: pivotCenter.y - uy * 17))
-            context.stroke(cwScaleRing, with: .color(Color(red: 0.85, green: 0.68, blue: 0.32)), style: StrokeStyle(lineWidth: 15, lineCap: .butt))
-
-            // 5. Draw S-Shaped Tubular Aluminum Tonearm from Pivot to Headshell Collar
-            let headshellLength: CGFloat = 26
-            let collarPoint = CGPoint(
-                x: stylusPoint.x - ux * headshellLength,
-                y: stylusPoint.y - uy * headshellLength
-            )
-
-            let ctrl1 = CGPoint(
-                x: pivotCenter.x + ux * (dist * 0.32) + nx * 12,
-                y: pivotCenter.y + uy * (dist * 0.32) + ny * 12
-            )
-            let ctrl2 = CGPoint(
-                x: pivotCenter.x + ux * (dist * 0.68) - nx * 10,
-                y: pivotCenter.y + uy * (dist * 0.68) - ny * 10
-            )
-
-            var armCurve = Path()
-            armCurve.move(to: pivotCenter)
-            armCurve.addCurve(to: collarPoint, control1: ctrl1, control2: ctrl2)
-
-            // Drop Shadow under Tonearm (Wider offset when needle is lifted!)
-            var shadowCurve = armCurve
-            let shadowOffset = isNeedleLifted ? CGSize(width: -8, height: 10) : CGSize(width: -3, height: 4)
-            shadowCurve = shadowCurve.offsetBy(dx: shadowOffset.width, dy: shadowOffset.height)
-            context.stroke(shadowCurve, with: .color(Color.black.opacity(0.65)), style: StrokeStyle(lineWidth: 6, lineCap: .round))
-
-            // Chrome Outer Tube & Specular Highlight Core
-            context.stroke(armCurve, with: .color(Color(white: 0.58)), style: StrokeStyle(lineWidth: 5.5, lineCap: .round))
-            context.stroke(armCurve, with: .color(Color(white: 0.92)), style: StrokeStyle(lineWidth: 2.0, lineCap: .round))
-
-            // 6. Draw Angled Technics Headshell & Finger Lift at Stylus Point
-            var headshellPath = Path()
-            headshellPath.move(to: collarPoint)
-            headshellPath.addLine(to: stylusPoint)
-            context.stroke(headshellPath, with: .color(Color(white: 0.16)), style: StrokeStyle(lineWidth: 12, lineCap: .round))
-            context.stroke(headshellPath, with: .color(Color.white.opacity(0.45)), style: StrokeStyle(lineWidth: 1.2, lineCap: .round))
-
-            // Finger Lift Wire on Side of Headshell
-            let fingerBase = CGPoint(x: stylusPoint.x - ux * 10, y: stylusPoint.y - uy * 10)
-            let fingerTip = CGPoint(x: fingerBase.x - nx * 14, y: fingerBase.y - ny * 14)
-            var liftWire = Path()
-            liftWire.move(to: fingerBase)
-            liftWire.addLine(to: fingerTip)
-            context.stroke(liftWire, with: .color(Color(white: 0.82)), style: StrokeStyle(lineWidth: 2.2, lineCap: .round))
-
-            // 7. Glowing Diamond Stylus Needle Point Directly on the Groove!
-            let needleDotRect = CGRect(x: stylusPoint.x - 4, y: stylusPoint.y - 4, width: 8, height: 8)
-            let stylusColor: Color = isHoveringSegment
-                ? Color(red: 1.0, green: 0.80, blue: 0.20)
-                : (isNeedleLifted ? Color.white.opacity(0.75) : Color(red: 0.85, green: 0.68, blue: 0.32))
-            context.fill(Path(ellipseIn: needleDotRect), with: .color(stylusColor))
-        }
-        .frame(width: deckSize.width, height: deckSize.height)
     }
 }
 
@@ -4472,7 +3560,7 @@ struct PlaylistArtworkThumbnailView: View {
     }
 }
 
-// MARK: - Root Tab View (Supports Full-Screen iPod Mode & Full-Screen Vinyl Turntable Mode)
+// MARK: - Root Tab View (With Floating Toast Banner & Duplicate Song Disclaimer Alert)
 struct MusiQRootView: View {
     @StateObject private var engine = MusiQEngine()
     @State private var selectedTab: Int = 0
@@ -4507,6 +3595,31 @@ struct MusiQRootView: View {
             }
             .tint(.purple)
 
+            // Floating Top Toast Feedback Pill
+            if let toast = engine.toastBannerText {
+                VStack {
+                    HStack(spacing: 8) {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundColor(.purple)
+                        Text(toast)
+                            .font(.system(size: 13, weight: .bold, design: .rounded))
+                            .foregroundColor(.white)
+                            .lineLimit(1)
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
+                    .background(Color.black.opacity(0.88))
+                    .clipShape(Capsule())
+                    .overlay(Capsule().stroke(Color.purple.opacity(0.55), lineWidth: 1))
+                    .shadow(color: .black.opacity(0.45), radius: 10, x: 0, y: 4)
+                    .padding(.top, 12)
+
+                    Spacer()
+                }
+                .transition(.move(edge: .top).combined(with: .opacity))
+                .zIndex(100)
+            }
+
             if let current = engine.currentTrack {
                 MiniPlayerBar(engine: engine, track: current) {
                     withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
@@ -4524,10 +3637,26 @@ struct MusiQRootView: View {
                 engine.isIPodModeActive = false
             }
         }
-        .fullScreenCover(isPresented: $engine.isVinylModeActive) {
-            FullScreenVinylTurntableModeView(engine: engine, progress: engine.progress) {
-                engine.isVinylModeActive = false
+        // Duplicate Song Recognition & Disclaimer Alert
+        .alert(
+            "Duplicate Song Detected",
+            isPresented: Binding(
+                get: { engine.activeDuplicateAlert != nil },
+                set: { if !$0 { engine.activeDuplicateAlert = nil } }
+            ),
+            presenting: engine.activeDuplicateAlert
+        ) { candidate in
+            Button("Skip Import", role: .cancel) {
+                engine.resolveDuplicateCandidate(candidate, decision: .skip)
             }
+            Button("Replace Existing", role: .destructive) {
+                engine.resolveDuplicateCandidate(candidate, decision: .replaceExisting)
+            }
+            Button("Keep Both Copies") {
+                engine.resolveDuplicateCandidate(candidate, decision: .keepBoth)
+            }
+        } message: { candidate in
+            Text("'\(candidate.proposedTitle)' matches '\(candidate.matchedExistingTrack.title)' already in your MusiQ library.\n\nReason: \(candidate.matchReason).\n\nWould you like to skip this file, replace the existing song, or keep both?")
         }
     }
 }
@@ -4635,7 +3764,7 @@ struct PlaylistsHomeView: View {
     }
 }
 
-// MARK: - Clean Full-Bleed Playlist Detail View
+// MARK: - Clean Full-Bleed Playlist Detail View (With Left-to-Right Swipe to Queue!)
 struct PlaylistDetailView: View {
     @ObservedObject var engine: MusiQEngine
     let playlistID: UUID
@@ -4643,6 +3772,7 @@ struct PlaylistDetailView: View {
 
     @State private var showSongPicker = false
     @State private var showEditPlaylistSheet = false
+    @State private var trackForQuickPlaylist: Track? = nil
     @State private var searchText = ""
 
     var playlist: Playlist? {
@@ -4812,6 +3942,39 @@ struct PlaylistDetailView: View {
                             engine.playTrack(track, in: tracks)
                             showFullPlayer = true
                         }
+                        // Swipe Left-to-Right to Add to Queue!
+                        .swipeActions(edge: .leading, allowsFullSwipe: true) {
+                            Button {
+                                engine.playNextInQueue(track)
+                            } label: {
+                                Label("Play Next", systemImage: "text.line.first.and.arrowtriangle.forward")
+                            }
+                            .tint(.purple)
+
+                            Button {
+                                engine.appendToQueue(track)
+                            } label: {
+                                Label("Add to Queue", systemImage: "text.append")
+                            }
+                            .tint(.indigo)
+                        }
+                        .contextMenu {
+                            Button {
+                                engine.playNextInQueue(track)
+                            } label: {
+                                Label("Play Next in Queue", systemImage: "text.line.first.and.arrowtriangle.forward")
+                            }
+                            Button {
+                                engine.appendToQueue(track)
+                            } label: {
+                                Label("Add to End of Queue", systemImage: "text.append")
+                            }
+                            Button {
+                                trackForQuickPlaylist = track
+                            } label: {
+                                Label("Add to Another Playlist...", systemImage: "plus.rectangle.on.folder")
+                            }
+                        }
                         .padding(.horizontal, 16)
                         .padding(.vertical, 4)
                         .listRowInsets(EdgeInsets())
@@ -4878,6 +4041,10 @@ struct PlaylistDetailView: View {
             if let p = playlist {
                 PlaylistEditorSheet(engine: engine, playlist: p)
             }
+        }
+        .sheet(item: $trackForQuickPlaylist) { track in
+            QuickAddToPlaylistSheet(engine: engine, track: track)
+                .presentationDetents([.medium, .large])
         }
     }
 }
@@ -4962,13 +4129,14 @@ struct PlaylistEditorSheet: View {
     }
 }
 
-// MARK: - Tab 2: Global Searchable Songs Library
+// MARK: - Tab 2: Global Searchable Songs Library (With Left-to-Right Swipe to Queue & Duplicate Check on Import!)
 struct AllSongsSearchView: View {
     @ObservedObject var engine: MusiQEngine
     @Binding var showFullPlayer: Bool
     @State private var searchText: String = ""
     @State private var showFileImporter: Bool = false
     @State private var trackToTag: Track? = nil
+    @State private var trackForQuickPlaylist: Track? = nil
 
     var filteredTracks: [Track] {
         if searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -5029,21 +4197,45 @@ struct AllSongsSearchView: View {
                                     showFullPlayer = true
                                 }
                             }
+                            // Swipe Left-to-Right to Add to Queue!
+                            .swipeActions(edge: .leading, allowsFullSwipe: true) {
+                                Button {
+                                    engine.playNextInQueue(track)
+                                } label: {
+                                    Label("Play Next", systemImage: "text.line.first.and.arrowtriangle.forward")
+                                }
+                                .tint(.purple)
+
+                                Button {
+                                    engine.appendToQueue(track)
+                                } label: {
+                                    Label("Add to Queue", systemImage: "text.append")
+                                }
+                                .tint(.indigo)
+                            }
                             .contextMenu {
+                                Button {
+                                    engine.playNextInQueue(track)
+                                } label: {
+                                    Label("Play Next in Queue", systemImage: "text.line.first.and.arrowtriangle.forward")
+                                }
+
+                                Button {
+                                    engine.appendToQueue(track)
+                                } label: {
+                                    Label("Add to End of Queue", systemImage: "text.append")
+                                }
+
+                                Button {
+                                    trackForQuickPlaylist = track
+                                } label: {
+                                    Label("Add to Playlist...", systemImage: "plus.rectangle.on.folder")
+                                }
+
                                 Button {
                                     trackToTag = track
                                 } label: {
                                     Label("Edit Tags & Cover Art", systemImage: "tag.fill")
-                                }
-
-                                if !engine.playlists.isEmpty {
-                                    Menu("Add to Playlist") {
-                                        ForEach(engine.playlists) { playlist in
-                                            Button(playlist.name) {
-                                                engine.addTrack(track, to: playlist.id)
-                                            }
-                                        }
-                                    }
                                 }
 
                                 Button(role: .destructive) {
@@ -5087,21 +4279,24 @@ struct AllSongsSearchView: View {
             ) { result in
                 switch result {
                 case .success(let urls):
-                    let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+                    let tempDir = FileManager.default.temporaryDirectory
                     for url in urls {
                         let gotAccess = url.startAccessingSecurityScopedResource()
                         defer { if gotAccess { url.stopAccessingSecurityScopedResource() } }
-                        let dest = docs.appendingPathComponent(url.lastPathComponent)
-                        try? FileManager.default.removeItem(at: dest)
-                        try? FileManager.default.copyItem(at: url, to: dest)
+                        let stagedURL = tempDir.appendingPathComponent("import_\(UUID().uuidString)_\(url.lastPathComponent)")
+                        try? FileManager.default.copyItem(at: url, to: stagedURL)
+                        engine.ingestStagedAudioFile(tempURL: stagedURL, proposedFileName: url.lastPathComponent)
                     }
-                    engine.scanLocalLibrary()
                 case .failure(let err):
                     print("Import failed: \(err)")
                 }
             }
             .sheet(item: $trackToTag) { track in
                 BuiltInTagEditorSheet(engine: engine, track: track)
+            }
+            .sheet(item: $trackForQuickPlaylist) { track in
+                QuickAddToPlaylistSheet(engine: engine, track: track)
+                    .presentationDetents([.medium, .large])
             }
         }
     }
@@ -5226,7 +4421,7 @@ struct MiniPlayerBar: View {
     }
 }
 
-// MARK: - Full-Screen Player (Scrubber-Safe Edge Dismissal)
+// MARK: - Full-Screen Player (With Quick "+ Playlist" Button & Scrubber-Safe Dismissal)
 struct FullPlayerDeckView: View {
     @ObservedObject var engine: MusiQEngine
     @Binding var isPresented: Bool
@@ -5236,7 +4431,7 @@ struct FullPlayerDeckView: View {
     @State private var dragOffset: CGSize = .zero
 
     enum BottomPanel: Identifiable {
-        case dsp, lyrics, tagEditor, queue
+        case dsp, lyrics, tagEditor, queue, addToPlaylist
         var id: Int { hashValue }
     }
 
@@ -5260,7 +4455,7 @@ struct FullPlayerDeckView: View {
                 .animation(.easeInOut(duration: 0.65), value: engine.currentTrack?.fileName)
 
                 VStack(spacing: 0) {
-                    // Clean Top Bar
+                    // Clean Top Bar with Quick "+ Playlist" Action
                     HStack {
                         Button {
                             isPresented = false
@@ -5275,14 +4470,24 @@ struct FullPlayerDeckView: View {
                             .fill(Color.white.opacity(0.3))
                             .frame(width: 42, height: 5)
                         Spacer()
-                        if let track = engine.currentTrack {
-                            Text(engine.formattedListenTime(for: track.fileName))
-                                .font(.caption2.monospacedDigit().weight(.semibold))
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 5)
-                                .background(Color.black.opacity(0.28))
-                                .clipShape(Capsule())
-                                .foregroundColor(.white.opacity(0.9))
+                        HStack(spacing: 8) {
+                            if let track = engine.currentTrack {
+                                Text(engine.formattedListenTime(for: track.fileName))
+                                    .font(.caption2.monospacedDigit().weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 5)
+                                    .background(Color.black.opacity(0.28))
+                                    .clipShape(Capsule())
+                                    .foregroundColor(.white.opacity(0.9))
+
+                                Button {
+                                    activeBottomSheet = .addToPlaylist
+                                } label: {
+                                    Image(systemName: "plus.circle.fill")
+                                        .font(.title3)
+                                        .foregroundColor(.white.opacity(0.9))
+                                }
+                            }
                         }
                     }
                     .padding(.horizontal, 16)
@@ -5584,7 +4789,12 @@ struct FullPlayerDeckView: View {
                     }
                 case .queue:
                     QueueSheetView(engine: engine)
-                        .presentationDetents([.medium, .large])
+                        .presentationDetents([.large])
+                case .addToPlaylist:
+                    if let current = engine.currentTrack {
+                        QuickAddToPlaylistSheet(engine: engine, track: current)
+                            .presentationDetents([.medium, .large])
+                    }
                 }
             }
         }
@@ -6132,47 +5342,284 @@ struct DSPControlSheet: View {
     }
 }
 
-// MARK: - Queue Sheet
+// MARK: - 10x Upgraded Interactive Queue Sheet (Now Playing Hero + Drag Reorder + Play Next + Remaining Time)
 struct QueueSheetView: View {
     @ObservedObject var engine: MusiQEngine
+    @Environment(\.dismiss) private var dismiss
+
+    private var upcomingTracks: [Track] {
+        guard engine.currentIndex + 1 < engine.currentQueue.count else { return [] }
+        return Array(engine.currentQueue[(engine.currentIndex + 1)...])
+    }
+
+    private var totalRemainingMinutes: Int {
+        let secs = upcomingTracks.reduce(0.0) { $0 + $1.duration }
+        return Int(secs / 60.0)
+    }
 
     var body: some View {
         NavigationStack {
-            List(Array(engine.currentQueue.enumerated()), id: \.element.id) { idx, track in
-                Button {
-                    engine.playTrack(track, in: engine.currentQueue)
-                } label: {
+            ZStack {
+                LinearGradient(
+                    colors: ArtworkCache.shared.playerGradient(for: engine.currentTrack?.fileName),
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+                .ignoresSafeArea()
+
+                Color.black.opacity(0.55)
+                    .ignoresSafeArea()
+
+                VStack(spacing: 14) {
+                    // 1. Now Playing Hero Card
+                    if let current = engine.currentTrack {
+                        VStack(alignment: .leading, spacing: 10) {
+                            HStack {
+                                Text("NOW PLAYING")
+                                    .font(.system(size: 11, weight: .black, design: .monospaced))
+                                    .tracking(1.4)
+                                    .foregroundColor(.purple)
+                                Spacer()
+                                HStack(spacing: 10) {
+                                    Button {
+                                        engine.isShuffle.toggle()
+                                    } label: {
+                                        HStack(spacing: 4) {
+                                            Image(systemName: "shuffle")
+                                            Text("Shuffle")
+                                        }
+                                        .font(.caption2.weight(.bold))
+                                        .padding(.horizontal, 10)
+                                        .padding(.vertical, 5)
+                                        .background(engine.isShuffle ? Color.purple : Color.white.opacity(0.12))
+                                        .foregroundColor(.white)
+                                        .clipShape(Capsule())
+                                    }
+
+                                    Button {
+                                        engine.isRepeat.toggle()
+                                    } label: {
+                                        HStack(spacing: 4) {
+                                            Image(systemName: "repeat")
+                                            Text("Repeat")
+                                        }
+                                        .font(.caption2.weight(.bold))
+                                        .padding(.horizontal, 10)
+                                        .padding(.vertical, 5)
+                                        .background(engine.isRepeat ? Color.purple : Color.white.opacity(0.12))
+                                        .foregroundColor(.white)
+                                        .clipShape(Capsule())
+                                    }
+                                }
+                            }
+
+                            HStack(spacing: 14) {
+                                if let art = ArtworkCache.shared.artwork(for: current.fileName) {
+                                    Image(uiImage: art)
+                                        .resizable()
+                                        .scaledToFill()
+                                        .frame(width: 62, height: 62)
+                                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                                        .shadow(color: .black.opacity(0.45), radius: 6, x: 0, y: 3)
+                                } else {
+                                    RoundedRectangle(cornerRadius: 12)
+                                        .fill(Color.purple.opacity(0.35))
+                                        .frame(width: 62, height: 62)
+                                        .overlay(Image(systemName: "music.note").font(.title2).foregroundColor(.white))
+                                }
+
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(current.title)
+                                        .font(.system(size: 18, weight: .bold))
+                                        .foregroundColor(.white)
+                                        .lineLimit(1)
+                                    Text(current.artist)
+                                        .font(.subheadline)
+                                        .foregroundColor(.white.opacity(0.72))
+                                        .lineLimit(1)
+                                    Text(current.formattedDuration)
+                                        .font(.caption2.monospacedDigit())
+                                        .foregroundColor(.purple)
+                                }
+
+                                Spacer()
+
+                                Button {
+                                    engine.togglePlayPause()
+                                } label: {
+                                    ZStack {
+                                        Circle()
+                                            .fill(Color.purple)
+                                            .frame(width: 44, height: 44)
+                                        Image(systemName: engine.isPlaying ? "pause.fill" : "play.fill")
+                                            .font(.headline)
+                                            .foregroundColor(.white)
+                                    }
+                                }
+                            }
+                        }
+                        .padding(16)
+                        .background(Color.white.opacity(0.08))
+                        .clipShape(RoundedRectangle(cornerRadius: 18))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 18)
+                                .stroke(Color.purple.opacity(0.45), lineWidth: 1)
+                        )
+                        .padding(.horizontal, 16)
+                        .padding(.top, 8)
+                    }
+
+                    // 2. Up Next Header & Stats
                     HStack {
                         VStack(alignment: .leading, spacing: 2) {
-                            Text(track.title)
-                                .foregroundColor(idx == engine.currentIndex ? .purple : .white)
-                                .fontWeight(idx == engine.currentIndex ? .bold : .regular)
-                            Text("\(track.artist) • \(track.formattedDuration)")
-                                .font(.caption2)
-                                .foregroundColor(.secondary)
+                            Text("UP NEXT IN QUEUE")
+                                .font(.system(size: 12, weight: .black, design: .monospaced))
+                                .tracking(1.2)
+                                .foregroundColor(.white.opacity(0.85))
+                            Text("\(upcomingTracks.count) tracks remaining • \(totalRemainingMinutes) mins")
+                                .font(.caption)
+                                .foregroundColor(.white.opacity(0.55))
+                        }
+
+                        Spacer()
+
+                        if !upcomingTracks.isEmpty {
+                            EditButton()
+                                .font(.caption.weight(.bold))
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 6)
+                                .background(Color.white.opacity(0.12))
+                                .foregroundColor(.white)
+                                .clipShape(Capsule())
+
+                            Button {
+                                engine.clearUpcomingQueue()
+                            } label: {
+                                Text("Clear")
+                                    .font(.caption.weight(.bold))
+                                    .padding(.horizontal, 12)
+                                    .padding(.vertical, 6)
+                                    .background(Color.red.opacity(0.22))
+                                    .foregroundColor(.red)
+                                    .clipShape(Capsule())
+                            }
+                        }
+                    }
+                    .padding(.horizontal, 20)
+
+                    // 3. Reorderable Up Next List
+                    if upcomingTracks.isEmpty {
+                        Spacer()
+                        VStack(spacing: 10) {
+                            Image(systemName: "text.line.first.and.arrowtriangle.forward")
+                                .font(.system(size: 38))
+                                .foregroundColor(.white.opacity(0.35))
+                            Text("No Upcoming Songs in Queue")
+                                .font(.headline)
+                                .foregroundColor(.white.opacity(0.8))
+                            Text("Swipe left-to-right on any song in your library or playlists to queue it up next.")
+                                .font(.caption)
+                                .foregroundColor(.white.opacity(0.5))
+                                .multilineTextAlignment(.center)
+                                .padding(.horizontal, 40)
                         }
                         Spacer()
-                        if idx == engine.currentIndex {
-                            Image(systemName: "speaker.wave.2.fill")
-                                .foregroundColor(.purple)
+                    } else {
+                        List {
+                            ForEach(Array(upcomingTracks.enumerated()), id: \.offset) { offset, track in
+                                let absoluteIdx = engine.currentIndex + 1 + offset
+                                HStack(spacing: 12) {
+                                    Text("\(offset + 1)")
+                                        .font(.caption.monospacedDigit().weight(.bold))
+                                        .foregroundColor(.white.opacity(0.45))
+                                        .frame(width: 22)
+
+                                    if let art = ArtworkCache.shared.artwork(for: track.fileName) {
+                                        Image(uiImage: art)
+                                            .resizable()
+                                            .scaledToFill()
+                                            .frame(width: 44, height: 44)
+                                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                                    } else {
+                                        RoundedRectangle(cornerRadius: 8)
+                                            .fill(Color.white.opacity(0.1))
+                                            .frame(width: 44, height: 44)
+                                            .overlay(Image(systemName: "music.note").foregroundColor(.gray))
+                                    }
+
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(track.title)
+                                            .font(.system(size: 15, weight: .semibold))
+                                            .foregroundColor(.white)
+                                            .lineLimit(1)
+                                        Text("\(track.artist) • \(track.formattedDuration)")
+                                            .font(.caption)
+                                            .foregroundColor(.white.opacity(0.6))
+                                            .lineLimit(1)
+                                    }
+
+                                    Spacer()
+
+                                    Button {
+                                        withAnimation(.spring(response: 0.4, dampingFraction: 0.82)) {
+                                            engine.currentIndex = absoluteIdx
+                                        }
+                                        engine.playTrack(track, in: engine.currentQueue)
+                                    } label: {
+                                        Image(systemName: "play.circle.fill")
+                                            .font(.title3)
+                                            .foregroundColor(.white.opacity(0.75))
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                                .padding(.vertical, 2)
+                                .listRowBackground(Color.white.opacity(0.06))
+                                .swipeActions(edge: .leading, allowsFullSwipe: true) {
+                                    Button {
+                                        let removed = engine.currentQueue.remove(at: absoluteIdx)
+                                        let targetIdx = min(engine.currentIndex + 1, engine.currentQueue.count)
+                                        engine.currentQueue.insert(removed, at: targetIdx)
+                                        engine.showToast("Moved '\(track.title)' to Top of Queue")
+                                    } label: {
+                                        Label("Move to Top", systemImage: "arrow.up.to.line")
+                                    }
+                                    .tint(.purple)
+                                }
+                            }
+                            .onMove(perform: engine.moveUpcomingQueueItems)
+                            .onDelete { offsets in
+                                for off in offsets.sorted(by: >) {
+                                    engine.removeQueueItem(at: engine.currentIndex + 1 + off)
+                                }
+                            }
                         }
+                        .listStyle(.plain)
+                        .scrollContentBackground(.hidden)
                     }
                 }
             }
-            .navigationTitle("Up Next")
+            .navigationTitle("Playback Queue")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Done") { dismiss() }
+                        .fontWeight(.bold)
+                }
+            }
         }
     }
 }
 
-// MARK: - Tab 3: Settings Tab (Optional Crossfader + iPod Mode + Vinyl Turntable Mode + Wi-Fi Drop + URL Importer)
+// MARK: - Tab 3: Settings Tab (Crossfader + iPod Mode + Wi-Fi Drop + Direct/API Audio Importer with Duplicate Protection)
 struct MusiQSettingsAndToolsView: View {
     @ObservedObject var engine: MusiQEngine
     @StateObject private var wifiServer = WiFiUploadServer()
 
     @State private var urlInput: String = ""
+    @State private var customResolverEndpoint: String = UserDefaults.standard.string(forKey: "MusiQ_Custom_Resolver_API") ?? ""
     @State private var customTitle: String = ""
     @State private var customArtist: String = ""
-    @State private var statusMessage: String = "Use Wi-Fi Browser Drop above, or paste a direct audio file link below."
+    @State private var statusMessage: String = "Use Wi-Fi Browser Drop above, or paste a link below."
     @State private var isDownloading: Bool = false
 
     var body: some View {
@@ -6202,30 +5649,20 @@ struct MusiQSettingsAndToolsView: View {
                         .padding(.vertical, 4)
                     }
 
-                    Text("When enabled, MusiQ smoothly fades out the ending song while fading in the next song across dual audio decks (automatically disabled while in Vinyl Mode).")
+                    Text("When enabled, MusiQ smoothly fades out the ending song while fading in the next song across dual audio decks.")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
 
-                // 2. Classic Hardware Modes (iPod Classic Mode + Physical Vinyl Turntable Mode!)
-                Section("Classic Hardware Modes") {
+                // 2. Classic Hardware Mode (iPod Classic Mode Only — Vinyl Simulator Removed!)
+                Section("Classic Hardware Mode") {
                     Toggle(isOn: $engine.isIPodModeActive) {
-                        Label("iPod Mode", systemImage: "ipod")
+                        Label("iPod Classic Mode", systemImage: "ipod")
                             .font(.headline)
                     }
                     .tint(.purple)
 
-                    Text("Transforms MusiQ into a full-screen 5th Gen iPod Classic with a tactile Click Wheel.")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-
-                    Toggle(isOn: $engine.isVinylModeActive) {
-                        Label("Vinyl Mode", systemImage: "record.circle.fill")
-                            .font(.headline)
-                    }
-                    .tint(.purple)
-
-                    Text("Browse your playlists as physical 12\" vinyl records pressed into 20-minute sides (40 mins per disc). Drag the needle across glowing song grooves to drop & spin with crossfade disabled.")
+                    Text("Transforms MusiQ into a full-screen 5th Gen iPod Classic with a tactile Click Wheel. Tap 'Quit iPod' in the top-left corner to return.")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
@@ -6235,8 +5672,8 @@ struct MusiQSettingsAndToolsView: View {
                     Toggle(isOn: Binding(
                         get: { wifiServer.isRunning },
                         set: { _ in
-                            wifiServer.onFileUploaded = {
-                                engine.scanLocalLibrary()
+                            wifiServer.onFileUploaded = { tempURL, fileName in
+                                engine.ingestStagedAudioFile(tempURL: tempURL, proposedFileName: fileName)
                             }
                             wifiServer.toggleServer()
                         }
@@ -6275,10 +5712,10 @@ struct MusiQSettingsAndToolsView: View {
                     }
                 }
 
-                // 4. Direct & Cloud Audio URL Importer
-                Section("Direct Audio File or Cloud Share Link") {
+                // 4. Native Link & Custom API Resolver Importer
+                Section("Native Audio Link & API Importer") {
                     HStack {
-                        TextField("https://example.com/song.mp3", text: $urlInput)
+                        TextField("Paste audio link or playlist URL...", text: $urlInput)
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled()
                         if let clip = UIPasteboard.general.string, !clip.isEmpty {
@@ -6291,6 +5728,14 @@ struct MusiQSettingsAndToolsView: View {
                         }
                     }
 
+                    TextField("Optional Resolver API (e.g. https://your-api.com/resolve?url=)", text: $customResolverEndpoint)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .font(.caption)
+                        .onChange(of: customResolverEndpoint) { newVal in
+                            UserDefaults.standard.set(newVal, forKey: "MusiQ_Custom_Resolver_API")
+                        }
+
                     TextField("Custom Song Title (Leave blank for auto)", text: $customTitle)
                     TextField("Artist Name (Optional)", text: $customArtist)
 
@@ -6302,9 +5747,9 @@ struct MusiQSettingsAndToolsView: View {
                             if isDownloading {
                                 ProgressView()
                                     .padding(.trailing, 8)
-                                Text("Downloading & Tagging...")
+                                Text("Downloading & Checking Duplicates...")
                             } else {
-                                Label("Download to MusiQ Library", systemImage: "arrow.down.circle.fill")
+                                Label("Import to MusiQ Library", systemImage: "arrow.down.circle.fill")
                                     .font(.headline)
                             }
                             Spacer()
@@ -6324,6 +5769,12 @@ struct MusiQSettingsAndToolsView: View {
 
     private func normalizeCloudAudioURL(_ raw: String) -> URL? {
         var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let apiPrefix = customResolverEndpoint.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !apiPrefix.isEmpty && (s.contains("spotify.com") || s.contains("youtu")) {
+            if let encoded = s.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
+                return URL(string: apiPrefix + encoded)
+            }
+        }
         if s.contains("dropbox.com") {
             s = s.replacingOccurrences(of: "?dl=0", with: "?dl=1")
             if !s.contains("dl=1") {
@@ -6367,10 +5818,7 @@ struct MusiQSettingsAndToolsView: View {
                     resolvedTitle = "Track_\(Int(Date().timeIntervalSince1970))"
                 }
 
-                var resolvedArtist = customArtist.trimmingCharacters(in: .whitespacesAndNewlines)
-                if resolvedArtist.isEmpty {
-                    resolvedArtist = "Audio Import"
-                }
+                let resolvedArtist = customArtist.trimmingCharacters(in: .whitespacesAndNewlines)
 
                 let safeBaseName = resolvedTitle
                     .replacingOccurrences(of: "/", with: "-")
@@ -6378,40 +5826,29 @@ struct MusiQSettingsAndToolsView: View {
                     .replacingOccurrences(of: "?", with: "")
 
                 let safeFileName = "\(safeBaseName).\(ext)"
-                let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-                let destinationURL = docs.appendingPathComponent(safeFileName)
+                let stagedURL = FileManager.default.temporaryDirectory.appendingPathComponent("dl_\(UUID().uuidString)_\(safeFileName)")
+                try? FileManager.default.removeItem(at: stagedURL)
+                try FileManager.default.moveItem(at: tempURL, to: stagedURL)
 
-                if FileManager.default.fileExists(atPath: destinationURL.path) {
-                    try FileManager.default.removeItem(at: destinationURL)
-                }
-                try FileManager.default.moveItem(at: tempURL, to: destinationURL)
-
-                guard let verifyFile = try? AVAudioFile(forReading: destinationURL) else {
-                    try? FileManager.default.removeItem(at: destinationURL)
+                guard (try? AVAudioFile(forReading: stagedURL)) != nil else {
+                    try? FileManager.default.removeItem(at: stagedURL)
                     throw NSError(domain: "MusiQ", code: -1, userInfo: [
-                        NSLocalizedDescriptionKey: "URL did not point to a valid direct audio file. Use the Wi-Fi Browser Drop above or Files importer."
+                        NSLocalizedDescriptionKey: "URL did not return a direct audio stream. Use the Wi-Fi Browser Drop above or configure a Resolver API endpoint."
                     ])
-                }
-
-                let exactDuration = Double(verifyFile.length) / max(verifyFile.processingFormat.sampleRate, 1)
-                ArtworkCache.shared.saveCustomMetadata(title: resolvedTitle, artist: resolvedArtist, for: safeFileName)
-
-                if let res = await LyricsManager.shared.fetchVersionMatchedLyrics(
-                    title: resolvedTitle,
-                    artist: resolvedArtist,
-                    targetDuration: exactDuration
-                ) {
-                    let tempTrack = Track(id: UUID(), title: resolvedTitle, artist: resolvedArtist, fileName: safeFileName, duration: exactDuration)
-                    LyricsManager.shared.saveLyrics(res.lyrics, matchedDuration: res.matchedDuration, for: tempTrack)
                 }
 
                 await MainActor.run {
                     isDownloading = false
-                    statusMessage = "✅ Saved '\(resolvedTitle)' to your Songs library!"
+                    statusMessage = "✅ Processed '\(resolvedTitle)'!"
                     urlInput = ""
                     customTitle = ""
                     customArtist = ""
-                    engine.scanLocalLibrary()
+                    engine.ingestStagedAudioFile(
+                        tempURL: stagedURL,
+                        proposedFileName: safeFileName,
+                        customTitle: resolvedTitle,
+                        customArtist: resolvedArtist.isEmpty ? nil : resolvedArtist
+                    )
                 }
             } catch {
                 await MainActor.run {
